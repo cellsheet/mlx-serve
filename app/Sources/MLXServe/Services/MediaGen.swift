@@ -438,11 +438,11 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// forward, matching comfy's `disable_cfg1_optimization`). f32
     /// end-to-end, no quantization yet.
     static let animaTurbo = ImageModelPreset(
-        id: "justintime47/Anima-Turbo-MLX-Serve",
+        id: "jlweights/Anima-Turbo-MLX-Serve",
         name: "Anima Turbo (~5 GB)",
         variant: .anima,
         configName: "anima",
-        repo: "justintime47/Anima-Turbo-MLX-Serve",
+        repo: "jlweights/Anima-Turbo-MLX-Serve",
         approxDownloadGB: 5,
         approxRAMGB: 12,
         resolutions: kreaResolutions,
@@ -464,11 +464,11 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// base-v1.0 variant. Full schedule: 32 steps, CFG 4.5 (classifier-free
     /// guidance engaged every step, unlike Turbo's single-forward shortcut).
     static let animaBaseCatalog = ImageModelPreset(
-        id: "justintime47/Anima-Base-MLX-Serve",
+        id: "jlweights/Anima-Base-MLX-Serve",
         name: "Anima Base (~5 GB)",
         variant: .anima,
         configName: "anima",
-        repo: "justintime47/Anima-Base-MLX-Serve",
+        repo: "jlweights/Anima-Base-MLX-Serve",
         approxDownloadGB: 5,
         approxRAMGB: 12,
         resolutions: kreaResolutions,
