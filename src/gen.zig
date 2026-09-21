@@ -648,7 +648,12 @@ pub const ImageEngine = struct {
     /// Steps for a request that names none: the distilled backends' few-step
     /// default, or an undistilled checkpoint's own recommendation.
     pub fn defaultSteps(self: *const ImageEngine) u32 {
-        return if (self.backend == .qwen_image) qwen_image.DEFAULT_STEPS else 4;
+        return if (self.backend == .qwen_image)
+            qwen_image.DEFAULT_STEPS
+        else if (self.backend == .anima)
+            self.backend.anima.recommended.steps
+        else
+            4;
     }
 
     /// Reconcile the engine's attached LoRA stack with the request: an empty
@@ -804,17 +809,6 @@ pub const ImageEngine = struct {
 
     pub fn maxDim(self: *const ImageEngine) u32 {
         return maxDimFor(std.meta.activeTag(self.backend));
-    }
-
-    /// Default step count for a request that omits `steps`. Every backend
-    /// but Anima keeps its long-standing literal (unchanged behavior); Anima
-    /// reads its own pack's `recommended_steps` (base ~32, turbo ~10) since
-    /// one literal can't serve both variants.
-    pub fn defaultSteps(self: *const ImageEngine) u32 {
-        return switch (self.backend) {
-            .flux, .krea, .mage_flow => 4,
-            .anima => |m| m.recommended.steps,
-        };
     }
 };
 
@@ -2140,22 +2134,6 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             log.info("[image] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, lora_n });
     }
 
-    // `guidance` (CFG scale) and `negative_prompt` are read here regardless
-    // of backend — a model that runs guidance-free (FLUX/Krea/MageFlow) just
-    // never looks at them, same as `cond_weights` is only meaningful with a
-    // matching `condWeightCount()`. `guidance_scale` is diffusers' own
-    // spelling, accepted so a pasted script works unmodified.
-    const negative_prompt: ?[]const u8 = if (extractJsonString(body, "negative_prompt")) |np| try jsonUnescape(allocator, np) else null;
-    defer if (negative_prompt) |np| allocator.free(np);
-    var guidance: ?f32 = null;
-    if (extractJsonFloat(body, "guidance")) |gv| {
-        if (!(gv >= 1.0 and gv <= 30.0)) return sendError(conn, 400, "'guidance' must be in [1,30]");
-        guidance = @floatCast(gv);
-    } else if (extractJsonFloat(body, "guidance_scale")) |gv| {
-        if (!(gv >= 1.0 and gv <= 30.0)) return sendError(conn, 400, "'guidance_scale' must be in [1,30]");
-        guidance = @floatCast(gv);
-    }
-
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
@@ -2169,7 +2147,6 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .edit_image_bytes = edit_byte_bufs[0..edit_byte_n],
         .cond_gain = cond_gain,
         .cond_weights = cond_weights,
-        .guidance = guidance,
         .guidance_scale = guidance_scale,
         .negative_prompt = negative_prompt,
     };

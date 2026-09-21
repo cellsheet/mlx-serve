@@ -489,7 +489,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow") or
-        std.mem.startsWith(u8, model_type, "qwen_image")) or
+        std.mem.startsWith(u8, model_type, "qwen_image") or
         std.mem.eql(u8, model_type, "anima")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
