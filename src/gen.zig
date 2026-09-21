@@ -522,15 +522,12 @@ pub const ImageGenOpts = struct {
     /// (FLUX: 3 taps, Krea: 12 taps).
     cond_gain: f32 = 1.0,
     cond_weights: ?[]const f32 = null,
-    /// Classifier-free guidance scale override. Null = the backend's own
-    /// default (Anima: the pack's `recommended_cfg`). Backends that generate
-    /// guidance-free (FLUX/Krea/MageFlow are distilled, one forward per step)
-    /// simply ignore it — there is no unconditional branch for it to steer.
-    guidance: ?f32 = null,
-    /// What to steer the CFG unconditional branch away from. Only meaningful
-    /// alongside a `guidance` that engages CFG (Anima: != 1.0); backends
-    /// without real guidance ignore it the same way they ignore `guidance`.
-    negative_prompt: ?[]const u8 = null,
+    /// Classifier-free guidance — the undistilled "base" klein checkpoints,
+    /// gated by `ImageEngine.supportsGuidance()`. 1.0 (default) skips the
+    /// unconditional forward entirely; distilled klein has guidance baked
+    /// into the weights and is never asked to run it.
+    guidance_scale: f32 = 1.0,
+    negative_prompt: []const u8 = "",
 };
 
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
@@ -767,7 +764,7 @@ pub const ImageEngine = struct {
                     .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
                     .negative_prompt = opts.negative_prompt,
                 };
-                break :blk m.generateImageOpts(allocator, prompt, width, height, seed, steps, opts.guidance orelse 0.0, aopts, progress);
+                break :blk m.generateImageOpts(allocator, prompt, width, height, seed, steps, opts.guidance_scale, aopts, progress);
             },
         };
     }
