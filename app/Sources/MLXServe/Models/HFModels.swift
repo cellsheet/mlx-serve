@@ -126,7 +126,7 @@ enum MediaModality: CaseIterable {
     init?(modelType: String) {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
             || modelType.hasPrefix("mage_flow") || modelType == "mageflow"
-            || modelType.hasPrefix("qwen_image") { self = .image; return }
+            || modelType.hasPrefix("qwen_image")
             || modelType == "anima" { self = .image; return }
         if modelType.hasPrefix("hunyuan3d") { self = .mesh; return }
         switch modelType {
