@@ -522,10 +522,10 @@ pub const ImageGenOpts = struct {
     /// (FLUX: 3 taps, Krea: 12 taps).
     cond_gain: f32 = 1.0,
     cond_weights: ?[]const f32 = null,
-    /// Classifier-free guidance — the undistilled "base" klein checkpoints,
-    /// gated by `ImageEngine.supportsGuidance()`. 1.0 (default) skips the
-    /// unconditional forward entirely; distilled klein has guidance baked
-    /// into the weights and is never asked to run it.
+    /// Classifier-free guidance scale, gated by `ImageEngine.supportsGuidance()`.
+    /// Already RESOLVED by `ImageEngine.defaultGuidance()` when the request named
+    /// none, so no backend arm re-derives it. 1.0 skips the unconditional forward
+    /// entirely; distilled klein has guidance baked into the weights.
     guidance_scale: f32 = 1.0,
     negative_prompt: []const u8 = "",
 };
@@ -639,7 +639,7 @@ pub const ImageEngine = struct {
     /// fields (1.0 is a no-op, matching mflux's basic guider); Krea/Mage-Flow
     /// have no negative-encode path.
     pub fn supportsGuidance(self: *const ImageEngine) bool {
-        return self.backend == .flux or self.backend == .qwen_image;
+        return self.backend == .flux or self.backend == .qwen_image or self.backend == .anima;
     }
 
     /// Steps for a request that names none: the distilled backends' few-step
@@ -651,6 +651,17 @@ pub const ImageEngine = struct {
             self.backend.anima.recommended.steps
         else
             4;
+    }
+
+    /// CFG scale for a request that names none: 1.0 — which skips the
+    /// unconditional forward — or an undistilled checkpoint's own
+    /// recommendation. Resolved at the request edge so `ImageGenOpts` carries
+    /// a real scale and no backend arm has to know what "absent" means.
+    pub fn defaultGuidance(self: *const ImageEngine) f32 {
+        return if (self.backend == .anima)
+            self.backend.anima.recommended.cfg
+        else
+            1.0;
     }
 
     /// Reconcile the engine's attached LoRA stack with the request: an empty
@@ -717,7 +728,9 @@ pub const ImageEngine = struct {
     }
 
     pub fn generatePng(self: *ImageEngine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) ![]u8 {
-        const img = try self.generateImage(allocator, prompt, width, height, seed, steps, .{}, progress);
+        // The second construction site of ImageGenOpts, so it owes the same
+        // resolution the request handler does — `.{}` would pin Anima to 1.0.
+        const img = try self.generateImage(allocator, prompt, width, height, seed, steps, .{ .guidance_scale = self.defaultGuidance() }, progress);
         defer _ = mlx.mlx_array_free(img);
         return krea.imageToPng(allocator, img, self.stream());
     }
@@ -753,9 +766,9 @@ pub const ImageEngine = struct {
                 }, progress);
             },
             // No instruction-edit training (Anima has no edit checkpoint);
-            // img2img rides the Qwen-Image VAE encoder. guidance null -> cfg
-            // 0.0 -> the pack's own recommended_cfg (base ~4.5, turbo 1.0
-            // skips uncond); a request override rides straight through.
+            // img2img rides the Qwen-Image VAE encoder. The scale arrives
+            // resolved (`defaultGuidance` = the pack's recommended_cfg, base
+            // ~4.5, turbo 1.0 skips uncond), never as anima's own <=0 sentinel.
             .anima => |m| blk: {
                 if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0)
                     break :blk error.EditUnsupported;
@@ -2080,16 +2093,18 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         log.info("[image] rebalance: gain={d:.2} weights={d}\n", .{ cond_gain, wl.len });
     }
 
-    // Classifier-free guidance (base klein, undistilled): 'guidance_scale'
-    // != 1.0 runs a second, unconditional forward per step against
-    // 'negative_prompt' (default "" — empty-string unconditioning, the
-    // standard CFG convention). 1.0 is a no-op, so distilled klein can
-    // accept both fields harmlessly; only an ACTUALLY-requested CFG run
-    // needs the capability.
-    var guidance_scale: f32 = 1.0;
+    // Classifier-free guidance: a scale != 1.0 runs a second, unconditional
+    // forward per step against 'negative_prompt' (default "" — empty-string
+    // unconditioning, the standard CFG convention). Absent takes the backend's
+    // own default, which is 1.0 (a no-op, so distilled klein accepts the field
+    // harmlessly) everywhere but Anima, whose pack names its own. Only an
+    // ACTUALLY-requested CFG run needs the capability.
+    var guidance: f32 = engine.defaultGuidance();
     if (extractJsonFloat(body, "guidance_scale")) |g| {
         if (!(g >= 0.0 and g <= 20.0)) return sendError(conn, 400, "'guidance_scale' must be in [0,20]");
-        guidance_scale = @floatCast(g);
+        if (g != 1.0 and !engine.supportsGuidance())
+            return sendError(conn, 400, "'guidance_scale' requires a FLUX.2, Qwen-Image or Anima model");
+        guidance = @floatCast(g);
     }
     var negative_prompt: []const u8 = "";
     var negative_prompt_owned: ?[]u8 = null;
@@ -2098,8 +2113,6 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         negative_prompt_owned = try jsonUnescape(allocator, raw_neg);
         negative_prompt = negative_prompt_owned.?;
     }
-    if (guidance_scale != 1.0 and !engine.supportsGuidance())
-        return sendError(conn, 400, "'guidance_scale' requires a FLUX.2 or Qwen-Image model");
 
     // Style LoRA(s): one or more absolute paths to .safetensors adapters,
     // each with an optional scale — mirrors mflux's `--lora-paths`/
@@ -2132,7 +2145,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     }
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
+    log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance, want_stream, prompt.len });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
@@ -2144,7 +2157,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .edit_image_bytes = edit_byte_bufs[0..edit_byte_n],
         .cond_gain = cond_gain,
         .cond_weights = cond_weights,
-        .guidance_scale = guidance_scale,
+        .guidance_scale = guidance,
         .negative_prompt = negative_prompt,
     };
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
