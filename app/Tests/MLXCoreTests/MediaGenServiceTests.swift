@@ -1298,6 +1298,23 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertFalse(ImageModelPreset.krea2Turbo.supportsGuidance)
     }
 
+    /// `gen.ImageEngine.supportsGuidance` names flux, qwen_image AND anima, so
+    /// the pane has to offer the pair for Anima too — hiding them there is the
+    /// mirror of a dead control: a capability the backend has, unreachable.
+    /// Safe for the distilled Turbo pack because the app OMITS `guidance_scale`
+    /// at its 1.0 default, leaving the server to resolve each pack's own
+    /// `recommended_cfg` (1.0 Turbo, 4.5 Base).
+    func testAnimaDeclaresTheGuidanceItsBackendWires() {
+        for p in [ImageModelPreset.animaTurbo, .animaBaseCatalog, .animaBase] {
+            XCTAssertTrue(p.supportsGuidance, "\(p.id): the anima backend encodes a negative prompt")
+        }
+        var req = ImageGenRequest(model: .animaBaseCatalog, prompt: "1girl", width: 512, height: 512, steps: 32)
+        req.negativePrompt = "worst quality, blurry"
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["negative_prompt"] as? String, "worst quality, blurry")
+        XCTAssertNil(json["guidance_scale"], "1.0 stays omitted so the pack's own recommendation wins")
+    }
+
     func testParseCondWeightsAcceptsCommasAndSpacesRejectsGarbage() {
         XCTAssertEqual(ImageGenRequest.parseCondWeights("1,2,3"), [1, 2, 3])
         XCTAssertEqual(ImageGenRequest.parseCondWeights(" 0.5  1\t-2 "), [0.5, 1, -2])

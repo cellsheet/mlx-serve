@@ -2011,7 +2011,7 @@ extension ImageModelPreset {
     /// Qwen-Image-2.1 is undistilled too: 1.0 (its recommended default) runs
     /// one forward per step, anything else two.
     var supportsGuidance: Bool {
-        variant == .flux2Klein9BBase || variant == .qwenImage21
+        variant == .flux2Klein9BBase || variant == .qwenImage21 || variant == .anima
     }
 
     // ── Capability flags: what the Advanced panel is allowed to offer ──
