@@ -19,6 +19,7 @@ const flux = @import("flux.zig");
 const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const qwen_image = @import("qwen_image.zig");
+const anima_mod = @import("anima.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -95,6 +96,7 @@ pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
+    "anima",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -102,6 +104,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
+    if (std.mem.eql(u8, model_type, "anima")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -468,6 +471,7 @@ const ImageBackend = union(enum) {
     krea: *krea.Engine,
     mage_flow: *mage_flow_mod.Engine,
     qwen_image: *qwen_image.Engine,
+    anima: *anima_mod.Engine,
 };
 
 /// Most reference images an edit request may carry (the primary 'image' plus
@@ -518,12 +522,15 @@ pub const ImageGenOpts = struct {
     /// (FLUX: 3 taps, Krea: 12 taps).
     cond_gain: f32 = 1.0,
     cond_weights: ?[]const f32 = null,
-    /// Classifier-free guidance — the undistilled "base" klein checkpoints,
-    /// gated by `ImageEngine.supportsGuidance()`. 1.0 (default) skips the
-    /// unconditional forward entirely; distilled klein has guidance baked
-    /// into the weights and is never asked to run it.
-    guidance_scale: f32 = 1.0,
-    negative_prompt: []const u8 = "",
+    /// Classifier-free guidance scale override. Null = the backend's own
+    /// default (Anima: the pack's `recommended_cfg`). Backends that generate
+    /// guidance-free (FLUX/Krea/MageFlow are distilled, one forward per step)
+    /// simply ignore it — there is no unconditional branch for it to steer.
+    guidance: ?f32 = null,
+    /// What to steer the CFG unconditional branch away from. Only meaningful
+    /// alongside a `guidance` that engages CFG (Anima: != 1.0); backends
+    /// without real guidance ignore it the same way they ignore `guidance`.
+    negative_prompt: ?[]const u8 = null,
 };
 
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
@@ -541,7 +548,8 @@ pub const ImageEngine = struct {
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .backend = undefined };
         // Re-peek the arch to pick the backend (detectModality already proved the
-        // config parses). `mage_flow*` → MageFlow; `krea*` → Krea; else FLUX.
+        // config parses). `mage_flow*` → MageFlow; `krea*` → Krea; `anima` →
+        // Anima; else FLUX.
         if (peekModelType(io, allocator, model_dir)) |mt| {
             defer allocator.free(mt);
             if (std.mem.startsWith(u8, mt, "mage_flow") or std.mem.eql(u8, mt, "mageflow")) {
@@ -557,6 +565,10 @@ pub const ImageEngine = struct {
                 self.backend = .{ .qwen_image = try qwen_image.Engine.load(io, allocator, model_dir, staged) };
                 return self;
             }
+            if (std.mem.eql(u8, mt, "anima")) {
+                self.backend = .{ .anima = try anima_mod.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
         }
         self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
@@ -569,6 +581,7 @@ pub const ImageEngine = struct {
             .krea => |k| k.deinit(),
             .mage_flow => |m| m.deinit(),
             .qwen_image => |q| q.deinit(),
+            .anima => |m| m.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -579,6 +592,7 @@ pub const ImageEngine = struct {
             .krea => |k| k.s,
             .mage_flow => |m| m.s,
             .qwen_image => |q| q.s,
+            .anima => |m| m.s,
         };
     }
 
@@ -589,6 +603,7 @@ pub const ImageEngine = struct {
             .krea => 12,
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
             .qwen_image => 0, // one final-norm hidden state, no layer taps
+            .anima => 0, // conditioning-rebalance not wired for Anima yet
         };
     }
 
@@ -599,6 +614,7 @@ pub const ImageEngine = struct {
             .krea => |k| k.vae_enc != null,
             .mage_flow => false, // img2img lands with the MageFlow VAE encoder
             .qwen_image => true, // the VAE encoder loads on first use
+            .anima => |m| m.vae.hasEncoder(),
         };
     }
 
@@ -610,6 +626,7 @@ pub const ImageEngine = struct {
             .krea => false,
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
             .qwen_image => false, // text-to-image checkpoint
+            .anima => false, // Anima has no edit training
         };
     }
 
@@ -658,7 +675,9 @@ pub const ImageEngine = struct {
             const arch: lora_mod.Arch = switch (self.backend) {
                 .flux => .flux2,
                 .krea => .krea2,
-                .mage_flow, .qwen_image => .generic,
+                .mage_flow,
+                .qwen_image => .generic,
+                .anima => .generic,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -671,6 +690,7 @@ pub const ImageEngine = struct {
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
             .qwen_image => 0, // no LoRA key mapping yet (matches mflux)
+            .anima => |m| anima_mod.attachLora(&m.dit, &stack),
         };
         if (matched == 0) {
             stack.deinit();
@@ -685,7 +705,9 @@ pub const ImageEngine = struct {
         switch (self.backend) {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
-            .mage_flow, .qwen_image => {}, // no LoRA attached
+            .mage_flow,
+            .qwen_image => {}, // no LoRA attached
+            .anima => |m| anima_mod.detachLora(&m.dit),
         }
         if (self.lora_stack) |*st| st.deinit();
         self.lora_stack = null;
@@ -728,6 +750,20 @@ pub const ImageEngine = struct {
                     .negative_prompt = opts.negative_prompt,
                 }, progress);
             },
+            // No instruction-edit training (Anima has no edit checkpoint);
+            // img2img rides the Qwen-Image VAE encoder. guidance null -> cfg
+            // 0.0 -> the pack's own recommended_cfg (base ~4.5, turbo 1.0
+            // skips uncond); a request override rides straight through.
+            .anima => |m| blk: {
+                if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0)
+                    break :blk error.EditUnsupported;
+                const aopts = anima_mod.GenOpts{
+                    .init_image = opts.init_image,
+                    .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
+                    .negative_prompt = opts.negative_prompt,
+                };
+                break :blk m.generateImageOpts(allocator, prompt, width, height, seed, steps, opts.guidance orelse 0.0, aopts, progress);
+            },
         };
     }
 
@@ -749,6 +785,7 @@ pub const ImageEngine = struct {
             .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
             // Qwen-Image-2.1: one latent token per 16x16 tile.
             .qwen_image => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
+            .anima => .{ .w = clampAnimaDim(req_w), .h = clampAnimaDim(req_h) },
         };
     }
 
@@ -759,12 +796,25 @@ pub const ImageEngine = struct {
     pub fn maxDimFor(kind: std.meta.Tag(ImageBackend)) u32 {
         return switch (kind) {
             .flux => 1536,
-            .krea, .mage_flow, .qwen_image => 2048,
+            .krea, .mage_flow,
+            .qwen_image => 2048,
+            .anima => 1920,
         };
     }
 
     pub fn maxDim(self: *const ImageEngine) u32 {
         return maxDimFor(std.meta.activeTag(self.backend));
+    }
+
+    /// Default step count for a request that omits `steps`. Every backend
+    /// but Anima keeps its long-standing literal (unchanged behavior); Anima
+    /// reads its own pack's `recommended_steps` (base ~32, turbo ~10) since
+    /// one literal can't serve both variants.
+    pub fn defaultSteps(self: *const ImageEngine) u32 {
+        return switch (self.backend) {
+            .flux, .krea, .mage_flow => 4,
+            .anima => |m| m.recommended.steps,
+        };
     }
 };
 
@@ -782,6 +832,22 @@ pub fn clampFluxDim(v: u32) u32 {
 fn clampKreaDim(v: u32) u32 {
     const rounded = ((v + 15) / 16) * 16;
     return std.math.clamp(rounded, 256, 2048);
+}
+
+/// Round a requested dimension to a multiple of 16 in [256, 1920] — same
+/// VAE ×8 + DiT patch ×2 grid as Krea, but Anima's ceiling is NOT Krea's:
+/// `comfy/model_detection.py`'s cosmos_predict2/anima branch hardcodes
+/// `max_img_h`/`max_img_w = 240` (LATENT pixels, pre-patchify — `predict2.py
+/// build_pos_embed` divides by `patch_spatial` to get the RoPE table's
+/// token-grid length), i.e. 240 * 8 (VAE downsample) = 1920 pixels — the
+/// resolution the DiT's 3D-RoPE NTK extrapolation (`h/w_extrapolation_ratio
+/// 4.0`) was actually calibrated against. The RoPE forward itself computes
+/// its position range from the REAL input shape (`max(H,W,T)`), not from
+/// this stored length — so nothing crashes past 1920, but quality is
+/// unverified beyond the ratio the checkpoint was tuned for.
+fn clampAnimaDim(v: u32) u32 {
+    const rounded = ((v + 15) / 16) * 16;
+    return std.math.clamp(rounded, 256, 1920);
 }
 
 /// The audio modality hosts MULTIPLE architectures (the `ImageBackend`
@@ -2074,6 +2140,22 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             log.info("[image] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, lora_n });
     }
 
+    // `guidance` (CFG scale) and `negative_prompt` are read here regardless
+    // of backend — a model that runs guidance-free (FLUX/Krea/MageFlow) just
+    // never looks at them, same as `cond_weights` is only meaningful with a
+    // matching `condWeightCount()`. `guidance_scale` is diffusers' own
+    // spelling, accepted so a pasted script works unmodified.
+    const negative_prompt: ?[]const u8 = if (extractJsonString(body, "negative_prompt")) |np| try jsonUnescape(allocator, np) else null;
+    defer if (negative_prompt) |np| allocator.free(np);
+    var guidance: ?f32 = null;
+    if (extractJsonFloat(body, "guidance")) |gv| {
+        if (!(gv >= 1.0 and gv <= 30.0)) return sendError(conn, 400, "'guidance' must be in [1,30]");
+        guidance = @floatCast(gv);
+    } else if (extractJsonFloat(body, "guidance_scale")) |gv| {
+        if (!(gv >= 1.0 and gv <= 30.0)) return sendError(conn, 400, "'guidance_scale' must be in [1,30]");
+        guidance = @floatCast(gv);
+    }
+
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
@@ -2087,6 +2169,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .edit_image_bytes = edit_byte_bufs[0..edit_byte_n],
         .cond_gain = cond_gain,
         .cond_weights = cond_weights,
+        .guidance = guidance,
         .guidance_scale = guidance_scale,
         .negative_prompt = negative_prompt,
     };
@@ -4492,6 +4575,7 @@ test "modalityFromType classifies the media archs + markers (incl. krea + hunyua
     try testing.expectEqual(Modality.image, modalityFromType("mage_flow").?);
     try testing.expectEqual(Modality.image, modalityFromType("mageflow").?);
     try testing.expectEqual(Modality.image, modalityFromType("qwen_image21").?);
+    try testing.expectEqual(Modality.image, modalityFromType("anima").?);
     try testing.expectEqual(@as(?Modality, null), modalityFromType("gemma4"));
     try testing.expectEqual(@as(?Modality, null), modalityFromType("qwen3_5_moe"));
 }
@@ -4720,6 +4804,15 @@ test "maxDim matches what normalizeSize actually clamps to (drift guard)" {
     try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.krea));
     try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.mage_flow));
     try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.qwen_image));
+    try testing.expectEqual(clampAnimaDim(99999), ImageEngine.maxDimFor(.anima));
+}
+
+test "clampAnimaDim rounds to multiples of 16 in [256,1920] (comfy max_img_h/w=240 latent px x 8 VAE)" {
+    try testing.expectEqual(@as(u32, 1024), clampAnimaDim(1024));
+    try testing.expectEqual(@as(u32, 512), clampAnimaDim(500)); // 500 -> 512
+    try testing.expectEqual(@as(u32, 256), clampAnimaDim(16)); // clamp up
+    try testing.expectEqual(@as(u32, 1920), clampAnimaDim(5000)); // clamp down -- NOT Krea's 2048
+    try testing.expectEqual(@as(u32, 1920), clampAnimaDim(2048)); // Krea's own ceiling is over Anima's
 }
 
 test "Modality.mesh advertises the 3d capability" {
