@@ -1,5 +1,70 @@
 # Changelog
 
+## v26.9.7 — Faster Small Models - Prefill That Shares - Qwen-Image Editing - UNRELEASED
+
+### Highlights
+
+- **Small dense and MoE models decode faster, same bytes out.** The per-layer op chains are fused into single kernels that reproduce MLX's arithmetic exactly, so greedy output is byte-identical to 26.9.6 on all 18 model packs we checked (Llama, Mistral, Qwen3, Qwen3.5/3.6, K2, Muse, Gemma 3/4, LFM2.5 text/vision/MoE, Ling, Flash Next). Prefill speed is unchanged everywhere. Decode tok/s vs the shipped 26.9.6 app, M4 Max:
+
+  | Model | 0.5k | 4k | 8k | 16k |
+  |---|---|---|---|---|
+  | Gemma 4 26B-A4B 4-bit | +8% | +11% | +9% | +9% |
+  | Gemma 4 E4B 4-bit | +7% | +8% | +7% | +7% |
+  | LFM2.5 2.6B | +3% | +2% | +2% | +4% |
+  | Spark-X2.5 4B 4-bit | +10% | · | · | · |
+
+- **Decoding streams keep moving through another request's prefill.** `--prefill-decode-share` gives decoders a share of wall time while a long prompt prefills, instead of freezing them for seconds on a 32k prompt (#568).
+- **Qwen3.8 Flash Next after long prompts.** Decode past 32k is about 12% faster with the default bf16 KV, the n-gram gather runs on the GPU (prefill 2-4% faster everywhere, decode +15% at 128k), and MTP rounds draft the next chain before the host read (#555, #539, #545, #554, #556).
+- **Qwen-Image-2.1 instruction editing.** One checkpoint serves text-to-image and `mode:"edit"` with an image plus up to 10 references (#512).
+- **Console in Simplified Chinese with a light theme**, and the app's alerts and hints are translated (#487, #485, #463).
+
+### Changes
+- Nemotron-H 3.5 MoE checkpoints load (#559).
+- A second server refuses a port already in use instead of silently sharing it (#569).
+- Qwen3.8 Flash Next GGUFs route to the engine that can load them (#546).
+
+## v26.9.6 — Every Image Seen - Laya Decisions - Steady Qwen3.8 Agents
+
+### Highlights
+
+- **Qwen3.8 Flash Next reaches up to ~243-300+ tok/s decode and 3,362 tok/s prefill, on an M5 Ultra.** MTP drafts from the conversation itself when the reply copies it, so file rewrites and edits decode 1.3-1.5x faster (on by default, `MLX_SERVE_MTP_LOOKUP=0` turns it off); GDN layers run as one GPU dispatch (a few percent on every Mac, 27B included); Ultra chips verify through the fused MoE kernel (+14%); and M5 Ultra fuses the verify across 2 or more streams (+13% at 4 streams). Peak on M5 Ultra, Flash Next mixed 4-8 bit with `--mtp`: 219 tok/s decode, 227 tok/s across 4 streams, 3,150 tok/s prefill on an 8k prompt. Thanks @STRML MVP of this release! (#517, #519, #523, #533, #534).
+
+- **Laya typed decisions.** `POST /v1/decisions` answers score, yes/no and choice questions about a game or app state with Laya checkpoints (`aac6fef/laya-multilingual-mlx`), and concurrent requests are answered in one pass. Thanks @sbusso (#475, #511).
+
+- **Every image in a conversation reaches the model.** Earlier turns and images returned by tools (pi, Claude Code's Read) are seen where they were sent; before, only the latest turn's images were, so an agent that read three pages saw only the last one. An image already seen is not re-encoded on later turns.
+
+- **Qwen3.8 agents stop going in circles.** Earlier turns' thinking is no longer replayed into the prompt, so long agent sessions use about half the context. The cost is a short pause when you send a new instruction; tool rounds are unaffected. `chat_template_kwargs: {"preserve_thinking": true}` in Model Settings restores the old behaviour.
+
+- **Steer a running agent.** Press Return while an agent chat works to queue a note; the agent picks it up at its next tool round as your next message. Thanks @lojza3d (#497, #537).
+
+- **Redesigned Create panes.** Image, Voice, Music, Video and 3D share one layout with the model first, the Video and 3D panes keep your prompt and files when you switch away, and file pickers open over the window. Thanks @lojza3d (#445, #521).
+
+- **The app is now MLX-Serve.app** and the download is MLX-Serve.dmg. Settings carry over; an app updated in place from 26.9.5 keeps its old folder name until the next update renames it.
+
+### Changes
+- Claude Code shows thinking as it streams when tools are on.
+- A long prompt that does not fit in memory clears other chats' cache to make room instead of failing. Thanks @celestial-rose.
+- Long agent sessions keep their cache when memory is tight (#518), and a short chat no longer pushes out a long one that starts the same way.
+- Fixed a crash on a repeated one-token prompt in `/v1/completions`.
+- A stop string ends the answer, not the thinking: a match inside the reasoning no longer cuts the reply short (#549).
+- `chat_template_kwargs` in a request is honoured, so `{"enable_thinking": false}` turns thinking off.
+- Mistral 7B v0.3 and similar models keep newlines and tabs in the prompt.
+- App chats and agents resend earlier images every turn (Qwen, LFM2-VL, Muse), and LFM2-VL handles images and agent tool calls correctly.
+- Text-only models tell the agent when a tool returned an image they cannot see.
+- opencode launchers turn thinking on, and Claude Code launched from the app skips permission prompts.
+- A request without tools gets the model's reply exactly as written, like other engines.
+- Qwen-Image-2.1 is about 10% faster and can return transparent PNGs. Thanks @mrv777 (#510) and @ChadCSong (#481).
+- Bonsai 2 decodes faster, up to 20% with several chats at once, and Bonsai 1 packs get the fast kernel too. Thanks @jasontitus (#530).
+- The sidebar shows which chats are working, finished or stopped on an error. Thanks @lojza3d (#536).
+- The model browser and Settings no longer freeze while the library rescans. Thanks @LXD-8 (#480).
+- Hand edits to `mcp.json`, `providers.json` and the agents list survive a save from the app. Thanks @LXD-8 (#482, #483).
+- Codex sees its MCP tools. Thanks @kmahara (#479).
+- `mlx-serve pull` downloads everything Kokoro and Qwen3-TTS need to speak. Thanks @brandondyal (#526).
+- Very long sessions (250k+ tokens) restore reliably from the SSD cache. Thanks @brandondyal (#527).
+- `logprobs` work with `response_format` (JSON mode and JSON schema). Thanks @brandondyal (#552).
+- A model that failed to load can be loaded again after its files are fixed, without restarting the server. Thanks @brandondyal (#550).
+- The web console has a new icon toolbar, and its media tools can be turned off.
+
 ## v26.9.5 — Bonsai - Qwen-Image 2.1 - Concurrency & Speed
 
 ### Highlights

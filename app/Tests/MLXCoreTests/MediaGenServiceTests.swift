@@ -366,9 +366,14 @@ final class MediaGenServiceTests: XCTestCase {
     }
 
     func testHintAndTipsLinkAreSelectedPerBackend() {
-        // LTX keeps its own guidance verbatim, including the 15-word floor.
-        XCTAssertEqual(H3PromptExamples.hint(for: .ltx, prompt: "a cat"),
-                       "LTX-Video performs best with detailed 4–8 sentence prompts. Try Examples or Prompt tips above.")
+        // LTX's hint is a 15-word floor. The BAR, not the wording: pinning the
+        // sentence verbatim broke this test on every copy edit.
+        let short = H3PromptExamples.hint(for: .ltx, prompt: "a cat")
+        XCTAssertNotNil(short)
+        XCTAssertTrue(short!.contains("LTX"), "names the engine the advice is for")
+        let fourteen = Array(repeating: "word", count: 14).joined(separator: " ")
+        XCTAssertNotNil(H3PromptExamples.hint(for: .ltx, prompt: fourteen))
+        XCTAssertNil(H3PromptExamples.hint(for: .ltx, prompt: fourteen + " more"), "fifteen words is enough")
         XCTAssertNil(H3PromptExamples.hint(for: .ltx, prompt: H3PromptExamples.ltx[0].body))
         XCTAssertNil(H3PromptExamples.hint(for: .ltx, prompt: ""), "an empty field shows the placeholder, not a warning")
 
@@ -981,6 +986,32 @@ final class MediaGenServiceTests: XCTestCase {
         }
         fm.createFile(atPath: (dir as NSString).appendingPathComponent("transformer/0.safetensors"), contents: Data([0, 1, 2]))
         XCTAssertEqual(ServerManager.resolveModelDir(repo: "mlx-community/flux2-klein-9b-4bit", modelsRoot: root), dir)
+    }
+
+    /// A media pack whose config.json is present but whose completeness
+    /// marker is not (the server's `requiredMediaMarker`) must not resolve:
+    /// a half-pulled copy in the first root shadowed the complete copy in a
+    /// later one and every load 400'd as an incomplete media pack.
+    func testResolveModelDirSkipsAnIncompleteMediaPack() throws {
+        let fm = FileManager.default
+        let base = NSTemporaryDirectory() + "resolvedir-partial-\(UUID().uuidString)"
+        defer { try? fm.removeItem(atPath: base) }
+        let repo = "ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit"
+        let cfg = Data("{\"model_type\":\"acestep\"}".utf8)
+
+        let partialRoot = base + "/dl", fullRoot = base + "/models"
+        let partial = (partialRoot as NSString).appendingPathComponent(repo)
+        let full = (fullRoot as NSString).appendingPathComponent(repo)
+        try fm.createDirectory(atPath: partial, withIntermediateDirectories: true)
+        try fm.createDirectory(atPath: full + "/text_encoder", withIntermediateDirectories: true)
+        for dir in [partial, full] {
+            fm.createFile(atPath: dir + "/config.json", contents: cfg)
+            fm.createFile(atPath: dir + "/model.safetensors", contents: Data([0, 1]))
+        }
+        fm.createFile(atPath: full + "/text_encoder/model.safetensors", contents: Data([0, 1]))
+
+        XCTAssertNil(ServerManager.resolveModelDir(repo: repo, roots: [partialRoot]))
+        XCTAssertEqual(ServerManager.resolveModelDir(repo: repo, roots: [partialRoot, fullRoot]), full)
     }
 
     // MARK: - Residency default

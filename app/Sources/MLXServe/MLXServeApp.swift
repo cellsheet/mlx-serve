@@ -277,12 +277,12 @@ struct MLXCoreApp: App {
                 }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
 
-                // Pull in the latest built-in default when ours has moved ahead of
-                // the on-disk copy. Backs up the user's current prompt first.
-                Button("Update System Prompt to Latest…") {
+                // Pull in the latest built-in prompt and skills when ours have moved
+                // ahead of the on-disk copies. Backs up the user's edits first.
+                Button("Update System Prompt and Skills to Latest…") {
                     AgentPrompt.runSystemPromptUpdateFlow()
                 }
-                .disabled(!AgentPrompt.isSystemPromptOutdated())
+                .disabled(!AgentPrompt.isPromptOrSkillsOutdated())
 
                 Button("Open Memory File") {
                     let path = NSString(string: "~/.mlx-serve/memory.md").expandingTildeInPath
@@ -412,6 +412,11 @@ private struct MenuBarLabel: View {
             // reach SwiftUI's openWindow itself.
             .onChange(of: appState.pendingChatOpenTick) { _, _ in
                 open("chat")
+            }
+            // The launch plan can bump the tick before this label mounts (a fast
+            // library scan), and onChange never sees a change from before it.
+            .onAppear {
+                if appState.pendingChatOpenTick > 0 { open("chat") }
             }
             // browse{show} bumps this on the manager and the scene opens the window.
             .onChange(of: browser.showRequestTick) { _, _ in

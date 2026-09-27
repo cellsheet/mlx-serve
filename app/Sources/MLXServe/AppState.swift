@@ -20,6 +20,8 @@ class AppState: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     @Published var downloads = DownloadManager()
     @Published var localModels: [LocalModel] = []
+
+    private let libraryRefresher = ModelLibraryRefresher()
     /// Chat is answered by Apple's on-device model rather than the server.
     /// Persisted like `selectedModelPath`; the local pick stays set underneath
     /// so turning it off lands back on the model that was chosen before.
@@ -158,8 +160,7 @@ class AppState: ObservableObject {
     lazy var terminals = TerminalSessionStore(server: server,
                                               options: { [unowned self] in self.serverOptions })
     /// The sidebar's dragged order over conversations and terminals (ids in
-    /// visual order). Empty = newest first. Persisted; terminals' ids drop out
-    /// at quit like the terminals do.
+    /// visual order). Empty = newest first. Persisted.
     @Published var sidebarOrder: [UUID] = (UserDefaults.standard.stringArray(forKey: "sidebarRowOrder") ?? [])
         .compactMap(UUID.init) {
         didSet {
@@ -167,9 +168,20 @@ class AppState: ObservableObject {
         }
     }
 
+    /// The sidebar's user-made groups (Move to Group). Persisted.
+    @Published var sidebarGroups: SidebarGroups = UserDefaults.standard.data(forKey: "sidebarGroups")
+        .flatMap { try? JSONDecoder().decode(SidebarGroups.self, from: $0) } ?? SidebarGroups() {
+        didSet {
+            UserDefaults.standard.set(try? JSONEncoder().encode(sidebarGroups), forKey: "sidebarGroups")
+        }
+    }
+
     /// Drag-to-reorder: `visible` is the whole panel in its current visual
     /// order, so the result is a complete order and stale ids self-prune.
     func moveSidebarRow(_ id: UUID, onto target: UUID, visible: [UUID]) {
+        var groups = sidebarGroups
+        groups.join(id, groupOf: target)
+        if groups != sidebarGroups { sidebarGroups = groups }
         let next = SidebarChatRows.moved(id, onto: target, in: visible)
         if next != visible { sidebarOrder = next }
     }
@@ -403,24 +415,28 @@ class AppState: ObservableObject {
     /// hot-mounted into the guest. A coding agent asks which folder it works
     /// in; a plain shell opens on click in the Settings folder.
     /// The ONE door for every "… in Sandbox" entry (tray, chip, sidebar).
-    func startTerminal(agentId: String?) {
+    func startTerminal(agentId: String?, group: UUID? = nil) {
         let agent = SandboxAgentRegistry.all.first { $0.id == agentId }
         // Every caller is a MENU item. A modal panel run inside the menu's own
         // click handler races the menu's dismissal and sometimes never shows,
         // so the picker opens one run-loop turn later, once the menu is gone.
         DispatchQueue.main.async { [self] in
             guard let workspace = terminalWorkspace(askingFor: agent?.displayName) else { return }
-            showTerminal(terminals.start(agent: agent, workspace: workspace))
+            let id = terminals.start(agent: agent, workspace: workspace)
+            sidebarGroups.assign([id], to: group)
+            showTerminal(id)
         }
     }
 
     /// A host CLI (Claude Code, opencode, …) or a plain shell in a terminal
     /// row of the chat window — the same door shape as the sandbox one;
     /// Terminal.app is no longer involved.
-    func startTerminal(hostCLI cli: LauncherCLI) {
+    func startTerminal(hostCLI cli: LauncherCLI, group: UUID? = nil) {
         DispatchQueue.main.async { [self] in
             guard let workspace = terminalWorkspace(askingFor: cli == .shell ? nil : cli.displayName) else { return }
-            showTerminal(terminals.startHost(cli: cli, workspace: workspace))
+            let id = terminals.startHost(cli: cli, workspace: workspace)
+            sidebarGroups.assign([id], to: group)
+            showTerminal(id)
         }
     }
 
@@ -574,6 +590,8 @@ class AppState: ObservableObject {
             if storedCtx > 0 { opts.ctxSize = storedCtx }
             opts.save()
         }
+        opts.migrateLegacyPrefixCacheMem()
+        opts.save()
         self.serverOptions = opts
         self.mcpMode = UserDefaults.standard.bool(forKey: "mcpMode")
         self.defaultAgentId = UserDefaults.standard.string(forKey: "defaultAgentId")
@@ -589,7 +607,13 @@ class AppState: ObservableObject {
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
 
-        refreshModels()
+        // The launch plan below reads `localModels`, so the first scan is awaited
+        // instead of fired: the walk is off-main, and a plan resolved against an
+        // empty library would silently stop preloading the pinned model.
+        Task { [weak self] in
+            guard let self else { return }
+            await self.refreshModelsBeforeLaunch()
+        }
         // A Finder-launched bundle has no shell environment, so HF_HOME /
         // HF_HUB_CACHE / XDG_CACHE_HOME are invisible until we ask the login
         // shell. Off-main (it spawns one), and rescan only if the cache moved.
@@ -600,6 +624,7 @@ class AppState: ObservableObject {
             }
         }
         loadChatHistory()
+        sidebarGroups.retain(only: Set(chatSessions.map(\.id) + terminals.sessions.sessions.map(\.id)))
         // Start background task scheduling (catch-up + timer arming). Notifications
         // route back here to resume paused runs / deep-link into the Tasks window.
         TaskNotifier.shared.appState = self
@@ -645,21 +670,28 @@ class AppState: ObservableObject {
         // and a sheet with no host window is a screen nobody can see. That is
         // also why the user can no longer end up in front of nothing — whatever
         // dismisses the sheet, a composer is what was already behind it.
+    }
+
+    /// Fills the library once, then decides what the launch does with it.
+    ///
+    /// Both the welcome-vs-chat decision and the preload gate read `localModels`,
+    /// which the scan publishes — awaiting it is what keeps them from resolving
+    /// against an empty list on every launch.
+    private func refreshModelsBeforeLaunch() async {
+        adoptDiscoveredModels(await libraryRefresher.scan(inputs: downloads.scanInputs()))
+
+        let hasChat = localModels.contains(where: \.isChatPickable)
         let suppressed = UserDefaults.standard.bool(forKey: LaunchDecision.suppressDefaultsKey)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self else { return }
-            let hasChat = self.localModels.contains(where: \.isChatPickable)
-            let decision = LaunchDecision.resolve(welcomeSuppressed: suppressed,
-                                                  hasChatModels: hasChat)
-            if decision.opensChatWindow { self.pendingChatOpenTick += 1 }
-            if decision.presentsWelcome {
-                self.welcomeHasChatModels = hasChat
-                self.showWelcome = true
-            }
+        let decision = LaunchDecision.resolve(welcomeSuppressed: suppressed,
+                                              hasChatModels: hasChat)
+        if decision.opensChatWindow { pendingChatOpenTick += 1 }
+        if decision.presentsWelcome {
+            welcomeHasChatModels = hasChat
+            showWelcome = true
         }
 
         // Auto-start is headless unless "Preload the model when the server starts" resolves an installed
-        // model (`refreshModels()` above fills the library the gate checks).
+        // model.
         let launchPlan = StartupModelChoice.launch(
             autoStart: autoStartServer,
             loadModelAtStart: loadModelAtStart,
@@ -749,8 +781,17 @@ class AppState: ObservableObject {
         await server.refreshModels()
     }
 
+    /// Rescan the model library without blocking the caller: the walk reads every
+    /// served root, and this is reached from UI actions. Callers that need the
+    /// list caught up observe `localModels`.
     func refreshModels() {
-        localModels = downloads.discoverLocalModels()
+        libraryRefresher.refresh(inputs: downloads.scanInputs()) { [weak self] models in
+            self?.adoptDiscoveredModels(models)
+        }
+    }
+
+    private func adoptDiscoveredModels(_ models: [LocalModel]) {
+        localModels = models
         // Auto-select a base model if none selected or the current selection is
         // invalid. Drafters and media / non-chat models never get auto-picked —
         // they aren't loadable as the primary chat model (must match the tray

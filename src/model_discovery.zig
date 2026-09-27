@@ -70,6 +70,7 @@ const supported_model_types = [_][]const u8{
 /// later roots, and loading it falls through to the text loader, which dies
 /// on the first missing weight. The ONE table: `gen.requiredMarkerFor`
 /// delegates here, so discovery, register-by-path and the load guard agree.
+/// App twin: `DownloadManager.requiredMediaMarker` (keep in sync).
 pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     // LTX: distinguishes the real bundle from any other "AudioVideo" config
     // and proves the text path can load.
@@ -79,7 +80,9 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     // MiniMax Music 3: the converter writes the vocoder LAST of the five files.
     if (std.mem.eql(u8, model_type, "minimax_music3")) return "vocoder.safetensors";
     // Anima: our converted pack writes the DiT (transformer + llm_adapter) last.
+    // ACE-Step: the text encoder is a subdir a partial pull can miss.
     if (std.mem.eql(u8, model_type, "anima")) return "transformer.safetensors";
+    if (std.mem.eql(u8, model_type, "acestep")) return "text_encoder/model.safetensors";
     return null;
 }
 
@@ -160,6 +163,11 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // A Laya decision checkpoint ships encoder/config.json + rl_agent_config.json.
         if (peekLayaCheckpoint(io, sub))
             return .{ .supported = allocator.dupe(u8, "laya") catch return .missing_or_unparseable };
+        // …and an mlx-community-style Qwen-Image-2.1 repo: no root
+        // config.json, model_index.json's `_class_name` its only marker
+        // (the 2.0 family's "QwenImagePipeline" is a different architecture).
+        if (peekQwenImage21Index(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "qwen_image21") catch return .missing_or_unparseable };
         return .missing_or_unparseable;
     };
     defer file.close(io);
@@ -230,6 +238,23 @@ pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.D
     if (parsed.value.object.get("_mage_flow_version") != null) return true;
     const cn = parsed.value.object.get("_class_name") orelse return false;
     return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
+}
+
+/// True when `sub/model_index.json` names the Qwen-Image-2.1 pipeline. The 2.0
+/// family spells "QwenImagePipeline" — a different architecture, never matched.
+/// Same signature as gen.isQwenImage21Repo, over an already-open Dir.
+pub fn peekQwenImage21Index(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    var file = sub.openFile(io, "model_index.json", .{}) catch return false;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
+    defer allocator.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const cn = parsed.value.object.get("_class_name") orelse return false;
+    return cn == .string and std.mem.eql(u8, cn.string, "QwenImage21Pipeline");
 }
 
 /// The FLUX.2 DiT's shared-modulation tensor. Unique to this architecture —
@@ -871,7 +896,8 @@ fn tryAddModel(
         if (!has_config and
             !peekMageFlowIndex(io, allocator, sub) and
             !peekMfluxFlux2(io, allocator, sub) and
-            !peekLayaCheckpoint(io, sub)) return false;
+            !peekLayaCheckpoint(io, sub) and
+            !peekQwenImage21Index(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
         //   - partially-downloaded checkpoints (missing/garbage config)
@@ -1086,6 +1112,8 @@ pub const StubMeta = struct {
     /// (video piggybacks the vision tower — see src/qwen_vision.zig).
     has_video: bool = false,
     has_chat: bool = false,
+    /// The chat template can open a reasoning block (`templateSupportsThinking`).
+    has_thinking: bool = false,
     /// bert, or a bidirectional embedding model (EmbeddingGemma) — the stub
     /// advertises "embeddings" and no chat capabilities.
     is_encoder: bool = false,
@@ -1203,7 +1231,9 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
     const bytes = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return .{};
     defer allocator.free(bytes);
 
-    var meta = parseStubMeta(allocator, bytes, hasChatTemplate(io, allocator, dir));
+    const sniff = sniffChatTemplate(io, allocator, dir);
+    var meta = parseStubMeta(allocator, bytes, sniff.present);
+    meta.has_thinking = meta.has_chat and sniff.thinking;
     meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
     // A sentence-transformers pooling sidecar marks embedding capability even
     // when config.json says nothing (the load path parses its mode; the stub
@@ -1216,21 +1246,45 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
     return meta;
 }
 
-/// True if the model dir ships a chat template — a `chat_template.jinja` file,
-/// or a `tokenizer_config.json` that carries a `chat_template` key. Cheap proxy
-/// for "this is an instruct/chat model" used to gate chat/tool capabilities on
-/// unloaded stubs.
-fn hasChatTemplate(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
-    if (dir.statFile(io, "chat_template.jinja", .{})) |st| {
-        if (st.kind == .file) return true;
+/// Whether a chat template can open a reasoning block; one rule for the stub
+/// and loaded capability paths.
+pub fn templateSupportsThinking(tmpl: []const u8) bool {
+    return std.mem.indexOf(u8, tmpl, "enable_thinking") != null or
+        std.mem.indexOf(u8, tmpl, "<think>") != null or
+        std.mem.indexOf(u8, tmpl, "<ifm|think") != null or
+        std.mem.indexOf(u8, tmpl, "thought") != null or
+        std.mem.indexOf(u8, tmpl, "<|channel>") != null;
+}
+
+const TemplateSniff = struct { present: bool = false, thinking: bool = false };
+
+/// Whether the model dir ships a chat template — a `chat_template.jinja` file,
+/// or a `tokenizer_config.json` that carries a `chat_template` key — and whether
+/// it can think. Cheap proxy used to gate capabilities on unloaded stubs.
+fn sniffChatTemplate(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) TemplateSniff {
+    if (dir.readFileAlloc(io, "chat_template.jinja", allocator, .limited(8 * 1024 * 1024))) |bytes| {
+        defer allocator.free(bytes);
+        return .{ .present = true, .thinking = templateSupportsThinking(bytes) };
     } else |_| {}
-    var f = dir.openFile(io, "tokenizer_config.json", .{}) catch return false;
-    defer f.close(io);
-    var rbuf: [4096]u8 = undefined;
-    var rs = f.reader(io, &rbuf);
-    const bytes = rs.interface.allocRemaining(allocator, .limited(8 * 1024 * 1024)) catch return false;
+    const bytes = dir.readFileAlloc(io, "tokenizer_config.json", allocator, .limited(8 * 1024 * 1024)) catch return .{};
     defer allocator.free(bytes);
-    return std.mem.indexOf(u8, bytes, "\"chat_template\"") != null;
+    if (std.mem.indexOf(u8, bytes, "\"chat_template\"") == null) return .{};
+    // Only the template value: `added_tokens` name `<think>` on non-thinking packs too.
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .{ .present = true };
+    defer parsed.deinit();
+    const tmpl = if (parsed.value == .object) parsed.value.object.get("chat_template") else null;
+    const v = tmpl orelse return .{ .present = true };
+    var sniff: TemplateSniff = .{ .present = true };
+    switch (v) {
+        .string => |t| sniff.thinking = templateSupportsThinking(t),
+        .array => |arr| for (arr.items) |item| {
+            if (item != .object) continue;
+            const t = item.object.get("template") orelse continue;
+            if (t == .string and templateSupportsThinking(t.string)) sniff.thinking = true;
+        },
+        else => {},
+    }
+    return sniff;
 }
 
 fn lessThanById(_: void, a: DiscoveredModel, b: DiscoveredModel) bool {
@@ -1267,6 +1321,38 @@ test "anima classifies as image media with the transformer marker" {
     // The DiT is the big last-written file the converter drops in; an
     // in-flight download without it must not shadow a complete copy.
     try testing.expectEqualStrings("transformer.safetensors", requiredMediaMarker("anima").?);
+}
+
+test "an ACE-Step pack without its text encoder does not shadow a complete copy in a later root" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var a_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer a_dir.cleanup();
+    var b_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer b_dir.cleanup();
+
+    const cfg = "{\"model_type\":\"acestep\"}";
+    try a_dir.dir.createDirPath(io, "org/ace");
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/ace/config.json", .data = cfg });
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/ace/model.safetensors", .data = "0123" });
+    try b_dir.dir.createDirPath(io, "org/ace/text_encoder");
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/ace/config.json", .data = cfg });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/ace/model.safetensors", .data = "0123" });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/ace/text_encoder/model.safetensors", .data = "0123" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const a_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, a_dir.sub_path });
+    defer allocator.free(a_path);
+    const b_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, b_dir.sub_path });
+    defer allocator.free(b_path);
+
+    var result = try discoverModelsMany(io, allocator, &.{ a_path, b_path });
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expect(std.mem.startsWith(u8, result.models[0].path, b_path));
 }
 
 test "discoverModels finds flat and org/repo model dirs" {
@@ -1462,6 +1548,39 @@ test "discoverModels finds a MageFlow repo (model_index.json, no root config.jso
     try testing.expectEqualStrings("mage_flow", result.models[0].model_type);
     // Size is the whole tree — the weights live in component subdirs.
     try testing.expectEqual(@as(?u64, 14), result.models[0].bytes_on_disk);
+}
+
+test "discoverModels finds a Qwen-Image-2.1 repo (model_index.json, no root config.json)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // An mlx-community-style 2.1 repo ships no root config.json — its only
+    // marker is model_index.json's `_class_name`. The 2.0 family spells
+    // "QwenImagePipeline": a different architecture (20B, 2x2-packed) we do
+    // not serve, so it stays invisible with the same directory shape.
+    try tmp.dir.createDirPath(io, "mlx-community/Qwen-Image-2.1-MLX-4bit/transformer");
+    try tmp.dir.createDirPath(io, "mlx-community/Qwen-Image-2.1-MLX-4bit/vae");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mlx-community/Qwen-Image-2.1-MLX-4bit/model_index.json",
+        .data = "{\"_class_name\":\"QwenImage21Pipeline\"}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/Qwen-Image-2.1-MLX-4bit/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/Qwen-Image-2.1-MLX-4bit/vae/diffusion_pytorch_model.safetensors", .data = "0123" });
+    try tmp.dir.createDirPath(io, "mlx-community/Qwen-Image-2.0-MLX/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mlx-community/Qwen-Image-2.0-MLX/model_index.json",
+        .data = "{\"_class_name\":\"QwenImagePipeline\"}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/Qwen-Image-2.0-MLX/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("mlx-community/Qwen-Image-2.1-MLX-4bit", result.models[0].id);
+    try testing.expectEqualStrings("qwen_image21", result.models[0].model_type);
 }
 
 test "discoverModels finds an mflux FLUX.2 repo (no root config.json)" {
@@ -2068,4 +2187,24 @@ test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
         \\{"weight_map":{"language_model.mtp.fc_hidden.weight":"model-00002.safetensors"}}
     });
     try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
+}
+
+test "readStubMeta: has_thinking reads the template on disk" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{\"model_type\":\"qwen3_5\",\"hidden_size\":8}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const model_dir = try std.fmt.allocPrint(allocator, "{s}/m", .{path_buf[0..root_len]});
+    defer allocator.free(model_dir);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/tokenizer_config.json", .data = "{\"chat_template\":\"{% if enable_thinking %}x{% endif %}\"}" });
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_thinking);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/chat_template.jinja", .data = "{{ messages[0].content }}" });
+    try std.testing.expect(!readStubMeta(io, allocator, model_dir).has_thinking);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/chat_template.jinja", .data = "<|im_start|>assistant\n<think>\n" });
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_thinking);
 }
