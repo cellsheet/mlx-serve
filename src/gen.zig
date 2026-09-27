@@ -517,7 +517,7 @@ pub const MAX_EDIT_IMAGES_OTHER = 4;
 pub fn editRefCap(backend: ImageBackend) usize {
     return switch (backend) {
         .qwen_image => MAX_EDIT_IMAGES,
-        .flux, .krea, .mage_flow => MAX_EDIT_IMAGES_OTHER,
+        .flux, .krea, .mage_flow, .anima => MAX_EDIT_IMAGES_OTHER,
     };
 }
 
@@ -5231,6 +5231,7 @@ test "editRefCap is 10 for Qwen-Image and 4 for the other editors" {
     try testing.expectEqual(MAX_EDIT_IMAGES, editRefCap(.{ .qwen_image = undefined }));
     try testing.expectEqual(MAX_EDIT_IMAGES_OTHER, editRefCap(.{ .flux = undefined }));
     try testing.expectEqual(MAX_EDIT_IMAGES_OTHER, editRefCap(.{ .mage_flow = undefined }));
+    try testing.expectEqual(MAX_EDIT_IMAGES_OTHER, editRefCap(.{ .anima = undefined }));
 }
 
 test "peekModelType classifies a model_index-only Qwen-Image-2.1 repo" {
