@@ -14,7 +14,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.2, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
+Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` d73eb752e = v0.32.2 + the sorted gather_qmm NAX 32K-row fix #3922, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
 
 ## Layout (`src/`)
 
@@ -34,7 +34,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `muse_vision.zig` / `lfm2_vision.zig` | Muse-Glimmer ViT / LFM2-VL SigLIP2-NaFlex tower + projector + tiling |
 | `server.zig` | All HTTP: `/v1/*` (chat/completions/messages/responses/embeddings/load/unload/models), media endpoints, `/metrics(.json)`, WS, Ollama glue, `--api-key`, console at `GET /` (`src/html/` as `{s}` args, renders with NO model). Embeddings: BERT + EmbeddingGemma, per-checkpoint pooling, `--embedding-max-length` |
 | `lan.zig` | LAN sharing: Bonjour, `SharedSet` + `routeClass` allowlist, `<id>@<peer>` mirroring, streaming proxy. Pure transport |
-| `model_settings.zig` | Per-model settings (`~/.mlx-serve/model-settings.json`, keyed by model path): `ctx_size`, `kv_quant`, `mtp`, `mtp_acceptance` (`exact|typical|tokenv3` at the default thresholds), `chat_template_kwargs` (JSON object of template variables, vLLM/llama.cpp vocabulary); read at every load construction site, stamped on `ModelConfig.{ctx,kv_quant,mtp,mtp_acceptance}_override` + `ChatConfig.chat_template_kwargs` |
+| `model_settings.zig` | Per-model settings (`~/.mlx-serve/model-settings.json`, keyed by model path): `ctx_size`, `kv_quant`, `mtp`, `mtp_acceptance` (`exact|typical|tokenv3` at the default thresholds), `mtp_greedy_tail` (bool), `chat_template_kwargs` (JSON object of template variables, vLLM/llama.cpp vocabulary); read at every load construction site, stamped on `ModelConfig.{ctx,kv_quant,mtp,mtp_acceptance,mtp_greedy_tail}_override` + `ChatConfig.chat_template_kwargs` |
 | `providers.zig` | Upstream OpenAI-compatible chat providers (`~/.mlx-serve/providers.json`): background `/v1/models` probe, `<id>@<name>` rows (`models` = filter, or the list for a listless provider), curl-backed `/v1/chat/completions` proxy. `GET /v1/providers`, `POST /v1/providers/reload` |
 | `metrics.zig` | Lock-free zero-when-off observability (`--metrics`): `vllm:`+`mlx_serve:` Prometheus + JSON |
 | `ollama.zig` | `/api/*` translation, SSE→NDJSON `Sink`, tags/show/ps, `resolveName` |
@@ -76,7 +76,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `status.zig` / `log.zig` | TUI status bar; leveled logging + file sink (`~/.mlx-serve/logs/mlx-serve-<port>.log`, 32 MB rotation) |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` / `mtp_replay_test.zig` | Hermetic format corpus + real-traffic replay (`src/fixtures/tool_traffic.jsonl`) + MTP depth-policy replay over recorded acceptance traces (`src/fixtures/mtp_accept_traces.txt`) |
 
-CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --config-overrides --embedding-max-length --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-history-window --max-mtp-ctx --ane-prefill --ane-image --ane-video --ane-audio --ane-split --dspark --decode-attn-quant --no-decode-attn-quant --kv-quant --kv-attn-mode --prefix-cache-entries --prefix-cache-mem --prefix-cache-disk --max-concurrent --prefill-decode-share --skip-mem-preflight --os-reserve-gib --wired-margin-gib --mtp-head-kv-quant --metrics --api-key --lan-share --lan-discover --lan-name --no-drafter --no-tool-autocorrect --no-prevent-sleep --ssd-streaming --ple-gpu --no-ds4-mtp --model-dir --log-level --log-file --version --help`
+CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --config-overrides --embedding-max-length --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-greedy-tail --mtp-history-window --max-mtp-ctx --ane-prefill --ane-image --ane-video --ane-audio --ane-split --dspark --decode-attn-quant --no-decode-attn-quant --kv-quant --kv-attn-mode --prefix-cache-entries --prefix-cache-mem --prefix-cache-disk --max-concurrent --prefill-decode-share --skip-mem-preflight --os-reserve-gib --wired-margin-gib --mtp-head-kv-quant --metrics --api-key --lan-share --lan-discover --lan-name --no-drafter --no-tool-autocorrect --no-prevent-sleep --ssd-streaming --ple-gpu --no-ds4-mtp --model-dir --log-level --log-file --version --help`
 
 Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded (1.0/1.0/off). Missing generation_config = wild-sampling signature.
 
@@ -91,7 +91,7 @@ Sampling defaults for omitted fields: body > launch flags > model `generation_co
 
 ## Testing — TDD is mandatory
 
-Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) full suite (`zig build test` 6/6 0 fail + `bash app/test.sh`/`swift build` + relevant `tests/*.sh`); (4) refactor. A live curl is a sanity check, NOT a test.
+Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) full suite (`zig build test` all steps, 0 fail + `bash app/test.sh`/`swift build` + relevant `tests/*.sh`); (4) refactor. A live curl is a sanity check, NOT a test.
 
 Feature = unit test that fails without it (+ integration script if HTTP-observable). Bug fix = regression test red→fix→green, red-on-revert. Cross-arch = cover every touched arch. Refactor = characterization test first. UI/build scripts = factor a pure helper and test that.
 
@@ -313,6 +313,7 @@ Prefix cache (RAM + SSD):
 - **A disk restore evals each chunk before loading the next** (a lazy `mlx_load_safetensors` holds its fd until eval: 256 files = ~250k tokens); restore entry points drop their own latch, or the cold fallback fails.
 - **SSD-first** (qwen4 + disk tier, `ssdFirstActive`): RAM floors at one session; spill and EVICT are two decisions (`PersistOutcome`); writes ride `kv_disk_writer.zig`; a checkout is a PROMISE until the append DONATES (`donateCheckout`/`releaseCheckout`).
 - **The batched pad-waste cap reads `KVCache.kvLenForBatching`**, never `cache.step`.
+- **An in-place SSD commit bills by MEASURE** (`nonChunkBytes` after − before, #573): the per-term delta in `appendSsmOnly` under-billed whole checkpoint lists in ReleaseFast builds and the tier outgrew its cap. Its guard is red only under `zig build test -Doptimize=ReleaseFast`.
 
 MLX errors + threads:
 - **An MLX failure is CATCHABLE** (#353, `installErrorHandler`): `checkError` per chunk, `checkErrorDecode` per tick, a latched error never 200s; a swallowed failure DROPS its latch (`dropLatchedErrorUnless(had_error)`); never hand a null `mlx_array` to the tensor-map insert. Guard: `tests/test_mlx_error_recovery.sh`.
@@ -389,6 +390,7 @@ Spec decode:
 - **Auto-mode MTP output is NOT byte-reproducible**; byte bar = `MLX_SERVE_MTP_FORCE_DEPTH`. Acceptance is a PROMPT-TYPE property — measure per index (`acc_idx=`) before touching round cost.
 - **EV cost tables are refit whenever the verify forward changes** (`MTP_EV_DEFAULT_COSTS`); `MtpCostProfile` comes from the runtime fingerprint, never the sidecar; qwen4 has its own G17 surface (`MLX_SERVE_MTP_QWEN4_PROFILE=0`). A/B profiles with persistence OFF on both arms.
 - **Drafts shortlist on a coarse lm_head and re-score exactly** (`buildRerankCoarse`/`rerankShortlist`, from the MIXER output; `MLX_SERVE_MTP_DRAFT_RERANK=0`). Proposal is per REQUEST (`mtpDraftStepPath`): greedy = argmax, sampled = q over the exact top-32; sampled group rows stay batched (`shortlistProposalRows`).
+- **A draft depth's proposal is resolved in ONE place, `mtpDraftSampling(step)`**: the greedy tail (`--mtp-greedy-tail`, per-model `mtp_greedy_tail`) samples depth 0 and argmaxes later depths with a one-hot q. A chain carrying q drafts `[1]` ids at every depth (`argmaxStepProposal`): the accept graphs concat them, and `draftSelect` returns `[1,1]`.
 - **qwen4 MTP specifics**: head projects only the consumed row (`Qwen4MtpProject`); EV seed lives on `Qwen4Mtp`, declines under FORCE_DEPTH; head rides the slot's M-RoPE table on image turns; a verify row is BYTES (MTP stays opt-in); grouped-expert NAX tile is a measured LOSS. Solo greedy rounds pad the head history and build the next chain lazily (`MLX_SERVE_MTP_PADDED_HEAD=0` / `MLX_SERVE_MTP_LAZY_PREDRAFT=0`); the lazy plan lags one round at auto depth BY DESIGN (see engine-mlx gotchas).
 
 Sampling:
@@ -417,6 +419,7 @@ Kernels + numerics:
 - **verifyQmm lanes** (`vqmmLaneForTile`): split-K M 2–7 / wide tile / NAX m16 M 8–16 / shader matmul2d on G16 (4-bit, M 8–24) / crossrow opt-in; plain-SIMD tiles BITS-templated and SHAPE-gated (`mixedPlainShapeEnabled`). M=8 is the plain-SIMD cliff.
 - **A verify lane is never byte-identical to stock**; parity = fp32-dequant truth per width, RMS ratio vs stock ≤ 3.0x, never cosine (`VerifyQmmParity`). 2-bit GEMV accumulates in f32 from exact products (`qmv2.zig`, M 1..8; unmeasured GPU generations keep the old M 1..3 dispatch).
 - **A `metal_kernel` config cache is keyed by FULL SHAPE** (`ShapeKey`); a borrowed-handle cache evicts LRU (`vqmmScalarEvictIndex`). A bandwidth bench smaller than a real step measures CACHE.
+- **Metal caps threads per threadgroup PER COMPILED KERNEL, by register use** (M1/M2: 704 and 448 for `simd_qmm` mma, 1024 for everything on M3+): a kernel above 256 threads probes on its first eval and shrinks simdgroups in the same summation order (`mma_sg`); under test a latched MLX error is invisible and poisons the next tests, so a kernel test drops its own latch.
 - **A diagnostic env goes through `diagEnvOn`** (absent or `0` = off). A default belongs to the engine that MEASURED it.
 - **Kernel testing**: parity = no-worse-than fp32 truth, never kernel-vs-kernel; same-boot A/Bs at per-cell MEDIANS, interleaved in one process; every adopted shape gets its own A/B; content-forking arms need 3+ reps with a NONCE per rep.
 - **QSA** (qwen4): GATHERS selected blocks, never a dense `[S, kv]` mask (`gatherQsa256`, `qsaSparseAttn`, `qsaDecodeGatherAttn`); exact select `msv_qsa_select` (split 16-way at decode, `MLX_SERVE_QSA_SELECT_SPLIT=0`); score sheet one NAX kernel (`msv_qsa_score`, `qsaScoreFusedActiveFor`); verify gather floor per KV scheme (`qsaVerifyGatherMinKvFor`); NAX gather via `qsaNaxEligible` (`MLX_SERVE_QSA_NAX=0`, bar = error vs float64).
