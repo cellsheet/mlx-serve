@@ -22,10 +22,13 @@
 - **Console in Simplified Chinese with a light theme**, and the app's alerts and hints are translated (#487, #485, #463).
 
 ### Changes
+- A model can have a short alias (Model Settings, or `"alias"` in model-settings.json) that works wherever a request names a model, including Ollama, load and unload; `/v1/models` lists it beside the full id (#520).
 - DFlash on Nemotron-H and dense Qwen3.5/3.8 emits exactly what serial decoding would, sampled requests included, on 4, 6 and 8-bit packs; seeded output with a DFlash drafter differs from earlier versions.
 - A seeded request gives the same text whether or not its prompt hit the prefix cache.
 - Qwen3.8-27B with a DFlash2 drafter verifies a tree of drafts each round instead of one path.
 - Nemotron-H 3.5 MoE checkpoints load (#559).
+- Qwen-Image-2.1 packs whose text or vision embedding tables are quantized at a group size other than 64 load them at the right width instead of misreading them silently (#496).
+- Qwen-Image-2.1 packs that store their VAE in MLX layout, like `mlx-community/Qwen-Image-2.1-MLX-4bit`, generate and edit instead of failing at the first VAE conv (#496).
 - A second server refuses a port already in use instead of silently sharing it (#569).
 - A request that names a model by its path no longer gets another model's answer: a pack that failed to load returns its load error, and an unknown path returns 404 (#585).
 - Qwen3.8 Flash Next GGUFs route to the engine that can load them (#546).
