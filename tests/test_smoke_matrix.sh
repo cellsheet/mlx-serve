@@ -55,6 +55,9 @@ ARCHES=(
     "gguf_llama|yes|unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf|gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf|unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ2_XXS.gguf|unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-IQ4_NL.gguf"
     "qwen4_exp|yes|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-3.3bpw"
     "qwen4_exp_sushi|yes|beamster/Qwen3.8-Flash-Next-Sushi-2bpw"
+    "bailing_hybrid|yes|rapid-mlx/Ling-3.0-tiny-MLX-4bit"
+    "mimo_v2|yes|ddalcu/MiMo-V2.6-Flash-MLX-Serve-MXFP4-Q8"
+    "glm5_next|yes|TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP"
 )
 CONFIGS="${SMOKE_CONFIGS:-default,kv4,kv8,mtp,nospec,drafter,drafter_kv8}"
 # A DFlash drafter per arch when the pack carries none in drafter/.
@@ -185,6 +188,17 @@ print(json.dumps({"c":c,"rc":rc}))' 2>/dev/null)
         c=$(echo "$r" | J 'd["choices"][0]["message"]["content"] or ""')
         check "thinking off: content" "$([[ -n "$c" ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 300)"
     fi
+
+    # 3b. a ~3k-token prompt still reads its first line: a window or rope wrong only
+    # past 1-2k tokens answers short prompts fine (Llama 3.x 1024-token windows).
+    r=$(post /v1/chat/completions "$(python3 -c '
+import json
+fill = "".join(f"Line {i}: the quick brown fox jumps over the lazy dog near the river bank.\n" for i in range(160))
+p = "My favourite number is 4417.\n" + fill + "What is my favourite number? Reply with the number only."
+print(json.dumps({"model": "m", "messages": [{"role": "user", "content": p}], "max_tokens": 60, "temperature": 0, "enable_thinking": False}))')")
+    # A model that thinks with thinking off (LFM2.5-8B-A1B) quotes the line in its reasoning: either proves it read it.
+    c=$(echo "$r" | J '(d["choices"][0]["message"].get("content") or "") + (d["choices"][0]["message"].get("reasoning_content") or "")')
+    check "long prompt: answers from its first line" "$(echo "$c" | grep -q 4417 && echo 0 || echo 1)" "prompt=$(echo "$r" | J 'd["usage"]["prompt_tokens"]') '${c:0:80}'"
 
     # 4. tools: 200 + valid args when the model calls
     r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Use the tool to get the weather in Paris.\"}],\"tools\":$TOOLS,\"max_tokens\":300,\"temperature\":0}")

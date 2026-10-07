@@ -327,10 +327,13 @@ pub const Conn = struct {
     /// output through `writer()` directly, bypassing this hook — same
     /// interception pattern as `ws_mode`. See src/ollama.zig.
     ollama_sink: ?*ollama_mod.Sink = null,
+    /// Agent named by the current request's User-Agent.
+    client: instr.Client = .other,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
         c.io = io;
+        c.client = .other;
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
@@ -338,6 +341,11 @@ pub const Conn = struct {
         c.sse_headers_sent = false;
         c.length_framed = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
+    }
+
+    /// Replaces the previous request's client, so a request without a User-Agent never inherits it.
+    pub fn noteRequestHeaders(c: *Conn, headers: []const u8) void {
+        c.client = instr.Client.fromUserAgent(findHeaderValue(headers, "user-agent"));
     }
 
     /// True when the connection has been silent long enough that a streaming
@@ -762,10 +770,12 @@ const ROUTE_PATHS = [_][]const u8{
     "/tokenize",
     "/v1/3d/generations",
     "/v1/audio/music-generations",
+    "/v1/audio/sound-generations",
     "/v1/audio/speech",
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/decisions",
+    "/v1/systemone",
     "/v1/embeddings",
     "/v1/images/edits",
     "/v1/images/generations",
@@ -803,7 +813,7 @@ pub fn maxRequestBytesFor(target: []const u8) usize {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
         if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
-    if (std.mem.eql(u8, path, "/v1/decisions")) return max_decision_request_bytes;
+    if (std.mem.eql(u8, path, "/v1/decisions") or std.mem.eql(u8, path, "/v1/systemone")) return max_decision_request_bytes;
     return max_request_bytes;
 }
 
@@ -901,6 +911,8 @@ pub fn parseModelFromRequest(body: []const u8, content_type: []const u8) ?[]cons
 // (`--prefix-cache-mem`, default 2 GB) is what actually bounds memory,
 // evicting LRU entries by size. 0 disables.
 pub var prefix_cache_capacity: u32 = 32;
+/// `--no-prefix-cache-ram` keeps the disk tier eligible without idle RAM retention.
+pub var prefix_cache_ram_enabled: bool = true;
 
 /// Wave 1.B — hot prefix cache memory budget. The cache evicts LRU entries on
 /// commit until `current_kv_bytes + new_bytes <= prefix_cache_mem_bytes`. The
@@ -920,7 +932,7 @@ pub var prefix_cache_mem_explicit = false;
 /// Bytes one cached session at `ctx_tokens` holds: its KV and state, plus the SSM checkpoints
 /// a cold prefill of that length retains, which the commit path bills to the entry.
 pub fn oneSessionEntryBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
-    return sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes() +|
+    return sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| slotFixedKvBytes(config, kv_bits, chunk) +|
         retainedSsmCheckpointBytes(config, ctx_tokens, 0, chunk);
 }
 
@@ -938,7 +950,7 @@ var hot_cache_mem_resolved = std.atomic.Value(u64).init(HOT_CACHE_MEM_UNRESOLVED
 
 /// The hot-cache byte budget every post-load reserve must bill: the clamp's answer once loaded, the raw ask before.
 pub fn resolvedPrefixCacheMem() u64 {
-    if (prefix_cache_capacity == 0) return 0;
+    if (prefix_cache_capacity == 0 or !prefix_cache_ram_enabled) return 0;
     const v = hot_cache_mem_resolved.load(.monotonic);
     return if (v != HOT_CACHE_MEM_UNRESOLVED) v else prefix_cache_mem_bytes;
 }
@@ -994,20 +1006,19 @@ pub var ssm_checkpoint_stride: u32 = 256;
 /// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
 pub var ssm_checkpoint_max: u32 = 16;
 
-/// SSM prefill checkpoints exist ONLY to feed the hot prefix cache (RAM +
-/// disk tiers key their hybrid restores off them). With the cache disabled
-/// (`--prefix-cache-entries 0`) every capture is a 48-layer materialize +
-/// eval thrown straight away — measured ~2-4% of short-prompt prefill on
-/// Qwen3.6-27B. Single chokepoint for every LoadParams builder.
-pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32) u32 {
-    if (cache_capacity == 0) return 0;
+/// SSM checkpoints feed reusable prefix tiers; zero capacity disables all reuse.
+pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32, ram_enabled: bool, disk_bytes: u64) u32 {
+    if (cache_capacity == 0 or (!ram_enabled and disk_bytes == 0)) return 0;
     return stride;
 }
 
-test "effectiveSsmCheckpointStride: disabled prefix cache disables checkpoint capture" {
-    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0));
-    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32));
-    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32));
+test "effectiveSsmCheckpointStride: zero capacity disables both tiers, RAM-off preserves disk" {
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0, true, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0, false, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32, true, 0));
+    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32, false, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 32, false, 0));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32, true, 0));
 }
 
 /// PLD request defaults carried as ONE value, so a `ServerConfig` builder
@@ -1083,23 +1094,10 @@ test "PldDefaults: ServerConfig built from it reports the CLI values" {
 /// hoarding token buffers across a long session.
 pub var tokenize_cache_entries: u32 = 4;
 
-/// Iteration 3-5 (perf-plan Phase 5 #1): cap on resident llama.cpp KV
-/// sessions per loaded GGUF model. 1 is the legacy single-session
-/// behavior (a flip between two long-doc prompts evicts the other on
-/// every turn — and even sequential shared-prefix requests reported
-/// cached_tokens=0). N > 1 enables the best-prefix-match LRU so
-/// alternating multi-doc / agent workloads stay warm. Sessions are
-/// created lazily, so unused slots cost nothing.
-pub var llama_cache_entries: u32 = 4;
-
-/// Phase 5 (performance-plan) #2: KV-cache quantization for the embedded
-/// llama.cpp engine. `off` = F16 (libllama default); `q8` halves the KV
-/// bytes (Q8_0, near-lossless); `q4` quarters them (Q4_0, some quality
-/// impact). Non-default settings automatically enable flash attention in
-/// the shim because llama.cpp's plain SDPA only supports F16/F32 KV.
-/// Set via `--llama-kv-quant {off,q8,q4}`. Applies to every llama.cpp
-/// session created after this is set (i.e., from the next model load).
-pub var llama_kv_quant: arch_llama.LlamaKvQuant = .off;
+/// Embedded llama.cpp engine settings: `--llama-cache-entries` (sequences per
+/// model), `--llama-kv-quant`, `--llama-ubatch`, `--llama-mtp-drafts`. Read when
+/// a GGUF model loads.
+pub var llama_settings: scheduler_mod.LlamaSettings = .{};
 
 /// Plan 01 — continuous batching: maximum concurrent in-flight requests sharing
 /// the inference thread's batched-decode pass. Set via `--max-concurrent N`.
@@ -1245,6 +1243,33 @@ fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tok
     @memcpy(forced[stop_ids.len + 1 ..], sep_ids);
     log.info("  reasoning budget {d}: enforced in-stream\n", .{budget});
     return .{ .budget = @intCast(budget), .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
+}
+
+/// Arm the forced tool-call opener for a `tool_choice` that obliges a call, or
+/// null when the dialect has no opener we can spell or the thought cannot be
+/// tracked. `forced` is allocated; the caller frees it after generation.
+fn armToolForce(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, forced_tool: ?chat_mod.ForcedTool) ?generate_mod.ToolForce {
+    const ft = forced_tool orelse return null;
+    if (lm.transformer == null) return null;
+    const cc = lm.chat_config orelse return null;
+    const text = (chat_mod.forcedToolOpener(allocator, cc.chat_template, ft) catch return null) orelse return null;
+    defer allocator.free(text);
+    const opened = promptOpensThink(allocator, lm, tok, prompt_ids);
+    const closer = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER);
+    if (opened and closer == null) return null;
+    const opener = tok.encode(allocator, text) catch return null;
+    defer allocator.free(opener);
+    const sep = tok.encode(allocator, "\n\n") catch return null;
+    defer allocator.free(sep);
+    const head: usize = if (opened) 1 + sep.len else 0;
+    const forced = allocator.alloc(u32, head + opener.len) catch return null;
+    if (opened) {
+        forced[0] = closer.?;
+        @memcpy(forced[1..head], sep);
+    }
+    @memcpy(forced[head..], opener);
+    log.info("  tool_choice: call opener enforced in-stream\n", .{});
+    return .{ .closer_id = closer, .forced = forced, .opener_at = head, .in_think = opened };
 }
 
 fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) bool {
@@ -1547,6 +1572,32 @@ fn toolCallFinishReason(pre_parse: []const u8) []const u8 {
     return if (std.mem.eql(u8, pre_parse, "length")) "length" else "tool_calls";
 }
 
+/// The `tool_calls` array of one streamed chat-completions delta: name, id and
+/// the full arguments in ONE delta, every string escaped.
+fn streamToolCallDelta(allocator: std.mem.Allocator, index: usize, id: []const u8, name: []const u8, arguments: []const u8) ![]u8 {
+    const esc_name = try jsonEscape(allocator, name);
+    defer allocator.free(esc_name);
+    const esc_args = try jsonEscape(allocator, arguments);
+    defer allocator.free(esc_args);
+    return std.fmt.allocPrint(allocator,
+        \\[{{"index":{d},"id":"{s}","type":"function","function":{{"name":{s},"arguments":{s}}}}}]
+    , .{ index, id, esc_name, esc_args });
+}
+
+test "streamed tool-call delta escapes the name and arguments (#748)" {
+    const allocator = std.testing.allocator;
+    const name = "read_file\n</parameter \"x\" \\";
+    const args = "{\"path\":\"a\\nb\"}";
+    const delta = try streamToolCallDelta(allocator, 0, "call_1_0", name, args);
+    defer allocator.free(delta);
+    try std.testing.expect(std.mem.indexOfScalar(u8, delta, '\n') == null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, delta, .{});
+    defer parsed.deinit();
+    const function = parsed.value.array.items[0].object.get("function").?.object;
+    try std.testing.expectEqualStrings(name, function.get("name").?.string);
+    try std.testing.expectEqualStrings(args, function.get("arguments").?.string);
+}
+
 /// A repetition-loop cut may land inside an otherwise recognizable tool call.
 /// Never emit that buffer as executable work: unlike a genuine max-token cut,
 /// this intentional stop must not ask clients to recover by compacting/retrying.
@@ -1797,16 +1848,18 @@ pub fn serve(
     g_model_aliases.alloc = scheduler.registry.allocator;
     g_model_aliases.path = model_settings_mod.defaultPath(&g_model_aliases_path);
 
-    // Plan 05: the hot prefix cache lives on the LoadedModel
-    // (entry.prefix_cache) and is set up by `loadModelOnInferenceThread`
-    // using the per-LoadParams capacity + byte budget. Surface a friendly
-    // log line so users see whether the cache engaged.
+    // Prefix cache lives on LoadedModel and may retain idle prefixes in RAM, SSD, or both.
     if (scheduler.hot_prefix_cache != null) {
         const ssm_note: []const u8 = if (config.has_hybrid_layers)
             " [hybrid: SSM checkpoints]"
         else
             "";
-        if (resolvedPrefixCacheMem() > 0) {
+        if (!prefix_cache_ram_enabled and prefix_cache_disk_bytes > 0) {
+            log.info("Prefix cache: SSD ONLY (RAM retention disabled, disk cap={d:.1} MB){s}\n", .{
+                @as(f64, @floatFromInt(prefix_cache_disk_bytes)) / (1024.0 * 1024.0),
+                ssm_note,
+            });
+        } else if (resolvedPrefixCacheMem() > 0) {
             const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
         } else {
@@ -1969,7 +2022,7 @@ pub fn serve(
     log.info("  POST /v1/chat/completions\n", .{});
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
-    log.info("  POST /v1/decisions (Laya, Kev)\n", .{});
+    log.info("  POST /v1/decisions, /v1/systemone (Laya, Kev, Clef)\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
     log.info("  POST /v1/responses/compact\n", .{});
@@ -2204,6 +2257,7 @@ fn handleConnection(
     // boundary lets us find (`parseModelFromRequest`).
     const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
     logHttpRequest(method, raw_path, request_body);
+    stream.noteRequestHeaders(request[0..header_end_pos]);
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
     //    requires the key (the OpenAI/Anthropic/Ollama APIs AND the index page
@@ -2641,7 +2695,7 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .speech);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/decisions")) {
+    } else if (std.mem.eql(u8, method, "POST") and (std.mem.eql(u8, path, "/v1/decisions") or std.mem.eql(u8, path, "/v1/systemone"))) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .decisions);
@@ -2649,6 +2703,10 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .music);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/sound-generations")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .sound);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/video/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -3607,7 +3665,7 @@ pub fn prefillTransientReserveAtKv(
         config.prefillAttnKeys(seq),
         prefillStreamBytesPerToken(config),
         prefillDequantWeightBytes(config),
-        .{ .qsa_ring_bytes = config.qsaRingBytes(), .dq_min_rows = transformer_mod.prefillDqGemmMinRows(config.quant_bits) },
+        .{ .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk), .dq_min_rows = transformer_mod.prefillDqGemmMinRows(config.quant_bits) },
     ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 }
 
@@ -3672,7 +3730,8 @@ pub fn ctxBarEnabled() bool {
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
 /// `generate.PREFILL_CHUNK_FLOOR` — below that the score-budget path refuses to
 /// go either, and a 256-token forward stops amortizing the per-chunk sweeps.
-pub const PREFILL_CHUNK_LADDER = [_]u32{ 8192, 4096, 2048, 1024, 512 };
+/// The top rung is `WIDE_PREFILL_CHUNK`, pinned only by an arch with no prefill score tensor.
+pub const PREFILL_CHUNK_LADDER = [_]u32{ @intCast(generate_mod.WIDE_PREFILL_CHUNK), 8192, 4096, 2048, 1024, 512 };
 
 /// How much of the post-weights serving budget a ONE-OFF prefill transient may
 /// claim before the chunk steps down. A quarter: past that the machine is
@@ -3738,6 +3797,7 @@ pub fn resolvePrefillChunk(
 ) u32 {
     const cap: u64 = prefillChunkCap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
     for (PREFILL_CHUNK_LADDER) |chunk| {
+        if (chunk == generate_mod.WIDE_PREFILL_CHUNK and config.prefillScoreHeadDim() != 0) continue;
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
     }
     // Nothing fits the share — the model barely fits at all. Take the narrowest
@@ -3777,7 +3837,9 @@ pub fn billedPrefillChunk(
 /// explicit `--ctx-size`, 0 while the context is auto (the auto sizer adapts to the rung).
 pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
     if (manualContext(config) == 0) return 0;
-    return sessionBytesPerToken(config, kv_bits) *| manualContext(config) +| config.qsaRingBytes();
+    // Runs inside `pinPrefillChunk`: before the pin, bill the widest rung.
+    const chunk: u64 = if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else generate_mod.WIDE_PREFILL_CHUNK;
+    return sessionBytesPerToken(config, kv_bits) *| manualContext(config) +| slotFixedKvBytes(config, kv_bits, chunk);
 }
 
 /// Freeze this model's prefill chunk at load, from live memory. Idempotent.
@@ -3882,7 +3944,7 @@ pub fn planHotCache(
     const chunk = billedPrefillChunk(config, kv_bits, ceiling, active_weights, sizer_ctx_kv, requested, chunk_override);
     const reserve_chunk = clampReserveWidth(config, chunk);
     const reserve = prefillTransientReserve(config, kv_bits, reserve_chunk);
-    const ctx_kv: u64 = sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes();
+    const ctx_kv: u64 = sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| slotFixedKvBytes(config, kv_bits, chunk);
     return .{
         .chunk = chunk,
         .reserve_chunk = reserve_chunk,
@@ -3955,7 +4017,7 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
 /// The bytes the SSD-first budget floors at: one session at the working context, at the width the cache stores.
 fn ssdFirstSessionKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u64 {
     return sessionBytesPerToken(config, kv_bits) *|
-        ssdFirstSessionTokensNow(config, kv_bits, ceiling, active_mem, chunk) +| config.qsaRingBytes();
+        ssdFirstSessionTokensNow(config, kv_bits, ceiling, active_mem, chunk) +| slotFixedKvBytes(config, kv_bits, chunk);
 }
 
 /// The SSD-first arm of `prefixCacheMemForLoad`, gate and log included. Null when the arch
@@ -3971,7 +4033,7 @@ fn ssdFirstBudgetForLoad(
     quiet: bool,
 ) ?u64 {
     // The predicate, shared with the spill site: without a disk tier the mode's floor would be RAM the server cannot use.
-    if (!prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0)) return null;
+    if (prefix_cache_capacity == 0 or !prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_ram_enabled)) return null;
     const budget = ssdFirstPrefixCacheMem(
         requested,
         ceiling,
@@ -4009,6 +4071,13 @@ const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The previous context-sizing cache reserve: the raw `--prefix-cache-mem` ask. Kept for
 /// ungated archs so their advertised `context_length` does not move.
+/// The ungated arm's ask. A sliding-ring entry cannot be trimmed below its ring (`ringFloor`), so
+/// a budget under one session caches nothing for it: it asks for one session at the working context.
+fn ungatedHotCacheAsk(config: *const model_mod.ModelConfig, requested: u64, explicit: bool, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
+    if (!config.slidingRing()) return requested;
+    return defaultPrefixCacheAsk(requested, explicit, oneSessionEntryBytes(config, kv_bits, ctx_tokens, chunk));
+}
+
 fn legacyPrefixCacheAsk() u64 {
     if (prefix_cache_capacity == 0) return 0;
     return prefix_cache_mem_bytes; // legacy_ask_read
@@ -4044,9 +4113,10 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         const chunk: u64 = pinPrefillChunk(config);
         // `statePerTokenBilled` is 0 off qwen4_exp.
         const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
-            getEffectiveContextLength(config) +| config.qsaRingBytes();
+            getEffectiveContextLength(config) +| slotFixedKvBytes(config, kv_bits, chunk);
+        const ask = ungatedHotCacheAsk(config, requested, prefix_cache_mem_explicit, kv_bits, getEffectiveContextLength(config), chunk);
         const clamped = clampedPrefixCacheMem(
-            requested,
+            ask,
             currentGpuMemoryCeiling(config, active_mem),
             active_mem,
             ctx_kv,
@@ -4055,8 +4125,10 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         // Publishing the resolved budget is kept on every arch: the ANE gate used to reserve the raw ask.
         publishResolvedPrefixCacheMem(clamped);
         if (revise.quiet) return clamped;
-        if (requested > 0 and clamped < requested) {
-            log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
+        if (ask > 0 and clamped < ask) {
+            log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ ask >> 20, clamped >> 20 });
+        } else if (ask != requested) {
+            log.info("[hot-cache] budget {d} MB (one session at the working context: a sliding-ring entry is never trimmed)\n", .{clamped >> 20});
         } else if (requested == 0) {
             log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
         }
@@ -4514,13 +4586,14 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
     defer static_ceiling_override = orig_ceiling;
     static_ceiling_override = 109_395 * (1 << 20);
 
-    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false));
-    try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true));
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false, true));
+    try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true, true));
     var dense = model_mod.ModelConfig{};
     dense.model_type = "qwen3";
-    try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true));
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true, true));
+    try t.expect(prefix_cache_mod.ssdFirstActive(&dense, true, false));
     prefix_cache_mod.ssd_first_override = false;
-    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, true));
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, true, true));
     prefix_cache_mod.ssd_first_override = true;
 
     // The SSD arm floors at one session's KV, the RAM arm is a residual bounded by the ask.
@@ -4772,8 +4845,8 @@ test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
     const seq: u64 = 512 * 1024;
     const short = prefillRequestTerms(&cfg, 1024, 2048, 8, 4096, .{});
     const long = prefillRequestTerms(&cfg, seq, 2048, 8, 4096, .{});
-    try t.expectEqual(cfg.qsaRingBytes(), short.qsa_ring_bytes);
-    try t.expectEqual(cfg.qsaRingBytes(), long.qsa_ring_bytes);
+    try t.expectEqual(cfg.qsaRingBytes(), short.slot_fixed_kv_bytes);
+    try t.expectEqual(cfg.qsaRingBytes(), long.slot_fixed_kv_bytes);
     const reserved = @max(reservedCacheTokens(seq, 2048, 4096, getEffectiveContextLength(&cfg)), seq);
     const new_needed = prefillNeededAtChunk(&cfg, seq, 2048, 8, 4096, .{});
     const old_needed = new_needed +| (reserved * 3_072 * 5 / 4);
@@ -5155,6 +5228,13 @@ fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
 /// Both the auto-context sizer and the prefill admission guard bill through
 /// here. The sizer used to bill fp16 unconditionally, so a `--kv-quant 4`
 /// server reported — and served — under a third of the context it can hold.
+/// KV every live slot holds whatever its length: the QSA key ring and the sliding rings
+/// (`ModelConfig.slidingRing`), whose buffers hold keep + one prefill chunk of rows.
+pub fn slotFixedKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) u64 {
+    const ring_rows: u64 = @as(u64, config.slidingKeepRows()) +| chunk;
+    return config.qsaRingBytes() +| kvBytesPerTokenAtBits(config.slidingRowBytes(), kv_bits) *| ring_rows;
+}
+
 pub fn kvBytesPerTokenAtBits(dense: u64, kv_bits: u64) u64 {
     if (kv_bits >= 16) return dense;
     return dense * (2 * kv_bits + 1) / 32;
@@ -5263,7 +5343,8 @@ pub const PrefillRequestTerms = struct {
     /// Zero when nothing grows and when the restore was shared (the whole copy is billed
     /// uncredited instead).
     grow_coexist_bytes: u64 = 0,
-    qsa_ring_bytes: u64 = 0,
+    /// KV the slot holds whatever its length (`slotFixedKvBytes`).
+    slot_fixed_kv_bytes: u64 = 0,
     mtp_head_kv_bytes: u64 = 0,
     /// Forward width from which the dequant+GEMM route fires (`prefillDqGemmMinRows`).
     dq_min_rows: u64 = transformer_mod.PREFILL_DQ_GEMM_MIN_M,
@@ -5295,7 +5376,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // already dominates.
     const dq_weights: u64 = if (fwd >= req.dq_min_rows) dequant_weights else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
-        req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
+        req.grow_coexist_bytes + req.slot_fixed_kv_bytes + req.mtp_head_kv_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
     // The one place a warm turn's resident rows leave the bill, inside the 5/4.
     return (gross -| req.shared_resident_bytes) * 5 / 4;
 }
@@ -5350,6 +5431,13 @@ pub fn dsv4PrefillMemoryNeeded(seq: u64, layers: u64, latent: u64, hidden: u64, 
 ///
 /// Attention-only archs return 0 and keep exactly the bill they had.
 fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
+    return prefillStreamBytesPerTokenOn(config, transformer_mod.verifyQmmNaxAvailable());
+}
+
+fn prefillStreamBytesPerTokenOn(config: *const model_mod.ModelConfig, nax: bool) u64 {
+    // GLM-5 on NAX: the sorted expert gather reads tokens through its row map (no top_k
+    // replica) and the per-core KDA recurrence holds no per-layer q/k/v stream.
+    if (nax and config.isGlm5()) return 0;
     var per_tok: u64 = 0;
     const linear_layers: u64 = @as(u64, config.num_hidden_layers) -| config.attnCacheLayerCount();
     if (config.linear_num_value_heads > 0 and linear_layers > 0) {
@@ -5498,6 +5586,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         return .{
             .shared_resident_bytes = warm.creditedRows(seq) *| kv_per_tok,
             .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
+            .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk),
             .dq_min_rows = dq_min_rows,
         };
     }
@@ -5519,7 +5608,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
         .shared_resident_bytes = credited *| kv_per_tok,
         .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
-        .qsa_ring_bytes = config.qsaRingBytes() +| head_qsa_ring,
+        .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk) +| head_qsa_ring,
         .mtp_head_kv_bytes = reserved *| head_per_tok,
         .dq_min_rows = dq_min_rows,
     };
@@ -6220,6 +6309,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         // is evictable here by construction (the withheld case took the deferral arm).
         const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill);
         defer allocator.free(msg);
+        countRejected();
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
@@ -6303,6 +6393,8 @@ const ReadyCaps = struct {
     /// Audio engine's backend is the ACE-Step music generator (advertises
     /// "music" ADDITIVELY beside "audio", the ready-model "3d" precedent).
     has_music_backend: bool = false,
+    /// Stable Audio 3 text-to-audio: "sound" beside "audio", the same rule.
+    has_sound_backend: bool = false,
     has_video_engine: bool = false,
     has_mesh_engine: bool = false,
     has_decision_engine: bool = false,
@@ -6347,6 +6439,7 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     if (c.has_image_engine) try append_cap(allocator, &caps, &n_caps, "image");
     if (c.has_audio_engine and !c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
     if (c.has_music_backend) try append_cap(allocator, &caps, &n_caps, "music");
+    if (c.has_sound_backend) try append_cap(allocator, &caps, &n_caps, "sound");
     if (c.has_video_engine) try append_cap(allocator, &caps, &n_caps, "video");
     if (c.has_mesh_engine) try append_cap(allocator, &caps, &n_caps, "3d");
     if (c.has_decision_engine) try append_cap(allocator, &caps, &n_caps, "decisions");
@@ -6470,7 +6563,7 @@ fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
     };
     if (modality) |m| return switch (m) {
         .image => "This is an image generation model; it cannot serve chat/text requests. Use POST /v1/images/generations instead.",
-        .audio => "This is an audio generation model; it cannot serve chat/text requests. Use POST /v1/audio/speech (TTS) or /v1/audio/music-generations (music) instead.",
+        .audio => "This is an audio generation model; it cannot serve chat/text requests. Use POST /v1/audio/speech (TTS), /v1/audio/music-generations (music) or /v1/audio/sound-generations (text-to-audio) instead.",
         .video => "This is a video generation model; it cannot serve chat/text requests. Use POST /v1/video/generations instead.",
         .mesh => "This is a 3D generation model; it cannot serve chat/text requests. Use POST /v1/3d/generations instead.",
         .decision => "This is a typed-decision model; it cannot serve chat/text requests. Use POST /v1/decisions instead.",
@@ -6563,6 +6656,7 @@ fn renderModelEntry(
                 .music, .music3 => true,
                 else => false,
             } else false,
+            .has_sound_backend = if (entry.audio_engine) |ae| ae.backend == .sound else false,
             .has_video_engine = entry.video_engine != null,
             .has_mesh_engine = entry.mesh_engine != null,
             .has_decision_engine = entry.decision_engine != null,
@@ -6583,7 +6677,7 @@ fn renderModelEntry(
         const arch_label: []const u8 = if (entry.arch_hint.len > 0) entry.arch_hint else config.model_type;
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
         const drafter_loaded = entry.drafter != null or entry.dflash != null;
-        const mtp_loaded = entry.mtp != null;
+        const mtp_loaded = entry.mtp != null or if (entry.llama_ctx) |c| c.mtpDrafts() > 0 else false;
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
         else
@@ -6708,6 +6802,8 @@ fn renderModelEntry(
             // too (matches the ready-path readyCapsJson additive rule).
             if (m == .audio and media_mod.audioBackendKindForType(entry.arch_hint).servesMusic())
                 break :blk try allocator.dupe(u8, ",\"capabilities\":[\"audio\",\"music\"]");
+            if (m == .audio and media_mod.audioBackendKindForType(entry.arch_hint) == .sound)
+                break :blk try allocator.dupe(u8, ",\"capabilities\":[\"audio\",\"sound\"]");
             break :blk try std.fmt.allocPrint(allocator, ",\"capabilities\":[\"{s}\"]", .{m.capability()});
         }
         if (is_encoder_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"embeddings\"]");
@@ -7088,6 +7184,7 @@ fn genJobRun(ctx: *anyopaque) void {
         .image => if (job.lm.image_engine) |e| media_mod.handleImage(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .speech => if (job.lm.audio_engine) |e| media_mod.handleAudio(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .music => if (job.lm.audio_engine) |e| media_mod.handleMusic(job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .sound => if (job.lm.audio_engine) |e| media_mod.handleSound(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
         .mesh => if (job.lm.mesh_engine) |e| media_mod.handleMesh(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .decisions => {
@@ -7322,6 +7419,8 @@ fn renderPropsBody(
 /// The model-level half of `Scheduler.batchVerdict`: does this loaded model
 /// batch decode at all? Per-slot arms (spec, grammar, logprobs) come later.
 fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
+    // llama.cpp batches its own sequences (`runLlamaDecodeTick`).
+    if (entry.llama_ctx) |c| return if (c.seqs.len > 1) .ok else .embedded_engine;
     if (entry.ds4_engine != null or entry.llama_engine != null) return .embedded_engine;
     const cfg = entry.config orelse return .arch;
     return if (scheduler_mod.configBatchesDecode(cfg)) .ok else .arch;
@@ -7364,6 +7463,7 @@ const PropsSettings = struct {
     max_concurrent: u32,
     prefix_cache_mem_bytes: u64,
     prefix_cache_disk_bytes: u64,
+    prefix_cache_ram_enabled: bool = true,
     /// `--prefill-decode-share`: decode's target wall-time fraction during another slot's prefill.
     prefill_decode_share: f32 = 0,
 };
@@ -7389,7 +7489,7 @@ fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bo
 
 fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
     const engine: PropsEngine = if (lm.ds4_engine != null) .ds4 else if (lm.llama_engine != null) .llama else .mlx;
-    const engine_mtp = if (lm.ds4_engine) |e| e.mtpDraftTokens() > 1 else false;
+    const engine_mtp = if (lm.ds4_engine) |e| e.mtpDraftTokens() > 1 else if (lm.llama_ctx) |c| c.mtpDrafts() > 0 else false;
     return embeddedEngineSettings(mlxPropsSettings(lm), engine, engine_mtp);
 }
 
@@ -7398,7 +7498,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const kv = configuredKvQuantFor(config);
     return .{
         .engine = "mlx",
-        .kv_quant = if (lm.llama_engine != null) @tagName(llama_kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
+        .kv_quant = if (lm.llama_engine != null) @tagName(llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
         .kv_attn_mode = server_config.kv_attn_mode,
         .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
@@ -7414,6 +7514,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .max_concurrent = max_concurrent,
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_disk_bytes = prefix_cache_disk_bytes,
+        .prefix_cache_ram_enabled = prefix_cache_capacity > 0 and prefix_cache_ram_enabled,
         // Diffusion prefill returns before the interleave hook: nothing to share.
         .prefill_decode_share = if (config.isDiffusion()) 0 else scheduler_mod.prefillDecodeShare(),
     };
@@ -7427,7 +7528,7 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                @tagName(st.kv_attn_mode),
         st.decode_attn_quant,                       st.prefill_chunk,
@@ -7438,7 +7539,8 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         st.drafter,                                 st.pld.enable,
         st.pld.draft_len,                           st.pld.key_len,
         st.max_concurrent,                          st.prefill_decode_share,
-        st.prefix_cache_mem_bytes,                  st.prefix_cache_disk_bytes,
+        st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
+        st.prefix_cache_disk_bytes,
     });
 }
 
@@ -7605,12 +7707,17 @@ fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
     // the CSS and JS are separate files injected as RUNTIME `{s}` args —
     // std.fmt does not re-parse a runtime argument, so app.css/app.js/
     // metrics.js can be ordinary CSS and JavaScript. Don't inline them back.
-    // The console's two boot scripts share the page's single `<script>{s}`
-    // slot: theme.js sets the stored/OS theme before the stylesheet paints,
-    // i18n.js resolves the language (and <html lang>) before the body. They are
-    // concatenated here rather than given a second slot because std.fmt does
-    // not re-parse a runtime argument, so both stay ordinary JavaScript.
+    // The console's three boot scripts share the page's single `<script>{s}`
+    // slot: api.js publishes `apiPrefix` (the mount the page was served under),
+    // which every later script — including the metrics panel rendered into the
+    // header below — resolves its requests through; theme.js sets the stored/OS
+    // theme before the stylesheet paints; i18n.js resolves the language (and
+    // <html lang>) before the body. They are concatenated here rather than given
+    // a second slot because std.fmt does not re-parse a runtime argument, so all
+    // three stay ordinary JavaScript.
     const boot_script = try std.mem.concat(allocator, u8, &.{
+        @embedFile("html/api.js"),
+        "\n;\n",
         @embedFile("html/theme.js"),
         "\n;\n",
         @embedFile("html/i18n.js"),
@@ -7619,7 +7726,7 @@ fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
     const body = try std.fmt.allocPrint(allocator, @embedFile("html/index.html"), .{
         // <title> version
         version_esc,
-        // <script> — src/html/theme.js + src/html/i18n.js (before first paint)
+        // <script> — src/html/api.js + theme.js + i18n.js (before first paint)
         boot_script,
         // <style> — src/html/app.css
         @embedFile("html/app.css"),
@@ -8365,6 +8472,49 @@ fn hashTextValue(v: std.json.Value) ?u64 {
     return if (n == 0) null else h.final();
 }
 
+const CompletionPrompt = union(enum) {
+    text: []const u8,
+    /// Caller frees.
+    ids: []u32,
+    invalid: []const u8,
+    missing,
+};
+
+/// `/v1/completions` `prompt`: a string or token ids (OpenAI's `int[]`, what lm-eval
+/// sends), either also as a one-item list. A real batch is a named 400, like `n`.
+fn parseCompletionPrompt(allocator: std.mem.Allocator, v: ?std.json.Value, vocab_size: u32) !CompletionPrompt {
+    const val = v orelse return .missing;
+    switch (val) {
+        .null => return .missing,
+        .string => |s| return .{ .text = s },
+        .array => |arr| {
+            if (arr.items.len == 0) return .{ .invalid = "'prompt' is empty" };
+            if (arr.items[0] == .string or arr.items[0] == .array) {
+                if (arr.items.len > 1) return .{ .invalid = "batched prompts are not supported: send one prompt per request" };
+                return parseCompletionPrompt(allocator, arr.items[0], vocab_size);
+            }
+            const ids = try allocator.alloc(u32, arr.items.len);
+            for (arr.items, ids) |item, *id| {
+                if (item != .integer or item.integer < 0 or item.integer >= vocab_size) {
+                    allocator.free(ids);
+                    return .{ .invalid = "'prompt' token ids must be integers inside the model's vocabulary" };
+                }
+                id.* = @intCast(item.integer);
+            }
+            return .{ .ids = ids };
+        },
+        else => return .{ .invalid = "'prompt' must be a string or a list of token ids" },
+    }
+}
+
+/// Prompt-token logprobs are not computed, so an echo would hand lm-eval an empty
+/// sum it reads as perplexity 1; refused by name instead.
+fn echoRejectReason(root: std.json.ObjectMap) ?[]const u8 {
+    const v = root.get("echo") orelse return null;
+    if (v != .bool or !v.bool) return null;
+    return "'echo' is not supported: the prompt is not echoed and its tokens carry no logprobs";
+}
+
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     const v = root.get("n") orelse return null;
     switch (v) {
@@ -8607,14 +8757,9 @@ fn handleChatCompletions(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
 
-    const repeat_penalty: f32 = blk: {
-        const rp = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
-        if (rp > 0.0) break :blk rp;
-        // Also check frequency_penalty (OpenAI format: 0-2 range, mapped to 1.0 + fp)
-        const fp = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-        break :blk if (fp > 0.0) 1.0 + fp else 1.0;
-    };
+    const repeat_penalty = requestRepeatPenalty(root);
 
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
 
@@ -8635,11 +8780,7 @@ fn handleChatCompletions(
     // Extract tools JSON from request body for chat template injection
     var tools_json: ?[]const u8 = null;
     var has_tools = root.get("tools") != null;
-    var tool_choice_instruction: ?[]const u8 = null;
-    var tool_choice_allocated = false;
-    defer if (tool_choice_allocated) {
-        if (tool_choice_instruction) |tci| allocator.free(tci);
-    };
+    var forced_tool: ?chat_mod.ForcedTool = null;
 
     // OpenAI parallel_tool_calls: only an explicit false clamps to one call
     // per response (the SDK sets false in strict structured-output mode).
@@ -8655,7 +8796,7 @@ fn handleChatCompletions(
                 if (std.mem.eql(u8, tc.string, "none")) {
                     has_tools = false; // Don't inject tools at all
                 } else if (std.mem.eql(u8, tc.string, "required")) {
-                    tool_choice_instruction = "\nYou MUST call one of the available functions. Do not respond with text.";
+                    forced_tool = .any;
                 }
                 // "auto" is the default behavior
             } else if (tc == .object) {
@@ -8663,10 +8804,7 @@ fn handleChatCompletions(
                 if (tc.object.get("function")) |func| {
                     if (func == .object) {
                         if (func.object.get("name")) |name_val| {
-                            if (name_val == .string) {
-                                tool_choice_instruction = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
-                                tool_choice_allocated = true;
-                            }
+                            if (name_val == .string) forced_tool = .{ .name = name_val.string };
                         }
                     }
                 }
@@ -8680,6 +8818,14 @@ fn handleChatCompletions(
             }
         }
     }
+    if (forced_tool) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
+        const msg = try std.fmt.allocPrint(allocator, "tool_choice names function \"{s}\", which is not in tools", .{ft.name});
+        defer allocator.free(msg);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    };
+    const tool_choice_instruction: ?[]const u8 = if (forced_tool) |ft| try chat_mod.toolChoiceInstruction(allocator, ft) else null;
+    defer if (tool_choice_instruction) |tci| allocator.free(tci);
 
     // Parse stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -9009,6 +9155,7 @@ fn handleChatCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -9076,6 +9223,7 @@ fn handleChatCompletions(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .seed = seed,
@@ -9118,6 +9266,16 @@ fn handleChatCompletions(
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
+
+    var tool_force = armToolForce(allocator, lm, tok, prompt_ids, forced_tool);
+    defer if (tool_force) |tf| allocator.free(tf.forced);
+    if (tool_force) |*tf| sampling.tool_force = tf;
+    // One token per tick: no draft round can carry the turn past the forced opener.
+    if (tool_force != null) {
+        enable_pld = false;
+        enable_drafter = false;
+        enable_mtp = false;
+    }
 
     // Hand vision ownership off to the sub-handler, which transfers it to
     // the slot at submit time.
@@ -9167,6 +9325,11 @@ fn handleCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
     }
+    if (echoRejectReason(root)) |reason| {
+        log.warn("POST /v1/completions -> 400 (unsupported echo)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    }
 
     // Legacy-completions `logprobs` is an INTEGER (how many alternatives per
     // token), not chat's bool + `top_logprobs`. It was parsed nowhere and the
@@ -9178,16 +9341,18 @@ fn handleCompletions(
         else => 0,
     } else 0;
 
-    // Extract prompt (required)
-    const prompt_text = if (root.get("prompt")) |v|
-        (if (v == .string) v.string else null)
-    else
-        null;
-
-    if (prompt_text == null) {
-        log.warn("POST /v1/completions -> 400 (missing prompt)\n", .{});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'prompt' is a required field", 400);
-        return;
+    // An embedded engine's stub config keeps the default vocab; its ids are the engine's.
+    const vocab_size: u32 = if (lm.ds4_engine) |e| e.vocabSize() else if (lm.llama_engine) |e| @intCast(e.nVocab()) else config.vocab_size;
+    const prompt = try parseCompletionPrompt(allocator, root.get("prompt"), vocab_size);
+    defer if (prompt == .ids) allocator.free(prompt.ids);
+    switch (prompt) {
+        .missing, .invalid => {
+            const reason = if (prompt == .invalid) prompt.invalid else "'prompt' is a required field";
+            log.warn("POST /v1/completions -> 400 ({s})\n", .{reason});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+            return;
+        },
+        .text, .ids => {},
     }
 
     const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
@@ -9203,24 +9368,10 @@ fn handleCompletions(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
 
-    const repeat_penalty: f32 = if (root.get("repeat_penalty")) |v| switch (v) {
-        .float => |f| @floatCast(f),
-        .integer => |i| @floatFromInt(i),
-        else => blk: {
-            break :blk if (root.get("frequency_penalty")) |fp| switch (fp) {
-                .float => |f| 1.0 + @as(f32, @floatCast(f)),
-                .integer => |i| 1.0 + @as(f32, @floatFromInt(i)),
-                else => 1.0,
-            } else 1.0;
-        },
-    } else 1.0;
-
-    const presence_penalty_c: f32 = if (root.get("presence_penalty")) |v| switch (v) {
-        .float => |f| @floatCast(@min(@max(f, 0.0), 2.0)),
-        .integer => |i| @floatFromInt(@min(@max(i, 0), 2)),
-        else => 0.0,
-    } else 0.0;
+    const repeat_penalty = requestRepeatPenalty(root);
+    const presence_penalty_c = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -9278,15 +9429,22 @@ fn handleCompletions(
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log the request
-    const preview_len = @min(prompt_text.?.len, 80);
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
     log.info("POST /v1/completions (max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream });
-    log.info("  > \"{s}{s}\"\n", .{ prompt_text.?[0..preview_len], if (prompt_text.?.len > 80) "..." else "" });
+    switch (prompt) {
+        .text => |t| log.info("  > \"{s}{s}\"\n", .{ t[0..@min(t.len, 80)], if (t.len > 80) "..." else "" }),
+        .ids => |ids| log.info("  > [{d} token ids]\n", .{ids.len}),
+        else => unreachable,
+    }
 
     // Tokenize prompt directly (no chat template). ds4-backed models
     // tokenize through the engine's GGUF vocab; MLX models go through
-    // the loaded BPE tokenizer.
-    const prompt_ids = try encodeText(allocator, lm, tok, prompt_text.?, true);
+    // the loaded BPE tokenizer. Token ids are taken as sent.
+    const prompt_ids = switch (prompt) {
+        .text => |t| try encodeText(allocator, lm, tok, t, true),
+        .ids => |ids| try allocator.dupe(u32, ids),
+        else => unreachable,
+    };
     defer allocator.free(prompt_ids);
     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
@@ -9294,6 +9452,7 @@ fn handleCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -9336,6 +9495,7 @@ fn handleCompletions(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty_c,
         .seed = seed,
@@ -9502,6 +9662,7 @@ fn handleStreamingCompletion(
         .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, null),
         .logprobs_n = logprobs_n,
         .cache_key = cache_key,
+        .client = stream.client,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
 
@@ -9522,6 +9683,8 @@ fn handleStreamingCompletion(
     try sendSseHeaders(stream, "completions", SSE_ALLOW_HEADERS_DEFAULT);
 
     var text_buf = std.ArrayList(u8).empty;
+    var stop_stream: StopStream = .{};
+    defer stop_stream.deinit(allocator);
     defer text_buf.deinit(allocator);
     var stopped = false;
     var utf8_carry_c: [3]u8 = undefined;
@@ -9530,10 +9693,10 @@ fn handleStreamingCompletion(
 
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
-        if (stopped) break;
-        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        if (stopped or stop_stream.flushed) break;
+        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_stream.holding()) null else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -9559,12 +9722,11 @@ fn handleStreamingCompletion(
             client_gone = true;
             break;
         }
-        try lps.note(token_id);
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded_c = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
-
         // Handle incomplete UTF-8 sequences across token boundaries
-        var token_text = blk: {
+        var token_text = if (next_id) |token_id| blk: {
+            try lps.note(token_id);
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded_c = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
             const with_carry = if (utf8_carry_c_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_c_len + raw_decoded_c.len);
                 @memcpy(combined[0..utf8_carry_c_len], utf8_carry_c[0..utf8_carry_c_len]);
@@ -9589,18 +9751,17 @@ fn handleStreamingCompletion(
                 break :blk trimmed;
             }
             break :blk with_carry;
-        };
+        } else try stop_stream.takeHeld(allocator);
         defer allocator.free(token_text);
 
         if (stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
-            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
-                stopped = true;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) break;
-                token_text = try allocator.realloc(token_text, cut.token_keep);
-            }
+            const fed = try stop_stream.feed(allocator, &text_buf, token_text, stop_sequences, null);
+            allocator.free(token_text);
+            token_text = fed.send;
+            if (fed.stop != null) stopped = true;
+            if (token_text.len == 0) continue;
         }
+        lps.sent(token_text.len, utf8_carry_c_len);
 
         const escaped = try jsonEscape(allocator, token_text);
         defer allocator.free(escaped);
@@ -9675,6 +9836,112 @@ fn stopSequenceCut(text: []const u8, token_len: usize, stops: []const []const u8
         best = .{ .index = idx, .token_keep = if (idx > emitted) idx - emitted else 0, .matched = stop_seq };
     }
     return best;
+}
+
+/// Bytes at the end of `text`, at most `fresh` of them, that could still begin a stop string.
+fn stopPrefixTail(text: []const u8, fresh: usize, stops: []const []const u8) usize {
+    var hold: usize = 0;
+    for (stops) |stop| {
+        var n = @min(stop.len -| 1, fresh);
+        while (n > hold) : (n -= 1) {
+            if (std.mem.endsWith(u8, text, stop[0..n])) {
+                hold = n;
+                break;
+            }
+        }
+    }
+    return hold;
+}
+
+/// Client stop strings on a stream: a tail that could still begin one is held until the next
+/// token decides it, so the stream sends exactly the bytes the finished reply keeps.
+const StopStream = struct {
+    held: std.ArrayList(u8) = .empty,
+    /// The held tail went out as the stream's last token.
+    flushed: bool = false,
+
+    const Fed = struct { send: []u8, stop: ?[]const u8 };
+
+    fn deinit(self: *StopStream, a: std.mem.Allocator) void {
+        self.held.deinit(a);
+    }
+
+    fn holding(self: *const StopStream) bool {
+        return self.held.items.len > 0 and !self.flushed;
+    }
+
+    /// The held tail as one last token, once generation ended without a match.
+    fn takeHeld(self: *StopStream, a: std.mem.Allocator) ![]u8 {
+        self.flushed = true;
+        const out = try a.dupe(u8, self.held.items);
+        self.held.clearRetainingCapacity();
+        return out;
+    }
+
+    /// Appends `token` to `buf` (the text sent so far) and returns what may go out now: up to
+    /// a stop match (judged answer-only like `answerStopCut` when `answer_opened` is set), else
+    /// everything but a tail that could still begin a stop string. The caller owns `send`.
+    fn feed(self: *StopStream, a: std.mem.Allocator, buf: *std.ArrayList(u8), token: []const u8, stops: []const []const u8, answer_opened: ?bool) !Fed {
+        const sent = buf.items.len;
+        try buf.appendSlice(a, self.held.items);
+        self.held.clearRetainingCapacity();
+        try buf.appendSlice(a, token);
+        const fresh = buf.items.len - sent;
+        const cut = if (answer_opened) |o| answerStopCut(buf.items, fresh, stops, o) else stopSequenceCut(buf.items, fresh, stops);
+        var end = buf.items.len;
+        if (cut) |c| {
+            end = @max(c.index, sent);
+        } else if (!self.flushed) {
+            end -= stopPrefixTail(buf.items, fresh, stops);
+            try self.held.appendSlice(a, buf.items[end..]);
+        }
+        const send = try a.dupe(u8, buf.items[sent..end]);
+        buf.shrinkRetainingCapacity(end);
+        return .{ .send = send, .stop = if (cut) |c| c.matched else null };
+    }
+};
+
+/// The text a stream of `text` split at `i` and `j` sends through a `StopStream`, and whether it stopped.
+fn stopStreamReplay(a: std.mem.Allocator, text: []const u8, i: usize, j: usize, stops: []const []const u8) !struct { sent: []u8, stopped: bool } {
+    var ss: StopStream = .{};
+    defer ss.deinit(a);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    for ([_][]const u8{ text[0..i], text[i..j], text[j..] }) |token| {
+        const fed = try ss.feed(a, &buf, token, stops, null);
+        defer a.free(fed.send);
+        try out.appendSlice(a, fed.send);
+        if (fed.stop != null) return .{ .sent = try out.toOwnedSlice(a), .stopped = true };
+    }
+    if (ss.holding()) {
+        const tail = try ss.takeHeld(a);
+        defer a.free(tail);
+        const fed = try ss.feed(a, &buf, tail, stops, null);
+        defer a.free(fed.send);
+        try out.appendSlice(a, fed.send);
+    }
+    return .{ .sent = try out.toOwnedSlice(a), .stopped = false };
+}
+
+test "StopStream: at every token split, a stream sends what the finished reply keeps" {
+    const a = std.testing.allocator;
+    const Case = struct { text: []const u8, stop: []const u8, want: []const u8, stopped: bool };
+    const cases = [_]Case{
+        .{ .text = "9, 10, 11, 12, 13", .stop = ", 12", .want = "9, 10, 11", .stopped = true },
+        .{ .text = "28, 29, 30", .stop = ", 30x", .want = "28, 29, 30", .stopped = false },
+        .{ .text = "a, b, a", .stop = "a, c", .want = "a, b, a", .stopped = false },
+    };
+    for (cases) |c| {
+        const stops = [_][]const u8{c.stop};
+        for (0..c.text.len + 1) |i| for (i..c.text.len + 1) |j| {
+            const r = try stopStreamReplay(a, c.text, i, j, &stops);
+            defer a.free(r.sent);
+            try std.testing.expectEqualStrings(c.want, r.sent);
+            try std.testing.expectEqual(c.stopped, r.stopped);
+        };
+    }
 }
 
 /// `stopSequenceCut` for a chat surface: a stop string ends the answer, never the reasoning.
@@ -9766,6 +10033,7 @@ fn nonStreamingViaScheduler(
         .vision_embeddings = vision_embeddings,
         .media = media,
         .cache_key = cache_key,
+        .client = if (conn) |c| c.client else .other,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -10355,6 +10623,25 @@ const StreamingTokenStream = struct {
         }
     }
 
+    /// The finalized stream as a `GenerationResult`, for surfaces that share
+    /// their post-generation tail with the non-streaming path.
+    fn generationResult(self: *const StreamingTokenStream, text: []u8, token_ids: []u32, finish_reason: []const u8, constraint_payload_byte: ?usize) generate_mod.GenerationResult {
+        return .{
+            .text = text,
+            .token_ids = token_ids,
+            .prompt_tokens = self.prompt_tokens,
+            .completion_tokens = self.completion_tokens,
+            .finish_reason = finish_reason,
+            .prefill_tps = generate_mod.prefillTokensPerSec(self.prompt_tokens, self.cached_tokens, self.prefill_ns),
+            .decode_tps = generate_mod.tokensPerSec(self.completion_tokens, self.decode_ns),
+            .prefill_ns = self.prefill_ns,
+            .decode_ns = self.decode_ns,
+            .cached_tokens = self.cached_tokens,
+            .finish_details = self.finish_details,
+            .constraint_payload_byte = constraint_payload_byte,
+        };
+    }
+
     const NextOrIdle = union(enum) { token: u32, done, idle };
 
     /// `next` with an idle timeout (scheduler path only): returns `.idle`
@@ -10742,6 +11029,7 @@ fn handleStreamingGeneration(
         .vision_embeddings = slot_ve_s,
         .media = media,
         .cache_key = cache_key,
+        .client = stream.client,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -10770,6 +11058,8 @@ fn handleStreamingGeneration(
 
     // Buffer for stop sequence and tool call detection
     var text_buf = std.ArrayList(u8).empty;
+    var stop_stream: StopStream = .{};
+    defer stop_stream.deinit(allocator);
     defer text_buf.deinit(allocator);
     // Memoized marker scan for the think gate. Owned BESIDE text_buf and reset
     // with it — the gate is otherwise O(buffer) per token for as long as a
@@ -10843,10 +11133,10 @@ fn handleStreamingGeneration(
     // regardless of whether the underlying decode is regular, PLD, or drafter.
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
-        if (stopped) break;
-        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        if (stopped or stop_stream.flushed) break;
+        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_stream.holding()) null else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -10872,14 +11162,13 @@ fn handleStreamingGeneration(
             client_gone = true;
             break;
         }
-        try lps.note(token_id);
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
-        if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
         // Prepend any carried-over bytes from a previous incomplete UTF-8 sequence,
         // then strip any new trailing incomplete bytes into the carry buffer.
-        var token_text = blk: {
+        var token_text = if (next_id) |token_id| blk: {
+            try lps.note(token_id);
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
+            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
             // Step 1: prepend carry-over from previous token
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
@@ -10911,26 +11200,22 @@ fn handleStreamingGeneration(
             }
 
             break :blk with_carry;
-        };
+        } else try stop_stream.takeHeld(allocator);
 
         // Accumulate for stop sequence and tool call detection
 
-        if (gated_stream or stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
-        }
-
         // The stop cut is an INDEX, not a token boundary: bytes before the match still go out.
         if (stop_sequences.len > 0) {
-            if (answerStopCut(text_buf.items, token_text.len, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed)) |cut| {
-                stopped = true;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) {
-                    allocator.free(token_text);
-                    break;
-                }
-                token_text = try allocator.realloc(token_text, cut.token_keep);
+            const fed = try stop_stream.feed(allocator, &text_buf, token_text, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed);
+            allocator.free(token_text);
+            token_text = fed.send;
+            if (fed.stop != null) stopped = true;
+            if (token_text.len == 0) {
+                allocator.free(token_text);
+                continue;
             }
-        }
+        } else if (gated_stream) try text_buf.appendSlice(allocator, token_text);
+        lps.sent(token_text.len, utf8_carry_len);
 
         if (delivery) |*d| {
             defer allocator.free(token_text);
@@ -11443,20 +11728,7 @@ fn handleStreamingGeneration(
             for (tool_calls, 0..) |tc, i| {
                 const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ chat_id, i });
                 defer allocator.free(tc_id);
-
-                // Escape the full arguments string for embedding in JSON
-                const escaped_args = try jsonEscape(allocator, tc.arguments);
-                defer allocator.free(escaped_args);
-                // Strip outer quotes from jsonEscape result (it wraps in "...")
-                const args_inner = if (escaped_args.len >= 2 and escaped_args[0] == '"')
-                    escaped_args[1 .. escaped_args.len - 1]
-                else
-                    escaped_args;
-
-                // First delta: name + id + full arguments (clients accumulate these)
-                const first_delta = try std.fmt.allocPrint(allocator,
-                    \\[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}]
-                , .{ i, tc_id, tc.name, args_inner });
+                const first_delta = try streamToolCallDelta(allocator, i, tc_id, tc.name, tc.arguments);
                 defer allocator.free(first_delta);
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null, .{ .logprobs_json = try lps.take() });
             }
@@ -11593,6 +11865,12 @@ const StreamLogprobs = struct {
     lens: std.ArrayList(usize) = .empty,
     /// Total decoded bytes noted so far — the generation's length.
     bytes_noted: usize = 0,
+    /// Decoded bytes the stream has SENT: a stop-string hold keeps a token's
+    /// bytes back and a stop cut drops them, and the entry goes with the bytes
+    /// (`sentTokens`). A trailing incomplete UTF-8 sequence (`carry`) is the
+    /// stream's own buffering, not a hold, so its token still counts.
+    bytes_sent: usize = 0,
+    carry: usize = 0,
     entries: std.ArrayList(generate_mod.LogprobResult) = .empty,
     /// The last rendered JSON, owned here and freed on the next drain — the
     /// caller passes it straight into a chunk and never sees the lifetime.
@@ -11619,6 +11897,11 @@ const StreamLogprobs = struct {
         defer if (text.len > 0) self.allocator.free(text);
         try self.lens.append(self.allocator, text.len);
         self.bytes_noted += text.len;
+    }
+
+    fn sent(self: *StreamLogprobs, n: usize, carry: usize) void {
+        self.bytes_sent += n;
+        self.carry = carry;
     }
 
     /// Drop the entries for tokens whose bytes never reach the client.
@@ -11674,8 +11957,9 @@ const StreamLogprobs = struct {
         const slot = self.slot orelse return null;
         self.cursor = try slot.copyLogprobsFrom(self.allocator, self.cursor, &self.entries);
         // An id with no entry yet (or the reverse) is a partially published
-        // token — hold it for the next chunk rather than shipping a half pair.
-        const avail = @min(self.ids.items.len, self.entries.items.len);
+        // token — hold it for the next chunk rather than shipping a half pair;
+        // so is one whose bytes a stop-string hold has not released.
+        const avail = @min(@min(self.ids.items.len, self.entries.items.len), sentTokens(self.lens.items, self.bytes_sent + self.carry));
         if (avail <= self.emitted) return null;
         const ids = self.ids.items[self.emitted..avail];
         const lps = self.entries.items[self.emitted..avail];
@@ -11688,6 +11972,26 @@ const StreamLogprobs = struct {
         return json;
     }
 };
+
+/// How many leading tokens of `lens` are wholly inside the first `bytes_sent` bytes.
+fn sentTokens(lens: []const usize, bytes_sent: usize) usize {
+    var acc: usize = 0;
+    for (lens, 0..) |len, i| {
+        if (acc + len > bytes_sent) return i;
+        acc += len;
+    }
+    return lens.len;
+}
+
+test "stream logprobs: a token whose bytes a stop hold keeps back waits for its chunk" {
+    const lens = [_]usize{ 2, 3, 0, 4 };
+    try std.testing.expectEqual(@as(usize, 0), sentTokens(&lens, 1));
+    try std.testing.expectEqual(@as(usize, 1), sentTokens(&lens, 2));
+    try std.testing.expectEqual(@as(usize, 1), sentTokens(&lens, 4));
+    try std.testing.expectEqual(@as(usize, 3), sentTokens(&lens, 5));
+    try std.testing.expectEqual(@as(usize, 4), sentTokens(&lens, 9));
+    try std.testing.expectEqual(@as(usize, 4), sentTokens(&lens, 50));
+}
 
 /// How a stream ended: the wire `finish_reason` plus, when the
 /// degenerate-tail guard cut it, the sibling cause (`finishDetailsField`).
@@ -12163,7 +12467,7 @@ test "apiKeyGateApplies: strict removes exactly the loopback exemption" {
     try std.testing.expect(apiKeyGateApplies(true, true, false));
 }
 
-fn peerIsLoopback(conn: *const Conn) bool {
+pub fn peerIsLoopback(conn: *const Conn) bool {
     return ipIsLoopback(conn.stream.socket.address);
 }
 
@@ -12821,6 +13125,20 @@ test "the index page documents every endpoint the server serves (drift guard)" {
     }
 }
 
+test "the mlx-serve agent skill documents every /v1 endpoint it does not deliberately leave out" {
+    // The skill is what an agent reads before writing client code; an endpoint
+    // missing there does not exist for it.
+    const left_out = [_][]const u8{ "/v1/completions", "/v1/models/rescan", "/v1/providers", "/v1/providers/reload", "/v1/responses/compact" };
+    const skills = @import("agent_skills");
+    outer: for (ROUTE_PATHS) |p| {
+        if (!std.mem.startsWith(u8, p, "/v1/")) continue;
+        for (left_out) |l| if (std.mem.eql(u8, p, l)) continue :outer;
+        for (skills.files) |f| if (std.mem.indexOf(u8, f.bytes, p) != null) continue :outer;
+        std.debug.print("endpoint missing from skills/mlx-serve: {s}\n", .{p});
+        return error.EndpointNotInSkill;
+    }
+}
+
 test "parseModelFromRequest reads the model out of a multipart form, not just JSON" {
     // `/v1/images/edits` is the ONE endpoint whose body is multipart, and model
     // resolution runs BEFORE the route translates that form to JSON. A JSON-only
@@ -12982,6 +13300,11 @@ fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *s
     try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
 }
 
+/// A request refused before it owned a slot. A null sink (metrics off) is one branch.
+fn countRejected() void {
+    if (g_metrics) |m| m.recordRejected();
+}
+
 fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
     return std.fmt.bufPrint(
         buf,
@@ -13033,6 +13356,15 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
     return if (actual < expected) actual else 0;
 }
 
+/// Bytes of a streamed think buffer safe to emit now: hold back the last 9
+/// bytes (the longest possible partial close tag) and cut on a UTF-8
+/// boundary; the escaper turns a split character into U+FFFD.
+fn thinkHoldBackLen(buf: []const u8) usize {
+    const max_partial: usize = 9;
+    var safe_len: usize = if (buf.len > max_partial) buf.len - max_partial else 0;
+    if (safe_len > 0) safe_len -= utf8TrailingIncomplete(buf[0..safe_len]);
+    return safe_len;
+}
 /// Build a llama.cpp-style `timings` JSON object (no surrounding key) from
 /// raw nanosecond counts and token totals. Caller frees. Returns an empty
 /// string when `prefill_ns`, `decode_ns`, AND `tokenize_ns` are all zero
@@ -13460,6 +13792,15 @@ fn formatLogprobsObject(
 }
 
 /// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
+/// OpenAI's `frequency_penalty` (0-2) is read as `repeat_penalty` 1 + x; an explicit
+/// `repeat_penalty` wins.
+fn requestRepeatPenalty(root: std.json.ObjectMap) f32 {
+    const repeat = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
+    if (repeat > 0) return repeat;
+    const frequency = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
+    return if (frequency > 0) 1.0 + frequency else 1.0;
+}
+
 fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: f32, max: f32) f32 {
     const raw = if (root.get(key)) |v| switch (v) {
         .float => |f| @as(f32, @floatCast(f)),
@@ -13662,7 +14003,7 @@ fn piecesOf(item: MediaItem) usize {
 }
 
 fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
-    var h = std.hash.Wyhash.init(@intFromEnum(std.meta.activeTag(piece)));
+    var h = std.hash.Wyhash.init(@backingInt(std.meta.activeTag(piece)));
     switch (piece) {
         .image => |im| {
             h.update(std.mem.asBytes(&[_]u32{ im.width, im.height, im.grid_h, im.grid_w }));
@@ -13840,7 +14181,7 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 ///   data:image/jpeg|png|webp|...;base64,... (decoded + resized via stb_image / libwebp)
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
-fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
     if (config.lfm2_vision) {
         // NaFlex: no temporal axis and no merge-block patch order — the
         // projector unshuffles AFTER the tower, so the grid stays plain
@@ -13927,7 +14268,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
     }
 }
 
-fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
+pub fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const sep = std.mem.indexOf(u8, url, ";base64,") orelse return null;
     const b64_data = url[sep + 8 ..];
     const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64_data) catch return null;
@@ -14154,7 +14495,7 @@ fn appendLfm2Tiles(
     defer allocator.free(raw);
     std.base64.standard.Decoder.decode(raw, b64) catch return;
 
-    const src = decodeRgbOwned(allocator, raw) orelse return;
+    const src = decodeRgbOwned(allocator, raw, true) orelse return;
     defer src.deinit(allocator);
 
     const split = vp.max_tiles > 1 and
@@ -14308,7 +14649,7 @@ const DecodedRgb = struct {
     }
 };
 
-fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb {
+fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8, composite_alpha: bool) ?DecodedRgb {
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
@@ -14318,7 +14659,7 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
         const total_px: usize = @intCast(w * h);
         const rgb = allocator.alloc(u8, total_px * 3) catch return null;
         for (0..total_px) |i| {
-            const a = @as(u16, rgba[i * 4 + 3]);
+            const a: u16 = if (composite_alpha) rgba[i * 4 + 3] else 255;
             const inv_a = 255 - a;
             rgb[i * 3 + 0] = @intCast((a * @as(u16, rgba[i * 4 + 0]) + inv_a * 255) / 255);
             rgb[i * 3 + 1] = @intCast((a * @as(u16, rgba[i * 4 + 1]) + inv_a * 255) / 255);
@@ -14337,10 +14678,10 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
     return .{ .rgb = rgb, .w = @intCast(webp_w), .h = @intCast(webp_h) };
 }
 
-fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
+pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const target: u32 = 768; // Gemma 4 default for square images
 
-    const src = decodeRgbOwned(allocator, encoded) orelse return null;
+    const src = decodeRgbOwned(allocator, encoded, vp.composite_alpha) orelse return null;
     defer src.deinit(allocator);
     const px = src.rgb.ptr;
     const src_w: u32 = src.w;
@@ -14427,6 +14768,18 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     return .{ .pixels = out_buf, .width = target, .height = target };
 }
 
+test "clef: transparent image RGB follows the checkpoint processor" {
+    const a = std.testing.allocator;
+    const bytes = try @import("clef_http_test.zig").readFile(std.testing.io, "tests/fixtures/robot.png");
+    defer a.free(bytes);
+    const composited = decodeRgbOwned(a, bytes, true) orelse return error.BadImage;
+    defer composited.deinit(a);
+    const rgb = decodeRgbOwned(a, bytes, false) orelse return error.BadImage;
+    defer rgb.deinit(a);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, composited.rgb[0..3]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, rgb.rgb[0..3]);
+}
+
 /// Decode a `video_url` block's `frames` array — already-decoded-by-the-client
 /// JPEG/PNG data URLs, one per sampled frame; no video codec exists anywhere in
 /// this codebase, so frame extraction is the client's job — into ONE
@@ -14454,7 +14807,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         const raw = allocator.alloc(u8, decoded_size) catch return null;
         defer allocator.free(raw);
         std.base64.standard.Decoder.decode(raw, b64) catch return null;
-        const rgb = decodeRgbOwned(allocator, raw) orelse return null;
+        const rgb = decodeRgbOwned(allocator, raw, true) orelse return null;
         decoded.append(allocator, rgb) catch {
             rgb.deinit(allocator);
             return null;
@@ -15053,7 +15406,7 @@ fn handleAnthropicMessages(
         }
     }
 
-    if (try chat_mod.foldSystemMessages(allocator, &messages)) |joined| try content_allocs.append(allocator, joined);
+    if (try chat_mod.foldSystemMessages(allocator, &messages, true)) |joined| try content_allocs.append(allocator, joined);
 
     if (image_decode_failed) {
         log.warn("POST /v1/messages -> 400 (undecodable image)\n", .{});
@@ -15072,6 +15425,7 @@ fn handleAnthropicMessages(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Tools
@@ -15080,11 +15434,7 @@ fn handleAnthropicMessages(
     defer if (tools_json_allocated) allocator.free(tools_json.?);
     var has_tools = false;
     var allow_parallel_tools = true;
-    var tool_choice_instruction: ?[]const u8 = null;
-    var tool_choice_allocated = false;
-    defer if (tool_choice_allocated) {
-        if (tool_choice_instruction) |tci| allocator.free(tci);
-    };
+    var forced_tool: ?chat_mod.ForcedTool = null;
 
     if (root.get("tools")) |tools_val| {
         if (tools_val == .array and tools_val.array.items.len > 0) {
@@ -15104,19 +15454,24 @@ fn handleAnthropicMessages(
                     if (std.mem.eql(u8, tc_type, "none")) {
                         has_tools = false;
                     } else if (std.mem.eql(u8, tc_type, "any")) {
-                        tool_choice_instruction = "\nYou MUST call one of the available functions. Do not respond with text.";
+                        forced_tool = .any;
                     } else if (std.mem.eql(u8, tc_type, "tool")) {
                         if (tc.object.get("name")) |name_val| {
-                            if (name_val == .string) {
-                                tool_choice_instruction = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
-                                tool_choice_allocated = true;
-                            }
+                            if (name_val == .string) forced_tool = .{ .name = name_val.string };
                         }
                     }
                 }
             }
         }
     }
+    if (forced_tool) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
+        const msg = try std.fmt.allocPrint(allocator, "tool_choice names tool \"{s}\", which is not in tools", .{ft.name});
+        defer allocator.free(msg);
+        try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+        return;
+    };
+    const tool_choice_instruction: ?[]const u8 = if (forced_tool) |ft| try chat_mod.toolChoiceInstruction(allocator, ft) else null;
+    defer if (tool_choice_instruction) |tci| allocator.free(tci);
 
     // Stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -15356,6 +15711,7 @@ fn handleAnthropicMessages(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/messages -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendAnthropicError(allocator, stream, "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -15375,6 +15731,7 @@ fn handleAnthropicMessages(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = 1.0,
         .presence_penalty = 0.0,
         .seed = seed,
@@ -15414,6 +15771,16 @@ fn handleAnthropicMessages(
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
+
+    var tool_force = armToolForce(allocator, lm, tok, prompt_ids, forced_tool);
+    defer if (tool_force) |tf| allocator.free(tf.forced);
+    if (tool_force) |*tf| sampling.tool_force = tf;
+    // One token per tick: no draft round can carry the turn past the forced opener.
+    if (tool_force != null) {
+        enable_pld = false;
+        enable_drafter = false;
+        enable_mtp = false;
+    }
 
     // Hand vision ownership to the sub-handler (slot takes it on submit).
     const sub_ve = mm.embeddings;
@@ -15781,6 +16148,7 @@ fn handleAnthropicStreaming(
         .vision_embeddings = slot_ve_anth,
         .media = media,
         .cache_key = cache_key,
+        .client = stream.client,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -15851,6 +16219,8 @@ fn handleAnthropicStreaming(
     var budget_exhausted = false;
 
     var text_buf = std.ArrayList(u8).empty;
+    var stop_stream: StopStream = .{};
+    defer stop_stream.deinit(allocator);
     defer text_buf.deinit(allocator);
     // Memoized marker scan for the think gate. Owned BESIDE text_buf and reset
     // with it — the gate is otherwise O(buffer) per token for as long as a
@@ -15869,10 +16239,10 @@ fn handleAnthropicStreaming(
 
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
-        if (stopped) break;
-        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        if (stopped or stop_stream.flushed) break;
+        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_stream.holding()) null else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -15898,12 +16268,11 @@ fn handleAnthropicStreaming(
             client_gone = true;
             break;
         }
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
-        if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
         // UTF-8 carry handling
-        var token_text = blk: {
+        var token_text = if (next_id) |token_id| blk: {
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
+            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                 @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -15927,26 +16296,23 @@ fn handleAnthropicStreaming(
                 break :blk trimmed;
             }
             break :blk with_carry;
-        };
-
-        if (gated_stream or stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
-        }
+        } else try stop_stream.takeHeld(allocator);
 
         // Stop sequences; remember WHICH one matched (reported as stop_reason
         // "stop_sequence" + the echoed `stop_sequence` field in message_delta).
         if (stop_sequences.len > 0) {
-            if (answerStopCut(text_buf.items, token_text.len, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed)) |cut| {
+            const fed = try stop_stream.feed(allocator, &text_buf, token_text, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed);
+            allocator.free(token_text);
+            token_text = fed.send;
+            if (fed.stop) |m| {
                 stopped = true;
-                matched_stop_seq = cut.matched;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) {
-                    allocator.free(token_text);
-                    break;
-                }
-                token_text = try allocator.realloc(token_text, cut.token_keep);
+                matched_stop_seq = m;
             }
-        }
+            if (token_text.len == 0) {
+                allocator.free(token_text);
+                continue;
+            }
+        } else if (gated_stream) try text_buf.appendSlice(allocator, token_text);
 
         if (delivery) |*d| {
             defer allocator.free(token_text);
@@ -16886,6 +17252,7 @@ fn handleResponsesInner(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
     const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
     const repeat_penalty: f32 = if (frequency_penalty > 0.0) 1.0 + frequency_penalty else 1.0;
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
@@ -16971,6 +17338,12 @@ fn handleResponsesInner(
     const tool_choice = try responses_mod.parseToolChoice(allocator, root.get("tool_choice"));
     defer if (tool_choice.instruction) |ins| allocator.free(ins);
     if (!tool_choice.include_tools) has_tools = false;
+    if (tool_choice.forced) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
+        const msg = try std.fmt.allocPrint(allocator, "tool_choice names function \"{s}\", which is not in tools", .{ft.name});
+        defer allocator.free(msg);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    };
 
     // Maps every name the model may spell a namespaced call with (expanded
     // wire names, unique bare child names) back to (namespace, name), so a
@@ -17122,6 +17495,7 @@ fn handleResponsesInner(
     // ── context limit ──
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -17148,6 +17522,7 @@ fn handleResponsesInner(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .seed = seed,
@@ -17184,6 +17559,9 @@ fn handleResponsesInner(
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     if (think_bound) |*tb| sampling.think_bound = tb;
+    var tool_force = armToolForce(allocator, lm, tok, prompt_ids, if (active_has_tools) tool_choice.forced else null);
+    defer if (tool_force) |tf| allocator.free(tf.forced);
+    if (tool_force) |*tf| sampling.tool_force = tf;
 
     // ── pre-allocate response id (used in streaming envelopes too) ──
     const resp_id = try responses_mod.makeId(stream.io, allocator, "resp");
@@ -17278,6 +17656,8 @@ fn handleResponsesInner(
     var streamed_reasoning_id: ?[]u8 = null;
     var streamed_reasoning_index: u32 = 0;
     var streamed_reasoning_started = false;
+    // Bytes of the thought a tool-active stream already sent; the end sends the rest.
+    var tool_reasoning_streamed: usize = 0;
     var streamed_message_id: ?[]u8 = null;
     var streamed_message_index: u32 = 0;
     var streamed_message_started = false;
@@ -17325,6 +17705,12 @@ fn handleResponsesInner(
         // Heavy-echo MTP->PLD routing retired 2026-07-13 (see the NOTE at the
         // chat-completions site): MTP wins whenever loaded.
     }
+    // One token per tick: no draft round can carry the turn past the forced opener.
+    if (tool_force != null) {
+        enable_pld_resp = false;
+        enable_drafter_resp = false;
+        enable_mtp_resp = false;
+    }
 
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
@@ -17366,6 +17752,7 @@ fn handleResponsesInner(
             .vision_embeddings = slot_ve_resp,
             .media = mm.media,
             .cache_key = cache_key,
+            .client = stream.client,
             .mrope_pos = slot_mrope.pos,
             .mrope_total = slot_mrope.total,
             .mrope_delta = slot_mrope.delta,
@@ -17379,6 +17766,8 @@ fn handleResponsesInner(
         defer ts.deinit(allocator);
 
         var raw_buf = std.ArrayList(u8).empty;
+        var stop_stream: StopStream = .{};
+        defer stop_stream.deinit(allocator);
         defer raw_buf.deinit(allocator);
         var token_ids_buf = std.ArrayList(u32).empty;
         defer token_ids_buf.deinit(allocator);
@@ -17403,13 +17792,15 @@ fn handleResponsesInner(
         // Inkling thinking message seen — its close is <|end_message|>.
         var inkling_think = false;
         var live_output_index: u32 = 0;
+        var tool_thought_open = active_has_tools;
+        var tool_think_scan: chat_mod.ThinkScan = .{};
 
         while (true) {
             // A stop cut resolved on the previous token ends the turn here.
-            if (stopped) break;
-            const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+            if (stopped or stop_stream.flushed) break;
+            const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
                 .token => |t| t,
-                .done => break,
+                .done => if (stop_stream.holding()) null else break,
                 .idle => {
                     // No tokens yet (long prefill). Probe the peer: an abandoned
                     // request must cancel instead of grinding a ghost prefill
@@ -17435,12 +17826,11 @@ fn handleResponsesInner(
                 client_gone = true;
                 break;
             }
-            try token_ids_buf.append(allocator, token_id);
-            const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, false);
-            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
             // UTF-8 carry across BPE-token boundaries (matches chat-completion).
-            var token_text = blk: {
+            var token_text = if (next_id) |token_id| blk: {
+                try token_ids_buf.append(allocator, token_id);
+                const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, false);
+                if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
                 const with_carry = if (utf8_carry_len > 0) cc: {
                     const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                     @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -17464,24 +17854,21 @@ fn handleResponsesInner(
                     break :blk trimmed;
                 }
                 break :blk with_carry;
-            };
+            } else try stop_stream.takeHeld(allocator);
             defer allocator.free(token_text);
 
-            try raw_buf.appendSlice(allocator, token_text);
-
             if (stop_sequences.items.len > 0) {
-                if (answerStopCut(raw_buf.items, token_text.len, stop_sequences.items, opens_think and !constrained_proto)) |cut| {
-                    stopped = true;
-                    raw_buf.shrinkRetainingCapacity(cut.index);
-                    if (cut.token_keep == 0) break;
-                    token_text = try allocator.realloc(token_text, cut.token_keep);
-                }
-            }
+                const fed = try stop_stream.feed(allocator, &raw_buf, token_text, stop_sequences.items, opens_think and !constrained_proto);
+                allocator.free(token_text);
+                token_text = fed.send;
+                if (fed.stop != null) stopped = true;
+                if (token_text.len == 0) continue;
+            } else try raw_buf.appendSlice(allocator, token_text);
 
             // Beat BEFORE the tool early-continue below: a tool-active request
-            // emits nothing for its whole generation, and the thinking branch
-            // holds until its close tag. Both look identical to a dead server
-            // from the client's socket.
+            // emits nothing past its thought until generation ends, and the
+            // thinking branch holds until its close tag. Both look identical to
+            // a dead server from the client's socket.
             beatStreamKeepalive(stream, .sse_comment) catch {
                 log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                 slot_handle.?.cancel();
@@ -17489,9 +17876,29 @@ fn handleResponsesInner(
                 break;
             };
 
-            // Tool-active requests buffer entirely — we cannot emit text deltas
-            // before knowing whether the output is a tool call.
-            if (active_has_tools) continue;
+            // Tool-active requests hold the answer for the tool-call parse. The
+            // leading thought streams as it arrives, in the chat stream's order:
+            // tool hold first, then the think gate.
+            if (active_has_tools) {
+                if (tool_thought_open and !chat_mod.streamShouldBufferForTools(raw_buf.items)) {
+                    const gate = chat_mod.streamThinkGateScan(raw_buf.items, enable_thinking, false, opens_think, &tool_think_scan);
+                    tool_thought_open = gate == .hold_thinking;
+                    if (gate != .flush_text) if (chat_mod.splitThinkBlock(raw_buf.items, true, opens_think).reasoning_content) |rc| {
+                        const ready = if (tool_thought_open) chat_mod.streamableReasoning(rc) else rc;
+                        if (chat_mod.unstreamedReasoning(ready, tool_reasoning_streamed)) |fresh| {
+                            if (!streamed_reasoning_started) {
+                                streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
+                                streamed_reasoning_index = live_output_index;
+                                try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                                streamed_reasoning_started = true;
+                            }
+                            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, fresh);
+                            tool_reasoning_streamed = ready.len;
+                        }
+                    };
+                }
+                continue;
+            }
 
             if (delivery) |*d| {
                 try d.feed(allocator, token_text);
@@ -17590,10 +17997,7 @@ fn handleResponsesInner(
                     think_buf.clearRetainingCapacity();
                     in_think_block = false;
                 } else if (skipped_think_open) {
-                    // Hold back the longest possible partial-tag suffix (max 9 bytes
-                    // covers both "</think>" and "<channel|>").
-                    const max_partial: usize = 9;
-                    const safe_len = if (think_buf.items.len > max_partial) think_buf.items.len - max_partial else 0;
+                    const safe_len = thinkHoldBackLen(think_buf.items);
                     if (safe_len > 0) {
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
@@ -17662,17 +18066,12 @@ fn handleResponsesInner(
             return;
         }
 
-        result = .{
-            .constraint_payload_byte = if (delivery) |d| d.payload_byte else null,
-            .text = try raw_buf.toOwnedSlice(allocator),
-            .token_ids = try token_ids_buf.toOwnedSlice(allocator),
-            .prompt_tokens = ts.prompt_tokens,
-            .completion_tokens = ts.completion_tokens,
-            .finish_reason = if (stopped) "stop" else ts.finish_reason,
-            .prefill_tps = 0.0,
-            .decode_tps = 0.0,
-            .finish_details = ts.finish_details,
-        };
+        result = ts.generationResult(
+            try raw_buf.toOwnedSlice(allocator),
+            try token_ids_buf.toOwnedSlice(allocator),
+            if (stopped) "stop" else ts.finish_reason,
+            if (delivery) |d| d.payload_byte else null,
+        );
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
@@ -17754,6 +18153,9 @@ fn handleResponsesInner(
             // Live deltas already streamed; emit just the closing events with
             // the canonical reasoning text from splitThinkBlock.
             try responses_mod.appendReasoningItem(allocator, &out_buf, streamed_reasoning_id.?, rt);
+            if (active_has_tools) if (chat_mod.unstreamedReasoning(rt, tool_reasoning_streamed)) |rest| {
+                try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rest);
+            };
             try emitResponsesReasoningEnd(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rt);
         } else {
             const rid = try responses_mod.makeId(stream.io, allocator, "rs");
@@ -19208,6 +19610,42 @@ test "utf8TrailingIncomplete empty" {
     try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
 }
 
+test "responses think hold-back never cuts a multibyte character" {
+    // A CJK thought replayed token-by-token through the hold-back: every emitted
+    // prefix must be valid UTF-8, and the stream must reassemble byte-exact.
+    const allocator = testing.allocator;
+    const tokens = [_][]const u8{
+        "\xE7\x94\xA8",
+        "\xE6\x88\xB7\xE9\x97\xAE",
+        "\xE7\x9A\x84 9.11",
+        "\xE8\xBF\x98\xE6\x98\xAF 9.9",
+        "\xEF\xBC\x8C\xE5\x85\x88\xE6\xAF\x94",
+        "\xE6\x95\xB4\xE6\x95\xB0",
+        "\xEF\xBC\x8C\xE5\x86\x8D",
+        "<|im_",
+        "end|>",
+    };
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    var reconstituted = std.ArrayList(u8).empty;
+    defer reconstituted.deinit(allocator);
+    for (tokens) |tok| {
+        try buf.appendSlice(allocator, tok);
+        const safe_len = thinkHoldBackLen(buf.items);
+        if (safe_len == 0) continue;
+        // The emitted prefix must be valid UTF-8 standing alone.
+        try testing.expect(std.unicode.utf8ValidateSlice(buf.items[0..safe_len]));
+        try reconstituted.appendSlice(allocator, buf.items[0..safe_len]);
+        const remaining = try allocator.dupe(u8, buf.items[safe_len..]);
+        defer allocator.free(remaining);
+        buf.clearRetainingCapacity();
+        try buf.appendSlice(allocator, remaining);
+    }
+    try reconstituted.appendSlice(allocator, buf.items);
+    const want = "\xE7\x94\xA8\xE6\x88\xB7\xE9\x97\xAE\xE7\x9A\x84 9.11\xE8\xBF\x98\xE6\x98\xAF 9.9\xEF\xBC\x8C\xE5\x85\x88\xE6\xAF\x94\xE6\x95\xB4\xE6\x95\xB0\xEF\xBC\x8C\xE5\x86\x8D<|im_end|>";
+    try testing.expectEqualStrings(want, reconstituted.items);
+}
+
 test "parseJsonFloat returns value when present" {
     const allocator = testing.allocator;
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"temp\":0.7}", .{});
@@ -20151,8 +20589,22 @@ test "expandMediaPlaceholders: an LFM2-VL tiled source is one item, every tile l
     // (0,0)=124908, (0,1)=124909, (1,0)=124918, (1,1)=124919.
     const want = [_]u32{
         1,
-        125009, 124908, 124907, 124909, 124907, 124918, 124907, 124919, 124907, 125008, 124907, 125010,
-        125009, 124907, 124907, 125010,
+        125009,
+        124908,
+        124907,
+        124909,
+        124907,
+        124918,
+        124907,
+        124919,
+        124907,
+        125008,
+        124907,
+        125010,
+        125009,
+        124907,
+        124907,
+        125010,
         2,
     };
     try testing.expectEqualSlices(u32, &want, out.ids);
@@ -20538,13 +20990,10 @@ test "mlxCacheLimitFromEnv: explicit bytes win, 0 disables, garbage falls throug
 }
 
 test "llama cache default keeps shared prefixes warm" {
-    // With the legacy default of 1, every llama.cpp request evicted the
-    // single KV session — even two SEQUENTIAL requests sharing an 8 KB
-    // prefix reported cached_tokens=0 (caught live by llmprobe
-    // cache-hit-reported on the E4B GGUF, 2026-06-10). 4 sessions keep
-    // interleaved agent roots warm; sessions are created lazily so idle
-    // slots cost nothing.
-    try testing.expect(llama_cache_entries >= 4);
+    // With one sequence, interleaved requests evict each other's prompt KV:
+    // even two SEQUENTIAL requests sharing an 8 KB prefix reported
+    // cached_tokens=0. 4 keep interleaved agent roots warm and decoding together.
+    try testing.expect(llama_settings.seqs >= 4);
 }
 
 test "prefix cache default capacity covers interleaved agent flows" {
@@ -20968,6 +21417,48 @@ test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to em
     // must emit everything rather than slice out of bounds.
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 5));
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 99));
+}
+
+test "parseCompletionPrompt: a token-id prompt is a prompt, a batch is a named 400 (#659)" {
+    const allocator = std.testing.allocator;
+    const Want = union(enum) { text: []const u8, ids: []const u32, invalid, missing };
+    const cases = [_]struct { body: []const u8, want: Want }{
+        .{ .body = "{\"prompt\":\"hi\"}", .want = .{ .text = "hi" } },
+        .{ .body = "{\"prompt\":[\"hi\"]}", .want = .{ .text = "hi" } },
+        .{ .body = "{\"prompt\":[1,2,3]}", .want = .{ .ids = &.{ 1, 2, 3 } } },
+        .{ .body = "{\"prompt\":[[5,6]]}", .want = .{ .ids = &.{ 5, 6 } } },
+        .{ .body = "{\"prompt\":[[1],[2]]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[\"a\",\"b\"]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[1,-2]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[1,100]}", .want = .invalid },
+        .{ .body = "{}", .want = .missing },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const got = try parseCompletionPrompt(allocator, parsed.value.object.get("prompt"), 100);
+        defer if (got == .ids) allocator.free(got.ids);
+        switch (case.want) {
+            .text => |t| try std.testing.expectEqualStrings(t, got.text),
+            .ids => |ids| try std.testing.expectEqualSlices(u32, ids, got.ids),
+            .invalid => try std.testing.expect(got == .invalid),
+            .missing => try std.testing.expect(got == .missing),
+        }
+    }
+}
+
+test "echoRejectReason: echo is refused by name, never silently dropped (#659)" {
+    const allocator = std.testing.allocator;
+    for ([_]struct { body: []const u8, rejected: bool }{
+        .{ .body = "{}", .rejected = false },
+        .{ .body = "{\"echo\":false}", .rejected = false },
+        .{ .body = "{\"echo\":true}", .rejected = true },
+    }) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.rejected, echoRejectReason(parsed.value.object) != null);
+    }
 }
 
 test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pass" {
@@ -21473,6 +21964,32 @@ test "mlxMemoryGuardApplies: embedded engines (ds4/llama) skip the MLX-prefill m
     try t.expect(!mlxMemoryGuardApplies(false, true));
 }
 
+test "ungatedHotCacheAsk: a sliding-ring arch asks for one whole session, every other arch keeps its ask" {
+    const t = std.testing;
+    const mimo: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .num_hidden_layers = 4, .head_dim = 192, .v_head_dim = 128, .num_key_value_heads = 8, .num_global_key_value_heads = 4, .sliding_window = 128, .sliding_window_pattern = 4 };
+    const session = oneSessionEntryBytes(&mimo, 16, 1_000_000, 8192);
+    try t.expect(session > PREFIX_CACHE_MEM_DEFAULT);
+    try t.expectEqual(session, ungatedHotCacheAsk(&mimo, PREFIX_CACHE_MEM_DEFAULT, false, 16, 1_000_000, 8192));
+    // An operator's number stands.
+    try t.expectEqual(@as(u64, 1 << 30), ungatedHotCacheAsk(&mimo, 1 << 30, true, 16, 100_000, 8192));
+    const llama: model_mod.ModelConfig = .{ .model_type = "llama" };
+    try t.expectEqual(PREFIX_CACHE_MEM_DEFAULT, ungatedHotCacheAsk(&llama, PREFIX_CACHE_MEM_DEFAULT, false, 16, 100_000, 8192));
+}
+
+test "slotFixedKvBytes: a MiMo slot bills its sliding rings once, at keep + one chunk of rows" {
+    const t = std.testing;
+    // Layer 3 global (4 KV heads), layers 0-2 sliding (8 KV heads).
+    const mimo: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .num_hidden_layers = 4, .head_dim = 192, .v_head_dim = 128, .num_key_value_heads = 8, .num_global_key_value_heads = 4, .sliding_window = 128, .sliding_window_pattern = 4 };
+    const rows: u64 = 128 + model_mod.ModelConfig.SLIDING_RING_SLACK + 8192;
+    try t.expectEqual(3 * 8 * (192 + 128) * 2 * rows, slotFixedKvBytes(&mimo, 16, 8192));
+    try t.expectEqual(kvBytesPerTokenAtBits(3 * 8 * (192 + 128) * 2, 8) * rows, slotFixedKvBytes(&mimo, 8, 8192));
+    // The admission guard bills them on an ungated arch too.
+    try t.expectEqual(slotFixedKvBytes(&mimo, 16, 8192), prefillRequestTerms(&mimo, 50_000, 1024, 16, 8192, .{}).slot_fixed_kv_bytes);
+    // Every other arch keeps its old fixed term.
+    const llama: model_mod.ModelConfig = .{ .model_type = "llama" };
+    try t.expectEqual(llama.qsaRingBytes(), slotFixedKvBytes(&llama, 16, 8192));
+}
+
 test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V widths" {
     const t = std.testing;
     // Uniform arch: every layer caches, K and V are both head_dim wide.
@@ -21889,6 +22406,22 @@ test "prefillMemoryNeeded: the new terms fire only where the measurement put the
     const dense_only = prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 0, .{});
     const pre_fix: u64 = (9827 * 53248 + 3 * 8 * 2048 * 19968 * 2) * 5 / 4;
     try t.expectEqual(dense_only - pre_fix, 512 * 1024 * 1024 * 5 / 4);
+}
+
+test "prefill stream bill: GLM-5 on NAX bills no top_k replica or linear stream" {
+    const t = std.testing;
+    var glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
+    glm.num_hidden_layers = 45;
+    glm.full_attention_interval = 4;
+    glm.linear_num_key_heads = 64;
+    glm.linear_num_value_heads = 64;
+    glm.hidden_size = 4096;
+    glm.num_experts = 288;
+    glm.num_experts_per_tok = 8;
+    glm.moe_intermediate_size = 2048;
+    // Measured 380 KB per chunk-token on M5 (NAX), under the 3-envelope floor.
+    try t.expectEqual(@as(u64, 0), prefillStreamBytesPerTokenOn(&glm, true));
+    try t.expect(prefillStreamBytesPerTokenOn(&glm, false) > 0);
 }
 
 test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for plain attention" {
@@ -23111,6 +23644,14 @@ fn adaptCapFor(cfg: *const model_mod.ModelConfig, seq: u64) u32 {
     return widthForRung(cfg, seq, PREFILL_CHUNK_LADDER[0]);
 }
 
+test "resolvePrefillChunk: only an arch with no prefill score tensor may pin the wide rung" {
+    const mimo: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .head_dim = 192, .num_attention_heads = 64, .num_key_value_heads = 8, .hidden_size = 4096, .intermediate_size = 16384, .num_hidden_layers = 48 };
+    const dense: model_mod.ModelConfig = .{ .model_type = "llama", .head_dim = 128, .num_attention_heads = 32, .num_key_value_heads = 8, .hidden_size = 4096, .intermediate_size = 14336, .num_hidden_layers = 32 };
+    const huge: u64 = 1 << 50;
+    try std.testing.expectEqual(@as(u32, generate_mod.WIDE_PREFILL_CHUNK), resolvePrefillChunk(&mimo, 16, huge, 0, 0, 0));
+    try std.testing.expectEqual(@as(u32, 8192), resolvePrefillChunk(&dense, 16, huge, 0, 0, 0));
+}
+
 test "adaptivePrefillWidth: a step-down is immediate, by as many rungs as it takes, and never 0" {
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
@@ -23528,6 +24069,19 @@ test "the published hot-cache budget is retired when the cache is dropped" {
     try t.expectEqual(prefix_cache_mem_bytes, resolvedPrefixCacheMem());
 }
 
+test "resolvedPrefixCacheMem: RAM-off bills zero despite a configured disk tier" {
+    const capacity = prefix_cache_capacity;
+    const ram = prefix_cache_ram_enabled;
+    defer prefix_cache_capacity = capacity;
+    defer prefix_cache_ram_enabled = ram;
+    prefix_cache_capacity = 8;
+    prefix_cache_ram_enabled = false;
+    try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    prefix_cache_ram_enabled = true;
+    prefix_cache_capacity = 0;
+    try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+}
+
 test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 19,032 MB)" {
     const t = std.testing;
     // Live: a 786,707-token warm turn restored its own 786,676-token entry and was then refused
@@ -23791,7 +24345,8 @@ test "prefillRequestTerms: the reservation terms are qwen4_exp-only, a donated w
     try t.expect(retainedSsmCheckpointBytes(&q35, seq, 0, chunk) > 0);
 
     // A donating warm is credited its resident rows on every arch (a checked-out entry is the slot's own
-    // buffer); a shared one is not, and then the ungated bill is exactly the previous expression.
+    // buffer); a shared one is not, and then the ungated bill is the previous expression plus the
+    // slot's fixed KV.
     const warm = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000, .will_donate = true };
     const shared = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000 };
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "bailing_hybrid", "lfm2", "nemotron_h", "llama", "mistral" }) |mt| {
@@ -23807,7 +24362,7 @@ test "prefillRequestTerms: the reservation terms are qwen4_exp-only, a donated w
         const sh = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, shared);
         try t.expectEqual(@as(u64, 0), sh.shared_resident_bytes);
         try t.expectEqual(
-            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{}),
+            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{ .slot_fixed_kv_bytes = slotFixedKvBytes(&cfg, kv_bits, chunk) }),
             prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), sh),
         );
     }
@@ -23847,9 +24402,9 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg)), seq);
     try t.expectEqual(reserved * 2048, on.mtp_head_kv_bytes);
     const n: u64 = cfg.attnCacheLayerCount();
-    try t.expectEqual(cfg.qsaRingBytes() + cfg.qsaRingBytes() / n, on.qsa_ring_bytes);
+    try t.expectEqual(cfg.qsaRingBytes() + cfg.qsaRingBytes() / n, on.slot_fixed_kv_bytes);
     try t.expectEqual(reserved * (statePerTokenBilled(&cfg) + statePerTokenBilled(&cfg) / n), on.state_bytes);
-    try t.expectEqual(cfg.qsaRingBytes(), off.qsa_ring_bytes);
+    try t.expectEqual(cfg.qsaRingBytes(), off.slot_fixed_kv_bytes);
     try t.expectEqual(reserved * statePerTokenBilled(&cfg), off.state_bytes);
     var other = cfg;
     other.model_type = "qwen3_5_moe";
@@ -24046,7 +24601,7 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
         terms.reserved_kv_bytes +
         terms.state_bytes +
         terms.checkpoint_bytes +
-        terms.qsa_ring_bytes +
+        terms.slot_fixed_kv_bytes +
         2 * seq * cfg.num_key_value_heads * cfg.head_dim * 2 +
         envelope +
         PREFILL_RUNTIME_FLOOR_BYTES;
@@ -24223,6 +24778,29 @@ test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints"
     try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
 }
 
+test "a streamed turn's result keeps the prompt-cache hit and timings the slot measured" {
+    const t = std.testing;
+    const ts: StreamingTokenStream = .{ .mode = .regular, .eos_token_ids = &.{}, .prompt_tokens = 3016, .cached_tokens = 2985, .completion_tokens = 40, .prefill_ns = 90_000_000, .decode_ns = 1_200_000_000 };
+    var text = "ok".*;
+    var ids = [_]u32{ 7, 8 };
+    const r = ts.generationResult(&text, &ids, "stop", null);
+    try t.expectEqual(@as(u32, 2985), r.cached_tokens);
+    try t.expectEqual(ts.prefill_ns, r.prefill_ns);
+    try t.expectEqual(ts.decode_ns, r.decode_ns);
+}
+
+test "Conn names the client from each request's User-Agent and keeps no header text" {
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 9 }, .port = 4242 } };
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = -1, .address = peer } }, std.Io.Threaded.global_single_threaded.io());
+    try std.testing.expectEqual(instr.Client.other, conn.client);
+
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nUser-Agent: opencode/1.4\r\n\r\n");
+    try std.testing.expectEqual(instr.Client.opencode, conn.client);
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n");
+    try std.testing.expectEqual(instr.Client.other, conn.client);
+}
+
 test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     const saved_capacity = prefix_cache_capacity;
     const saved_ask = prefix_cache_mem_bytes;
@@ -24247,4 +24825,20 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
     try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
     try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
+}
+
+test "outcome row 7/9: countRejected moves the rejected counter, and does nothing with metrics off" {
+    const t = std.testing;
+    const saved = g_metrics;
+    defer g_metrics = saved;
+
+    g_metrics = null;
+    countRejected();
+
+    var m = instr.Metrics.init();
+    g_metrics = &m;
+    countRejected();
+    try t.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
+    try t.expectEqual(@as(u64, 0), m.requests_failed_total.load());
+    try t.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
 }

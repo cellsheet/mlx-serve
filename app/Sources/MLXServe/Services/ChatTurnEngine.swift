@@ -194,7 +194,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
               session(sessionId) != nil,
               Self.canRunTurn(serverRunning: server.status == .running, apple: appState.useAppleModel),
               let note = steering.take(for: sessionId) else { return }
-        runTurn(sessionId: sessionId, userText: note, images: nil, audio: nil,
+        runTurn(sessionId: sessionId, userText: note, images: nil, videos: nil, audio: nil,
                 config: config.revokingTools(revoked), approval: approval)
     }
 
@@ -317,6 +317,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         var reasoningEffort: ReasoningEffort = .low
         /// The agent's own voice for this turn; nil = follow Settings.
         var voice: AgentVoice? = nil
+        /// A surface's own model pin (a scheduled task); nil = the picker's selection.
+        var modelPath: String? = nil
         /// The spoken name this turn answers to (the agent's phrase when it has
         /// one). nil = the app's own phrase.
         var wakePhrase: String? = nil
@@ -415,6 +417,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     // MARK: - Convenience accessors
 
     private var server: ServerManager { appState.server }
+    private func requestModelId(_ config: TurnConfig) -> String? {
+        server.chatRequestModelId(selectedPath: config.modelPath ?? appState.selectedModelPath)
+    }
     private var mcpManager: MCPManager { appState.mcpManager }
     private func session(_ id: UUID) -> ChatSession? {
         appState.chatSessions.first { $0.id == id }
@@ -548,7 +553,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     func runTurn(sessionId: UUID,
                  userText: String,
                  images: [ChatImage]?,
-                 videos: [ChatVideo]? = nil,
+                 videos: [ChatVideo]?,
                  audio: [ChatAudio]?,
                  config: TurnConfig,
                  approval: @escaping (APIClient.ToolCall) async -> Bool) {
@@ -593,6 +598,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         else { return }
         let text = msgs[lastUserIdx].content
         let images = msgs[lastUserIdx].images
+        let videos = msgs[lastUserIdx].videos
         let audio = msgs[lastUserIdx].audio
         // The reply about to be destroyed. `truncateMessages` drops everything
         // from the last user turn onward, so this is the only moment it can be
@@ -600,7 +606,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // answer is the whole reason the pager exists.
         let replaced = msgs[(lastUserIdx + 1)...].last { $0.role == .assistant && !$0.content.isEmpty }
         appState.truncateMessages(in: sessionId, keepingFirst: lastUserIdx)
-        runTurn(sessionId: sessionId, userText: text, images: images, audio: audio,
+        runTurn(sessionId: sessionId, userText: text, images: images, videos: videos, audio: audio,
                 config: config, approval: approval)
         // AFTER runTurn, which opens with `stop(sessionId:)` — and stop is a
         // turn exit, so a seed placed before it would be spent immediately.
@@ -751,7 +757,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 enableThinking: thinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: thinking),
                 defaults: config.requestDefaults(from: appState.serverOptions),
-                modelId: server.chatModelId,
+                modelId: requestModelId(config),
                 continueFinalMessage: continuing
             )
             }
@@ -940,8 +946,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 messages: session(sessionId)?.messages ?? [],
                 contextLength: contextLength,
                 maxTokens: turnMax,
-                buildMultimodalContent: { text, images in
-                    Self.buildMultimodalContent(text: text, images: images, serverPreprocess: useServerPreprocess)
+                buildMultimodalContent: { text, msg in
+                    Self.buildMultimodalContent(text: text, images: msg.images ?? [], videos: msg.videos ?? [],
+                                                audio: msg.audio ?? [], serverPreprocess: useServerPreprocess)
                 },
                 historyImages: useServerPreprocess
             )
@@ -1082,7 +1089,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 reasoningEffort: config.reasoningEffortParam(thinking: config.enableThinking),
                 toolsJSON: combinedToolsJSON,
                 defaults: config.requestDefaults(from: appState.serverOptions),
-                modelId: server.chatModelId
+                modelId: requestModelId(config)
             )
             }
 
@@ -1552,6 +1559,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             case .image:  return try await runImageTool(args, onProgress: onProgress)
             case .speech: return try await runSpeechTool(args, onProgress: onProgress)
             case .music:  return try await runMusicTool(args, onProgress: onProgress)
+            case .sound:  return try await runSoundTool(args, onProgress: onProgress)
             case .video:  return try await runVideoTool(args, onProgress: onProgress)
             }
         } catch let missing as MediaToolArgs.MissingArgument {
@@ -1635,6 +1643,21 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         let path = try await appState.musicGen.generateForAgent(req, server: appState.server,
                                                                 onProgress: onProgress)
         let caption = "Generated a \(req.durationSeconds)s track for: \(req.prompt). Saved to \(path)."
+        return "\(caption)\n\(AgentMediaInline.mediaRefLine(kind: .audio, path: path))"
+    }
+
+    private func runSoundTool(_ args: [String: String],
+                              onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
+        let s = SoundGenSettings.load()
+        let model = s.resolvedModel(models: appState.server.allModels)
+        let lanId = LanPick.lanId(s.modelId)
+        if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
+                                            approxGB: String(format: "%.1f", model.approxDownloadGB),
+                                            window: "Audio", lanId: lanId) { return notice }
+        let req = try MediaToolArgs.sound(args, model: model, keepResident: s.keepResident, lanId: lanId)
+        let path = try await appState.soundGen.generateForAgent(req, server: appState.server,
+                                                                onProgress: onProgress)
+        let caption = String(format: "Generated a %.1fs sound for: %@. Saved to %@.", req.durationSeconds, req.prompt, path)
         return "\(caption)\n\(AgentMediaInline.mediaRefLine(kind: .audio, path: path))"
     }
 

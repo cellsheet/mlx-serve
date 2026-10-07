@@ -79,11 +79,12 @@ enum SettingsReset {
         case .memory:
             return [
                 f("skipMemPreflight") { $0.skipMemPreflight = $1.skipMemPreflight },
-                f("osMemoryReserve") { $0.osMemoryReserve = $1.osMemoryReserve },
+                f("osReserveGiB") { $0.osReserveGiB = $1.osReserveGiB },
                 f("maxResidentMemGB") { $0.maxResidentMemGB = $1.maxResidentMemGB },
                 f("maxResidentModels") { $0.maxResidentModels = $1.maxResidentModels },
                 f("idleEvictSecs") { $0.idleEvictSecs = $1.idleEvictSecs },
                 f("kvQuant") { $0.kvQuant = $1.kvQuant },
+                f("hotPrefixCacheEnabled") { $0.hotPrefixCacheEnabled = $1.hotPrefixCacheEnabled },
                 f("prefixCacheEntries") { $0.prefixCacheEntries = $1.prefixCacheEntries },
                 f("prefixCacheMem") { $0.prefixCacheMem = $1.prefixCacheMem },
                 f("pleGpu") { $0.pleGpu = $1.pleGpu },
@@ -112,6 +113,8 @@ enum SettingsReset {
                 f("mlxGguf") { $0.mlxGguf = $1.mlxGguf },
                 f("llamaKvQuant") { $0.llamaKvQuant = $1.llamaKvQuant },
                 f("llamaCacheEntries") { $0.llamaCacheEntries = $1.llamaCacheEntries },
+                f("llamaMtpDrafts") { $0.llamaMtpDrafts = $1.llamaMtpDrafts },
+                f("llamaUbatch") { $0.llamaUbatch = $1.llamaUbatch },
                 f("ssdStreaming") { $0.ssdStreaming = $1.ssdStreaming },
             ]
 
