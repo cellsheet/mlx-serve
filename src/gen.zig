@@ -4766,7 +4766,7 @@ fn residentWeightBytes(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 
 /// Metal OOM; the test below refuses an unclassified entry of `media_model_types`.
 fn convertsW8a8(model_type: []const u8) ?bool {
     const converts = [_][]const u8{ "flux2", "krea", "mage_flow", "mageflow", "acestep", "AudioVideo", "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image" };
-    const packed_only = [_][]const u8{ "qwen3_tts", "kokoro", "laya", "kev", "clef", "d1", "stable_audio3", "yue2", "nemotron_diarization" };
+    const packed_only = [_][]const u8{ "qwen3_tts", "kokoro", "laya", "kev", "clef", "d1", "stable_audio3", "yue2", "nemotron_diarization", "anima" };
     for (converts) |p| if (std.mem.startsWith(u8, model_type, p)) return true;
     for (packed_only) |p| if (std.mem.startsWith(u8, model_type, p)) return false;
     return null;
