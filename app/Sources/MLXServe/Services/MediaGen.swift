@@ -2320,7 +2320,7 @@ extension ImageModelPreset {
         switch variant {
         case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo:
             return true
-        case .krea2Turbo, .mageFlowTurbo:
+        case .krea2Turbo, .mageFlowTurbo, .anima:
             return false
         }
     }
