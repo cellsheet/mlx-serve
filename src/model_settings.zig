@@ -7,6 +7,7 @@ const std = @import("std");
 const kv_quant = @import("kv_quant.zig");
 const log = @import("log.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
+const generation = @import("generation_settings.zig");
 
 pub const Override = struct {
     ctx_size: ?u32 = null,
@@ -16,28 +17,24 @@ pub const Override = struct {
     mtp_greedy_tail: ?bool = null,
     /// LOSSY int8-activation prefill for 2-bit Prism packs (`qmm_int8`).
     int8_prefill: ?bool = null,
+    /// Serve this model on the Neural Engine (`arch/ane_lm.zig`) instead of the GPU.
+    ane: ?bool = null,
     /// Extra template variables as a JSON object (vLLM/llama.cpp
     /// `chat_template_kwargs`), e.g. `{"preserve_thinking": true}`. Owned.
     chat_template_kwargs: ?[]const u8 = null,
-    /// Its `enable_thinking` / `reasoning_effort`: defaults for a request that
-    /// names neither. Effort owned.
-    enable_thinking: ?bool = null,
-    reasoning_effort: ?[]const u8 = null,
     /// The speculation sidecar: "off", "auto" (the pack's own `drafter/`) or an
     /// absolute path. Owned.
     drafter: ?[]const u8 = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.int8_prefill == null and o.chat_template_kwargs == null and o.drafter == null;
+            o.mtp_greedy_tail == null and o.int8_prefill == null and o.ane == null and o.chat_template_kwargs == null and o.drafter == null;
     }
 
     pub fn deinit(o: *Override, alloc: std.mem.Allocator) void {
         if (o.chat_template_kwargs) |k| alloc.free(k);
-        if (o.reasoning_effort) |e| alloc.free(e);
         if (o.drafter) |d| alloc.free(d);
         o.chat_template_kwargs = null;
-        o.reasoning_effort = null;
         o.drafter = null;
     }
 };
@@ -52,18 +49,18 @@ pub const Settings = struct {
 
     /// The returned Override owns its strings (`deinit`).
     pub fn lookup(self: *const Settings, alloc: std.mem.Allocator, model_path: []const u8) Override {
-        const p = self.parsed orelse return .{};
-        const root = switch (p.value) {
-            .object => |o| o,
-            else => return .{},
-        };
+        return fromValue(alloc, self.entry(model_path) orelse return .{});
+    }
+
+    /// The raw entry of `model_path`, borrowed from the parsed file.
+    pub fn entry(self: *const Settings, model_path: []const u8) ?std.json.Value {
+        const root = self.rootObject() orelse return null;
         const want = trimSlash(model_path);
         var it = root.iterator();
         while (it.next()) |kv| {
-            if (!std.mem.eql(u8, trimSlash(kv.key_ptr.*), want)) continue;
-            return fromValue(alloc, kv.value_ptr.*);
+            if (std.mem.eql(u8, trimSlash(kv.key_ptr.*), want)) return kv.value_ptr.*;
         }
-        return .{};
+        return null;
     }
 
     /// The model path whose `alias` is `name`; a name claimed twice goes to the
@@ -83,13 +80,7 @@ pub const Settings = struct {
 
     /// The valid alias set for `model_path`, borrowed from the parsed file.
     pub fn aliasForPath(self: *const Settings, model_path: []const u8) ?[]const u8 {
-        const root = self.rootObject() orelse return null;
-        const want = trimSlash(model_path);
-        var it = root.iterator();
-        while (it.next()) |kv| {
-            if (std.mem.eql(u8, trimSlash(kv.key_ptr.*), want)) return aliasOf(kv.value_ptr.*);
-        }
-        return null;
+        return aliasOf(self.entry(model_path) orelse return null);
     }
 
     pub const Duplicate = struct { alias: []const u8, a: []const u8, b: []const u8 };
@@ -164,6 +155,10 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
         .bool => |b| o.int8_prefill = b,
         else => {},
     };
+    if (obj.get("ane")) |m| switch (m) {
+        .bool => |b| o.ane = b,
+        else => {},
+    };
     if (obj.get("mtp_greedy_tail")) |g| switch (g) {
         .bool => |b| o.mtp_greedy_tail = b,
         else => {},
@@ -175,14 +170,24 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     };
     if (obj.get("chat_template_kwargs")) |k| if (k == .object) {
         o.chat_template_kwargs = std.json.Stringify.valueAlloc(alloc, k, .{}) catch null;
-        if (k.object.get("enable_thinking")) |e| if (e == .bool) {
-            o.enable_thinking = e.bool;
-        };
-        if (k.object.get("reasoning_effort")) |e| if (e == .string) {
-            o.reasoning_effort = alloc.dupe(u8, e.string) catch null;
-        };
     };
     return o;
+}
+
+/// A model entry's generation rules: its `generation_defaults`, plus the `enable_thinking` /
+/// `reasoning_effort` of its `chat_template_kwargs` where no rule names them.
+fn generationProfile(obj: std.json.ObjectMap) generation.Profile {
+    var p = if (obj.get("generation_defaults")) |v| generation.parseProfile(v) catch |err| blk: {
+        log.warn("[model-settings] generation_defaults ignored ({s})\n", .{@errorName(err)});
+        break :blk generation.Profile{};
+    } else generation.Profile{};
+    const kw = obj.get("chat_template_kwargs") orelse return p;
+    if (kw != .object) return p;
+    if (p.rules.get(.enable_thinking) == null) if (kw.object.get("enable_thinking")) |v| if (v == .bool)
+        p.set(.enable_thinking, .{ .boolean = v.bool }, false);
+    if (p.rules.get(.reasoning_effort) == null) if (kw.object.get("reasoning_effort")) |v| if (v == .string)
+        if (std.meta.stringToEnum(generation.Effort, v.string)) |e| p.set(.reasoning_effort, .{ .effort = e }, false);
+    return p;
 }
 
 pub fn parse(alloc: std.mem.Allocator, body: []const u8) !Settings {
@@ -203,8 +208,13 @@ pub fn load(alloc: std.mem.Allocator, io: std.Io, path: []const u8) Settings {
 }
 
 pub fn defaultPath(buf: []u8) []const u8 {
+    return homeFile(buf, "model-settings.json");
+}
+
+/// `~/.mlx-serve/<name>`; "" when it does not fit `buf`.
+pub fn homeFile(buf: []u8, name: []const u8) []const u8 {
     const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
-    return std.fmt.bufPrint(buf, "{s}/.mlx-serve/model-settings.json", .{home}) catch "";
+    return std.fmt.bufPrint(buf, "{s}/.mlx-serve/{s}", .{ home, name }) catch "";
 }
 
 /// The parsed file kept for the request path: re-stats at most once per
@@ -241,6 +251,26 @@ pub const Cache = struct {
         defer self.mutex.unlock(io);
         self.refresh(io);
         return copyInto(buf, self.settings.aliasForPath(model_path));
+    }
+
+    /// The generation rules of `model_path`'s entry; null reads the whole file as one
+    /// profile (`generation-settings.json`). Read per request, so an edit applies to the next one.
+    pub fn generationDefaults(self: *Cache, io: std.Io, model_path: ?[]const u8) generation.Profile {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.refresh(io);
+        const parsed = self.settings.parsed orelse return .{};
+        const path = model_path orelse return generation.parseProfile(parsed.value) catch |err| {
+            log.warn("[generation-settings] {s} ignored ({s})\n", .{ self.path, @errorName(err) });
+            return .{};
+        };
+        if (parsed.value != .object) return .{};
+        var it = parsed.value.object.iterator();
+        while (it.next()) |kv| {
+            if (!std.mem.eql(u8, trimSlash(kv.key_ptr.*), trimSlash(path))) continue;
+            return if (kv.value_ptr.* == .object) generationProfile(kv.value_ptr.object) else .{};
+        }
+        return .{};
     }
 
     /// Re-read the file if it changed; lookups call it, and a caller that must
@@ -293,7 +323,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
             o.drafter = null;
         };
     };
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} drafter={s} kwargs={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} ane={s} drafter={s} kwargs={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -301,6 +331,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
         if (o.mtp_greedy_tail) |g| (if (g) "on" else "off") else "default",
         if (o.int8_prefill) |b| (if (b) "on" else "off") else "default",
+        if (o.ane) |b| (if (b) "on" else "off") else "default",
         o.drafter orelse "auto",
         o.chat_template_kwargs orelse "none",
     });
@@ -324,6 +355,16 @@ test "model_settings: parse + lookup with and without trailing slash" {
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
 }
 
+test "model_settings: entry is the model's raw object, keys the Override does not read included" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a/": {"ctx_size": 65536, "numeric_tier": "stock"}, "/m/b": 3}
+    );
+    defer s.deinit();
+    try std.testing.expectEqualStrings("stock", s.entry("/m/a").?.object.get("numeric_tier").?.string);
+    try std.testing.expectEqual(@as(i64, 3), s.entry("/m/b/").?.integer);
+    try std.testing.expect(s.entry("/m/c") == null);
+}
+
 test "model_settings: chat_template_kwargs is an object carried verbatim, anything else is unset" {
     const t = std.testing.allocator;
     var s = try parse(t,
@@ -334,13 +375,36 @@ test "model_settings: chat_template_kwargs is an object carried verbatim, anythi
     var a = s.lookup(t, "/m/a");
     defer a.deinit(t);
     try std.testing.expectEqualStrings("{\"preserve_thinking\":true,\"x\":[1]}", a.chat_template_kwargs.?);
-    try std.testing.expectEqual(@as(?bool, null), a.enable_thinking);
-    // The thinking keys are typed out: they are request defaults, not template text.
-    var c = s.lookup(t, "/m/c");
-    defer c.deinit(t);
-    try std.testing.expectEqual(@as(?bool, true), c.enable_thinking);
-    try std.testing.expectEqualStrings("high", c.reasoning_effort.?);
     try std.testing.expect(s.lookup(t, "/m/b").isEmpty());
+}
+
+test "model_settings: generation rules re-read per request; kwargs thinking keys fill rules the entry leaves unset" {
+    const t = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const path = try std.fs.path.join(t, &.{ dir, "model-settings.json" });
+    defer t.free(path);
+    var c: Cache = .{ .path = path, .alloc = t, .recheck_ms = 0 };
+    defer c.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data =
+        \\{"/m/a/": {"chat_template_kwargs": {"enable_thinking": true, "reasoning_effort": "high"},
+        \\  "generation_defaults": {"reasoning_effort": {"value": "low", "ignore_client": true}}}}
+    });
+    var p = c.generationDefaults(io, "/m/a");
+    try std.testing.expectEqual(true, p.value(bool, .enable_thinking).?);
+    try std.testing.expectEqual(generation.Effort.low, p.value(generation.Effort, .reasoning_effort).?);
+    try std.testing.expect(p.forced(.reasoning_effort));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data =
+        \\{"/m/a": {"generation_defaults": {"temperature": {"value": 0.5}, "top_k": {"value": -1}}}}
+    });
+    p = c.generationDefaults(io, "/m/a"); // a bad rule drops the profile, never the request
+    try std.testing.expect(p.rules.get(.temperature) == null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data = "{\"max_tokens\": {\"value\": 12, \"ignore_client\": true}}" });
+    p = c.generationDefaults(io, null);
+    try std.testing.expectEqual(@as(u32, 12), p.resolve(u32, .max_tokens, 64, 0));
 }
 
 test "model_settings: mtp_acceptance names a mode at its default threshold" {
@@ -365,6 +429,17 @@ test "model_settings: the greedy tail (mtp_greedy_tail) is a bool, anything else
     try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").mtp_greedy_tail);
     try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+}
+
+test "model_settings: ane is a boolean, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"ane": true}, "/m/b": {"ane": false}, "/m/c": {"ane": "yes"}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").ane);
+    try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").ane);
+    try std.testing.expectEqual(@as(?bool, null), s.lookup(t, "/m/c").ane);
 }
 
 test "model_settings: int8_prefill is a boolean, anything else is unset" {

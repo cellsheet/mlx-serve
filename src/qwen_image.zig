@@ -30,11 +30,15 @@ const mage_flow = @import("mage_flow.zig");
 const qwen_kernels = @import("qwen_image_kernels.zig");
 const qwen_image_edit = @import("qwen_image_edit.zig");
 const model_discovery = @import("model_discovery.zig");
+const lora_mod = @import("lora.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
 const MfLinear = mage_flow.MfLinear;
+const w8a8 = @import("w8a8.zig");
+const dit_kernels = @import("dit_kernels.zig");
+const int8_attn = @import("int8_attn.zig");
 const TextEncoder = mage_flow.TextEncoder;
 const VisionTower = mage_flow.VisionTower;
 const stb = @import("stb");
@@ -42,12 +46,15 @@ const stb = @import("stb");
 /// The reference's recommended sampling: 40 steps, no guidance.
 pub const DEFAULT_STEPS: u32 = 40;
 
-pub fn resolveSteps(steps: u32) u32 {
+/// A checkpoint's own `sample_sigmas` grid (Turbo) decides the step count over
+/// the request's, as in diffusers' QwenImage21Pipeline.
+pub fn resolveSteps(grid: ?[]const f32, steps: u32) u32 {
+    if (grid) |g| return @intCast(g.len);
     return if (steps == 0) DEFAULT_STEPS else steps;
 }
 
-const VAE_DOWNSAMPLE: u32 = 16;
-/// Text encoding stays bf16; the DiT defaults to bf16 and the VAE stays f32.
+pub const VAE_DOWNSAMPLE: u32 = 16;
+/// Text encoding stays bf16; the DiT defaults to bf16 and the VAE runs f16.
 const COMPUTE: mlx.mlx_dtype = .bfloat16;
 /// Experimental DiT-only dtype override. Unrecognized values preserve the
 /// checkpoint's default; text encoding and VAE decoding keep their own dtypes.
@@ -59,7 +66,7 @@ fn fusedRopeEnabled(value: ?[*:0]const u8) bool {
     return if (value) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
 }
 
-const MAX_PROMPT_TOKENS: usize = 2048;
+pub const MAX_PROMPT_TOKENS: usize = 2048;
 
 // Raw template string, not the chat template: the checkpoint was trained on it.
 const SYSTEM_PREFIX = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n";
@@ -362,6 +369,32 @@ pub fn computeSigmas(a: std.mem.Allocator, steps: u32, image_seq_len: u32) ![]f3
     const scale = (1.0 - shifted(emu, n, n - 1)) / (1.0 - terminal);
     for (0..steps) |i| out[i] = @floatCast(1.0 - (1.0 - shifted(emu, n, @floatFromInt(i))) / scale);
     out[steps] = 0;
+    return out;
+}
+
+/// Sigmas [steps+1] for one request: the checkpoint's grid verbatim plus the
+/// terminal 0 (its scheduler config is shift 1, no dynamic shifting), else
+/// the dynamic-shift schedule.
+pub fn scheduleSigmas(a: std.mem.Allocator, grid: ?[]const f32, steps: u32, image_seq_len: u32) ![]f32 {
+    const g = grid orelse return computeSigmas(a, steps, image_seq_len);
+    const out = try a.alloc(f32, g.len + 1);
+    @memcpy(out[0..g.len], g);
+    out[g.len] = 0;
+    return out;
+}
+
+/// `model_index.json` `sample_sigmas` (owned), or null when the file or key is absent.
+pub fn parseSampleSigmas(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !?[]f32 {
+    const path = try std.fmt.allocPrint(a, "{s}/model_index.json", .{model_dir});
+    defer a.free(path);
+    var parsed = readJson(io, a, path) catch |err| return if (err == error.QwenImageConfigMissing) null else err;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const v = parsed.value.object.get("sample_sigmas") orelse return null;
+    if (v != .array or v.array.items.len == 0) return error.QwenImageBadConfig;
+    const out = try a.alloc(f32, v.array.items.len);
+    errdefer a.free(out);
+    for (v.array.items, out) |e, *o| o.* = jsonF32(e) orelse return error.QwenImageBadConfig;
     return out;
 }
 
@@ -716,6 +749,37 @@ pub const EditGeometry = struct {
     }
 };
 
+const BlockLora = struct {
+    q: lora_mod.Slot = .{},
+    k: lora_mod.Slot = .{},
+    v: lora_mod.Slot = .{},
+    o: lora_mod.Slot = .{},
+    proj: lora_mod.Slot = .{},
+    gate: lora_mod.Slot = .{},
+    out: lora_mod.Slot = .{},
+};
+
+/// Milliseconds since `t0`, restarting it: consecutive calls time consecutive stages.
+fn stageMs(io: std.Io, t0: *std.Io.Timestamp) u64 {
+    const ns = t0.untilNow(io, .awake).nanoseconds;
+    t0.* = std.Io.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ns, 1_000_000));
+}
+
+/// `lin(x)` plus every adapter attached to it.
+fn linForward(lin: *const MfLinear, slot: *const lora_mod.Slot, x: A, s: S) !A {
+    return lora_mod.addSlot(try lin.forward(x, null, s), x, slot, s);
+}
+
+/// `silu(g) * p`, consuming both.
+fn gluMul(g: A, p: A, s: S) !A {
+    defer free(g);
+    defer free(p);
+    const sg = try silu(g, s);
+    defer free(sg);
+    return mulA(sg, p, s);
+}
+
 const Block = struct {
     q: MfLinear,
     k: MfLinear,
@@ -726,8 +790,15 @@ const Block = struct {
     proj: MfLinear,
     gate: MfLinear,
     out: MfLinear,
+    lora: BlockLora = .{},
+    /// q, k, v rows in one int8 weight (the three linears are views of it), and
+    /// gate/proj interleaved for the SwiGLU epilogue, which REPLACES them (`--w8a8`).
+    qkv: ?w8a8.Weight = null,
+    gp: ?w8a8.Weight = null,
 
     fn deinit(self: *Block) void {
+        if (self.qkv) |*q| q.deinit();
+        if (self.gp) |*q| q.deinit();
         inline for (.{ &self.q, &self.k, &self.v, &self.o, &self.proj, &self.gate, &self.out }) |l| l.deinit();
         free(self.norm_q);
         free(self.norm_k);
@@ -832,6 +903,11 @@ pub const Dit = struct {
                 .gate = try loadLinear(&w, a, H, dtype, s, p ++ "img_mlp.gate_layer", .{i}),
                 .out = try loadLinear(&w, a, H * cfg.mlp_ratio, dtype, s, p ++ "img_mlp.out", .{i}),
             };
+            inline for (.{ &b.q, &b.k, &b.v, &b.o, &b.proj, &b.gate }) |l| try l.toW8a8(s);
+            try b.out.toW8a8(s);
+            b.qkv = try w8a8.fuse(&.{ &b.q.w8, &b.k.w8, &b.v.w8 }, .stack, s);
+            b.gp = try w8a8.fuse(&.{ &b.gate.w8, &b.proj.w8 }, .interleave, s);
+            if (w8a8.enabled) w.dropBlock("transformer_blocks.{d}.", i);
         }
         return self;
     }
@@ -841,6 +917,37 @@ pub const Dit = struct {
         free(self.txt_norm);
         for (self.blocks) |*b| b.deinit();
         self.allocator.free(self.blocks);
+    }
+
+    /// Attach every adapter in `stack` to its block linear. Returns the number
+    /// of (module, adapter) attachments across the stack; the caller compares
+    /// it with the adapters loaded to reject a file that matched only in part.
+    /// Non-owning: `stack` must outlive the attach.
+    pub fn attachLora(self: *Dit, stack: *const lora_mod.Stack) u32 {
+        self.detachLora();
+        var matched: u32 = 0;
+        var kbuf: [96]u8 = undefined;
+        var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
+        for (self.blocks, 0..) |*b, i| {
+            inline for (.{
+                .{ "attn.to_q", "q" },       .{ "attn.to_k", "k" },
+                .{ "attn.to_v", "v" },       .{ "attn.to_out", "o" },
+                .{ "img_mlp.proj", "proj" }, .{ "img_mlp.gate_layer", "gate" },
+                .{ "img_mlp.out", "out" },
+            }) |m| {
+                const key = std.fmt.bufPrint(&kbuf, "transformer_blocks.{d}." ++ m[0], .{i}) catch unreachable;
+                const refs = stack.findAll(key, &rbuf);
+                if (refs.len > 0) {
+                    @field(b.lora, m[1]).set(refs);
+                    matched += @intCast(refs.len);
+                }
+            }
+        }
+        return matched;
+    }
+
+    pub fn detachLora(self: *Dit) void {
+        for (self.blocks) |*b| b.lora = .{};
     }
 
     /// Timestep embedding rows [2, hidden]: row 0 the sampled t, row 1 t = 0.
@@ -926,10 +1033,10 @@ pub const Dit = struct {
     }
 
     /// Project → per-head RMS norm → RoPE → [1, heads, L, hd].
-    fn headsOf(self: *const Dit, lin: *const MfLinear, norm: ?A, x: A, geo: *const Geometry) !A {
+    fn headsOf(self: *const Dit, lin: *const MfLinear, slot: *const lora_mod.Slot, norm: ?A, x: A, geo: *const Geometry) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
-        const y = try lin.forward(x, null, s);
+        const y = try linForward(lin, slot, x, s);
         defer free(y);
         const y4 = try reshape(y, &[_]c_int{ sh[0], sh[1], @intCast(self.cfg.heads), @intCast(self.cfg.head_dim) }, s);
         defer free(y4);
@@ -942,17 +1049,36 @@ pub const Dit = struct {
         return transpose(yr, &perm, s);
     }
 
+    /// q, k, v heads-major from one int8 GEMM and one norm+RoPE kernel; null when
+    /// the fused weight is absent or the call is outside it.
+    fn fusedHeads(self: *const Dit, b: *const Block, x: A, geo: *const Geometry) !?dit_kernels.QkvHeads {
+        const f = if (b.qkv) |*q| q else return null;
+        if (b.lora.q.count + b.lora.k.count + b.lora.v.count != 0 or self.cfg.head_dim != 128) return null;
+        const sh = mlx.getShape(x);
+        if (sh[0] != 1) return null;
+        const xc = try astype(x, self.dtype, self.s);
+        defer free(xc);
+        const y = try w8a8.forward(xc, f, self.s);
+        defer free(y);
+        const y2 = try reshape(y, &[_]c_int{ sh[1], @intCast(f.n) }, self.s);
+        defer free(y2);
+        const hq: c_int = @intCast(self.cfg.heads * self.cfg.head_dim);
+        const h: c_int = @intCast(self.cfg.heads);
+        return try dit_kernels.qkvHeads(y2, .{ .heads = h, .kv_heads = h, .q_off = 0, .k_off = hq, .v_off = 2 * hq }, b.norm_q, b.norm_k, geo.cos, geo.sin, self.cfg.eps, false, self.s);
+    }
+
     /// Block-causal attention as the reference segments it: causal over the
     /// text prefix, then the image block against the whole sequence.
     fn attention(self: *const Dit, b: *const Block, x: A, geo: *const Geometry, cache: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
         const T = geo.text_len;
-        const q = try self.headsOf(&b.q, b.norm_q, x, geo);
+        const fused = try self.fusedHeads(b, x, geo);
+        const q = if (fused) |f| f.q else try self.headsOf(&b.q, &b.lora.q, b.norm_q, x, geo);
         defer free(q);
-        const k = try self.headsOf(&b.k, b.norm_k, x, geo);
+        const k = if (fused) |f| f.k else try self.headsOf(&b.k, &b.lora.k, b.norm_k, x, geo);
         defer free(k);
-        const v = try self.headsOf(&b.v, null, x, geo);
+        const v = if (fused) |f| f.v else try self.headsOf(&b.v, &b.lora.v, null, x, geo);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
 
@@ -967,6 +1093,28 @@ pub const Dit = struct {
         defer if (full_v) |a| free(a);
         const qi = try sliceAxis(q, 2, T, sh[1], s);
         defer free(qi);
+        if (w8a8.enabled) if (try int8_attn.attention(qi, full_k orelse k, full_v orelse v, scale, s)) |img8| {
+            defer free(img8);
+            const all = if (T == 0) try contig(img8, s) else blk: {
+                const qt = try sliceAxis(q, 2, 0, T, s);
+                defer free(qt);
+                const kt = try sliceAxis(k, 2, 0, T, s);
+                defer free(kt);
+                const vt = try sliceAxis(v, 2, 0, T, s);
+                defer free(vt);
+                const txt_out = try sdpa(qt, kt, vt, scale, "causal", s);
+                defer free(txt_out);
+                const tt = try transpose(txt_out, &[_]c_int{ 0, 2, 1, 3 }, s);
+                defer free(tt);
+                const tf = try reshape(tt, &[_]c_int{ T, sh[2] }, s);
+                defer free(tf);
+                break :blk try concat(&.{ tf, img8 }, 0, s);
+            };
+            defer free(all);
+            const flat = try reshape(all, &[_]c_int{ sh[0], sh[1], sh[2] }, s);
+            defer free(flat);
+            return linForward(&b.o, &b.lora.o, flat, s);
+        };
         const img_out = try sdpa(qi, full_k orelse k, full_v orelse v, scale, "", s);
         defer free(img_out);
         const joined = if (T == 0) try contig(img_out, s) else blk: {
@@ -985,7 +1133,32 @@ pub const Dit = struct {
         defer free(back);
         const flat = try reshape(back, &[_]c_int{ sh[0], sh[1], sh[2] }, s);
         defer free(flat);
-        return b.o.forward(flat, null, s);
+        return linForward(&b.o, &b.lora.o, flat, s);
+    }
+
+    /// `silu(gate(x)) * proj(x)`. With the interleaved int8 weight that is one
+    /// GEMM with the SwiGLU in its epilogue; an attached adapter needs the two
+    /// projections apart, so it takes the plain GEMM and splits it.
+    fn swiglu(self: *const Dit, b: *const Block, x: A) !A {
+        const s = self.s;
+        if (b.gp) |*f| {
+            const xc = try astype(x, self.dtype, s);
+            defer free(xc);
+            if (b.lora.gate.count + b.lora.proj.count == 0) return w8a8.forwardSwiglu(xc, f, s);
+            const pair = try w8a8.forwardPair(xc, f, s);
+            const g = try lora_mod.addSlot(pair.gate, xc, &b.lora.gate, s);
+            const p = lora_mod.addSlot(pair.up, xc, &b.lora.proj, s) catch |e| {
+                free(g);
+                return e;
+            };
+            return gluMul(g, p, s);
+        }
+        const g = try linForward(&b.gate, &b.lora.gate, x, s);
+        const p = linForward(&b.proj, &b.lora.proj, x, s) catch |e| {
+            free(g);
+            return e;
+        };
+        return gluMul(g, p, s);
     }
 
     fn blockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const Geometry, cache: ?*?PrefixKV, cached: bool) !A {
@@ -1005,15 +1178,9 @@ pub const Dit = struct {
         defer free(n2);
         const m_in = try mulA(n2, mod.scale2, s);
         defer free(m_in);
-        const g = try b.gate.forward(m_in, null, s);
-        defer free(g);
-        const sg = try silu(g, s);
-        defer free(sg);
-        const p = try b.proj.forward(m_in, null, s);
-        defer free(p);
-        const gp = try mulA(sg, p, s);
+        const gp = try self.swiglu(b, m_in);
         defer free(gp);
-        const mlp = try b.out.forward(gp, null, s);
+        const mlp = try linForward(&b.out, &b.lora.out, gp, s);
         defer free(mlp);
         const gm = try mulA(mlp, mod.gate2, s);
         defer free(gm);
@@ -1146,10 +1313,10 @@ pub const Dit = struct {
     }
 
     /// Project → per-head RMS norm → RoPE → [1, heads, L, hd], edit tables.
-    fn editHeadsOf(self: *const Dit, lin: *const MfLinear, norm: ?A, x: A, geo: *const Geometry) !A {
+    fn editHeadsOf(self: *const Dit, lin: *const MfLinear, slot: *const lora_mod.Slot, norm: ?A, x: A, geo: *const Geometry) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
-        const y = try lin.forward(x, null, s);
+        const y = try linForward(lin, slot, x, s);
         defer free(y);
         const y4 = try reshape(y, &[_]c_int{ sh[0], sh[1], @intCast(self.cfg.heads), @intCast(self.cfg.head_dim) }, s);
         defer free(y4);
@@ -1165,11 +1332,11 @@ pub const Dit = struct {
     fn editAttention(self: *const Dit, b: *const Block, x: A, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
-        const q = try self.editHeadsOf(&b.q, b.norm_q, x, rope);
+        const q = try self.editHeadsOf(&b.q, &b.lora.q, b.norm_q, x, rope);
         defer free(q);
-        const k = try self.editHeadsOf(&b.k, b.norm_k, x, rope);
+        const k = try self.editHeadsOf(&b.k, &b.lora.k, b.norm_k, x, rope);
         defer free(k);
-        const v = try self.editHeadsOf(&b.v, null, x, rope);
+        const v = try self.editHeadsOf(&b.v, &b.lora.v, null, x, rope);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
         const attn = if (cached) blk: {
@@ -1188,7 +1355,7 @@ pub const Dit = struct {
         defer free(back);
         const flat = try reshape(back, &[_]c_int{ sh[0], sh[1], sh[2] }, s);
         defer free(flat);
-        return b.o.forward(flat, null, s);
+        return linForward(&b.o, &b.lora.o, flat, s);
     }
 
     fn editBlockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
@@ -1208,15 +1375,9 @@ pub const Dit = struct {
         defer free(n2);
         const m_in = try mulA(n2, mod.scale2, s);
         defer free(m_in);
-        const g = try b.gate.forward(m_in, null, s);
-        defer free(g);
-        const sg = try silu(g, s);
-        defer free(sg);
-        const p = try b.proj.forward(m_in, null, s);
-        defer free(p);
-        const gp = try mulA(sg, p, s);
+        const gp = try self.swiglu(b, m_in);
         defer free(gp);
-        const mlp = try b.out.forward(gp, null, s);
+        const mlp = try linForward(&b.out, &b.lora.out, gp, s);
         defer free(mlp);
         const gm = try mulA(mlp, mod.gate2, s);
         defer free(gm);
@@ -1330,7 +1491,16 @@ fn segmentSdpaWalk(q: A, k: A, v: A, geo: *const EditGeometry, scale: f32, s: S,
     return joined;
 }
 
-// ── VAE (f32, NHWC inside) ──
+// ── VAE (NHWC inside) ──
+
+/// The VAE's compute dtype: f16 decodes within ~56 dB of the reference's f32 and
+/// lets every conv run on the half-precision matrix path.
+const vae_dt: mlx.mlx_dtype = .float16;
+
+fn vaeCast(x: A, s: S) !A {
+    defer free(x);
+    return astype(x, vae_dt, s);
+}
 
 const Conv = struct {
     w: A, // OHWI
@@ -1360,9 +1530,9 @@ const Conv = struct {
             break :blk try contig(t, s);
         };
         defer free(tc);
-        const wf = try astype(tc, .float32, s);
+        const wf = try astype(tc, vae_dt, s);
         errdefer free(wf);
-        return .{ .w = wf, .b = try loadVecF32(w, a, fmt ++ ".bias", args, s) };
+        return .{ .w = wf, .b = try vaeCast(try loadVecF32(w, a, fmt ++ ".bias", args, s), s) };
     }
 
     fn deinit(self: *Conv) void {
@@ -1444,7 +1614,7 @@ fn bandRows(x_shape: []const c_int, out_ch: c_int, grow: c_int) c_int {
 fn loadVaeNorm(w: *const Weights, a: std.mem.Allocator, s: S, comptime fmt: []const u8, args: anytype) !A {
     const g = try loadVecF32(w, a, fmt ++ ".gamma", args, s);
     defer free(g);
-    return reshape(g, &[_]c_int{-1}, s);
+    return vaeCast(try reshape(g, &[_]c_int{-1}, s), s);
 }
 
 /// x/‖x‖₂ · √C · gamma over channels IS rms_norm (‖x‖₂/√C = rms), and the fused
@@ -1684,7 +1854,7 @@ const Stage = struct {
             const nh = try r.forward(h, s);
             free(h);
             h = nh;
-            // Full-resolution stages are GBs of f32: never let resnets stack lazily.
+            // Full-resolution stages are GBs: never let resnets stack lazily.
             try mlx.check(mlx.mlx_array_eval(h));
         }
         return h;
@@ -1742,7 +1912,7 @@ fn channelVec(vals: []const f32, s: S) !A {
     const sh = [_]c_int{@intCast(vals.len)};
     const raw = mlx.mlx_array_new_data(vals.ptr, &sh, 1, .float32);
     defer free(raw);
-    return contig(raw, s);
+    return vaeCast(try contig(raw, s), s);
 }
 
 /// Everything both halves of the VAE share: stem, stages, mid block, head.
@@ -1821,7 +1991,7 @@ pub const VaeDecoder = struct {
     /// The fourth channel is native alpha; preserve it for transparent PNG output.
     pub fn decodeRgba(self: *const VaeDecoder, latent: A) !A {
         const s = self.h.s;
-        const lf = try astype(latent, .float32, s);
+        const lf = try astype(latent, vae_dt, s);
         defer free(lf);
         const nhwc = try transpose(lf, &[_]c_int{ 0, 2, 3, 1 }, s);
         defer free(nhwc);
@@ -1842,7 +2012,9 @@ pub const VaeDecoder = struct {
             try mlx.check(mlx.mlx_array_eval(x));
         }
         defer free(x);
-        const out = try self.h.head(x);
+        const hx = try self.h.head(x);
+        defer free(hx);
+        const out = try astype(hx, .float32, s);
         defer free(out);
         return transpose(out, &[_]c_int{ 0, 3, 1, 2 }, s);
     }
@@ -2049,6 +2221,8 @@ pub const Engine = struct {
     /// The pack's text_encoder/ carries the Qwen3-VL tower (edit capability),
     /// probed at load by `towerPresentIn`; the tower weights load on demand.
     has_tower: bool = false,
+    /// `model_index.json` `sample_sigmas` (Turbo's distilled grid), owned.
+    sample_sigmas: ?[]f32 = null,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, staged: bool) !*Engine {
         const dit_cfg = try DitConfig.parse(io, allocator, model_dir);
@@ -2069,6 +2243,8 @@ pub const Engine = struct {
         };
         errdefer allocator.free(self.model_dir);
         self.has_tower = towerPresentIn(io, allocator, self.model_dir);
+        self.sample_sigmas = try parseSampleSigmas(io, allocator, model_dir);
+        errdefer if (self.sample_sigmas) |g| allocator.free(g);
         self.vae_cfg = try VaeConfig.parse(io, allocator, model_dir);
         errdefer self.vae_cfg.deinit(allocator);
 
@@ -2085,11 +2261,15 @@ pub const Engine = struct {
         self.vae = try VaeDecoder.load(io, allocator, self.s, model_dir, self.vae_cfg);
         errdefer self.vae.deinit();
         if (!staged) self.te = try TextEncoder.load(io, allocator, self.s, model_dir, COMPUTE);
+        errdefer if (self.te) |*t| t.deinit();
+        // Resident now, so a request's memory check reads them in live memory.
+        try mlx.evalFields(.{ self.dit, self.vae, self.te });
         logMemory("load");
 
-        log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, fused_rope={}, VAE {d}ch /{d}, text encoder {s})\n", .{
+        log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, fused_rope={}, VAE {d}ch /{d}, text encoder {s}, {d} steps{s})\n", .{
             self.dit_cfg.layers, self.dit_cfg.hidden(), @tagName(self.dit.dtype),                         self.dit.fused_rope,
             self.vae_cfg.z_dim,  VAE_DOWNSAMPLE,        if (staged) "staged per request" else "resident",
+            self.stepsFor(0),    if (self.sample_sigmas != null) " from sample_sigmas" else "",
         });
         return self;
     }
@@ -2101,8 +2281,13 @@ pub const Engine = struct {
         self.dit.deinit();
         self.tok.deinit();
         self.vae_cfg.deinit(self.allocator);
+        if (self.sample_sigmas) |g| self.allocator.free(g);
         self.allocator.free(self.model_dir);
         self.allocator.destroy(self);
+    }
+
+    pub fn stepsFor(self: *const Engine, steps: u32) u32 {
+        return resolveSteps(self.sample_sigmas, steps);
     }
 
     /// Prompt → conditioning [1, n, context] (evaluated; caller frees).
@@ -2179,7 +2364,7 @@ pub const Engine = struct {
     /// Returns the image [1,3,H,W] f32 in [0,1] (owned; caller frees).
     pub fn generateImage(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: GenOpts, progress: ?sse.Progress) !A {
         const s = self.s;
-        const n_steps = resolveSteps(steps);
+        const n_steps = self.stepsFor(steps);
         const lat_h: usize = height / VAE_DOWNSAMPLE;
         const lat_w: usize = width / VAE_DOWNSAMPLE;
         const n_img: c_int = @intCast(lat_h * lat_w);
@@ -2190,7 +2375,9 @@ pub const Engine = struct {
             if (cfgActive(opts)) "two forwards per step" else "one forward per step", if (opts.init_image != null) " img2img" else "",
         });
         if (progress) |p| p.emit("Encoding prompt", 0, n_steps);
+        var stage_t0 = std.Io.Timestamp.now(self.io, .awake);
         const cond = try self.encodeConditioning(allocator, prompt, opts);
+        const prompt_ms = stageMs(self.io, &stage_t0);
         defer free(cond.pos);
         defer if (cond.neg) |n| free(n);
         logMemory("prompt encode");
@@ -2200,7 +2387,7 @@ pub const Engine = struct {
         var neg_geo: ?Geometry = if (cond.neg) |n| try Geometry.init(allocator, self.dit_cfg, @intCast(mlx.getShape(n)[1]), lat_h, lat_w) else null;
         defer if (neg_geo) |*g| g.deinit();
 
-        const sigmas = try computeSigmas(allocator, n_steps, @intCast(n_img));
+        const sigmas = try scheduleSigmas(allocator, self.sample_sigmas, n_steps, @intCast(n_img));
         defer allocator.free(sigmas);
         const start: u32 = if (opts.init_image != null) @min(opts.start_step, n_steps - 1) else 0;
 
@@ -2255,6 +2442,7 @@ pub const Engine = struct {
             }
         }
 
+        const denoise_ms = stageMs(self.io, &stage_t0);
         logMemory("denoise");
         if (progress) |p| p.emit("Decoding image", run, run);
         const grid = try reshape(img, &[_]c_int{ 1, @intCast(lat_h), @intCast(lat_w), z }, s);
@@ -2264,6 +2452,7 @@ pub const Engine = struct {
         const decoded = if (opts.transparent) try self.vae.decodeRgba(latent) else try self.vae.decode(latent);
         defer free(decoded);
         try mlx.check(mlx.mlx_array_eval(decoded));
+        log.info("[qwen-image] stages: prompt {d} ms, denoise {d} ms ({d} steps), vae decode {d} ms\n", .{ prompt_ms, denoise_ms, run, stageMs(self.io, &stage_t0) });
         logMemory("vae decode");
         return denormImage(decoded, s);
     }
@@ -2309,7 +2498,7 @@ pub const Engine = struct {
         if (image_bytes.len == 0) return error.NoReferenceImages;
         const a = allocator;
         const s = self.s;
-        const n_steps = resolveSteps(steps);
+        const n_steps = self.stepsFor(steps);
         const lat_h: usize = out_h / VAE_DOWNSAMPLE;
         const lat_w: usize = out_w / VAE_DOWNSAMPLE;
         const target_tokens: usize = lat_h * lat_w;
@@ -2449,7 +2638,7 @@ pub const Engine = struct {
 
         // 5. The mu/shift input counts TARGET tokens only (the reference
         //    pipeline feeds the target latents' length, never the joint's).
-        const sigmas = try computeSigmas(a, n_steps, @intCast(target_tokens));
+        const sigmas = try scheduleSigmas(a, self.sample_sigmas, n_steps, @intCast(target_tokens));
         defer a.free(sigmas);
 
         // 6. Euler denoise: the packed stream is [refs (constant clean) |
@@ -2594,6 +2783,48 @@ test "QwenImage sigmas match the reference schedule" {
     try testing.expectEqualSlices(f32, &.{ 1.0, 0.0 }, one);
 }
 
+const TURBO_SIGMAS = [_]f32{ 1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568 };
+
+test "QwenImage a checkpoint's sample_sigmas grid sets the steps and the schedule" {
+    try testing.expectEqual(@as(u32, 8), resolveSteps(&TURBO_SIGMAS, 0));
+    try testing.expectEqual(@as(u32, 8), resolveSteps(&TURBO_SIGMAS, 40));
+    try testing.expectEqual(DEFAULT_STEPS, resolveSteps(null, 0));
+    try testing.expectEqual(@as(u32, 12), resolveSteps(null, 12));
+
+    const got = try scheduleSigmas(testing.allocator, &TURBO_SIGMAS, 8, 4096);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(f32, &TURBO_SIGMAS ++ [_]f32{0.0}, got);
+    const dynamic = try scheduleSigmas(testing.allocator, null, 8, 640);
+    defer testing.allocator.free(dynamic);
+    const want = try computeSigmas(testing.allocator, 8, 640);
+    defer testing.allocator.free(want);
+    try testing.expectEqualSlices(f32, want, dynamic);
+}
+
+test "QwenImage parseSampleSigmas reads model_index.json" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+
+    // No model_index.json, or one without the key: the dynamic schedule.
+    try testing.expectEqual(@as(?[]f32, null), try parseSampleSigmas(io, a, root));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_index.json", .data = "{\"_class_name\":\"QwenImage21Pipeline\"}" });
+    try testing.expectEqual(@as(?[]f32, null), try parseSampleSigmas(io, a, root));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_index.json", .data = "{\"_class_name\":\"QwenImage21Pipeline\",\"sample_sigmas\":[1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568]}" });
+    const grid = (try parseSampleSigmas(io, a, root)).?;
+    defer a.free(grid);
+    try testing.expectEqualSlices(f32, &TURBO_SIGMAS, grid);
+
+    for ([_][]const u8{ "{\"sample_sigmas\":[]}", "{\"sample_sigmas\":[1.0,\"x\"]}", "{\"sample_sigmas\":0.5}" }) |bad| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_index.json", .data = bad });
+        try testing.expectError(error.QwenImageBadConfig, parseSampleSigmas(io, a, root));
+    }
+}
+
 test "QwenImage convs strip only past the unfold budget" {
     const k3 = [_]c_int{ 144, 3, 3, 288 };
     try testing.expectEqual(@as(c_int, 1), stripCount(&.{ 1, 64, 64, 1152 }, &.{ 1152, 3, 3, 1152 }, 1));
@@ -2651,7 +2882,11 @@ test "QwenImage VAE convs load the same from OIHW and OHWI packs" {
             var conv = try Conv.load(&w, a, s, "c", .{});
             defer conv.deinit();
             try testing.expectEqualSlices(c_int, &ohwi, mlx.getShape(conv.w));
-            try testing.expectEqual(@as(f32, 0), try maxAbsDiff(conv.w, want, s));
+            const want_vae = try astype(want, vae_dt, s); // the VAE stores its weights in f16
+            defer free(want_vae);
+            const got = try astype(conv.w, .float32, s); // maxAbsDiff reads f32
+            defer free(got);
+            try testing.expectEqual(@as(f32, 0), try maxAbsDiff(got, want_vae, s));
         }
     }
 }
@@ -2927,7 +3162,7 @@ test "QwenImage prefix cache matches full forwards across timesteps and conditio
             // Both RoPE implementations must cast Q/K back to compute dtype.
             for ([_]bool{ false, true }) |fused| {
                 dit.fused_rope = fused;
-                const heads = try dit.headsOf(&dit.blocks[0].q, dit.blocks[0].norm_q, head_input, &geo);
+                const heads = try dit.headsOf(&dit.blocks[0].q, &dit.blocks[0].lora.q, dit.blocks[0].norm_q, head_input, &geo);
                 defer free(heads);
                 try testing.expectEqual(dtype, mlx.mlx_array_dtype(heads));
             }
@@ -3075,6 +3310,128 @@ test "QwenImage DiT parity (env-gated)" {
     defer free(out16);
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(out16));
     try testing.expect((try parity(out16, try f.get("dit_out"), s)).cos > 0.99);
+}
+
+/// One DiT forward on seeded noise (16 x 16 latent tokens + 64 text rows), as f32;
+/// `resident` receives the MLX bytes the loaded DiT holds.
+fn qwenProbe(io: std.Io, a: std.mem.Allocator, s: S, dir: []const u8, cfg: DitConfig, resident: *usize) !A {
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    var dit = try Dit.load(io, a, s, dir, cfg, .bfloat16);
+    defer dit.deinit();
+    const img = try w8a8.randn(&.{ 1, 256, @intCast(cfg.in_ch) }, 1, .bfloat16, s);
+    defer free(img);
+    const txt = try w8a8.randn(&.{ 1, 64, @intCast(cfg.context) }, 2, .bfloat16, s);
+    defer free(txt);
+    var geo = try Geometry.init(a, cfg, 64, 16, 16);
+    defer geo.deinit();
+    const out = try dit.forward(img, txt, 0.5, &geo);
+    defer free(out);
+    const f = try astype(out, .float32, s);
+    try mlx.check(mlx.mlx_array_eval(f));
+    // Weights are lazy until the first forward has read them.
+    w8a8.dropMemo(); // job-end state: the last activation is not weights
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    resident.* = after -| before;
+    return f;
+}
+
+// The lossy int8 route against the same pack's packed forward (no reference fixture
+// needed). QWEN_IMAGE_TEST_MODEL.
+test "QwenImage DiT: the w8a8 route stays within its bar of the packed forward" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cfg = try DitConfig.parse(io, a, dir);
+    const prev = w8a8.enabled;
+    defer w8a8.enabled = prev;
+    w8a8.enabled = false;
+    var packed_bytes: usize = 0;
+    const want = try qwenProbe(io, a, s, dir, cfg, &packed_bytes);
+    defer free(want);
+    w8a8.enabled = true;
+    var int8_bytes: usize = 0;
+    const got = try qwenProbe(io, a, s, dir, cfg, &int8_bytes);
+    defer free(got);
+    const g = try w8a8.agreement(got, want, s);
+    std.debug.print("[qwen-image dit w8a8] cos={d:.6} rms_ratio={d:.6} resident packed={d} int8={d}\n", .{ g.cos, g.rms_ratio, packed_bytes, int8_bytes });
+    try w8a8.expectBilled(packed_bytes, int8_bytes, try w8a8.billedDelta(io, dir, &.{ "transformer/diffusion_pytorch_model-00001-of-00002.safetensors", "transformer/diffusion_pytorch_model-00002-of-00002.safetensors" }));
+    try testing.expect(g.cos < 0.99999); // the route engaged: a packed-numerics output would be identical
+    try testing.expect(g.cos > 0.99);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), g.rms_ratio, 0.03);
+}
+
+test "QwenImage block: an adapter on the fused int8 gate/proj equals the same adapter on the separate projections" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const prev = w8a8.enabled;
+    defer w8a8.enabled = prev;
+    w8a8.enabled = true;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var dit = try TinyPrefixModel.init(.bfloat16, s); // only its stream and dtype are read
+    defer dit.deinit();
+    var blocks: [2]Block = undefined;
+    for (&blocks) |*b| {
+        b.* = .{
+            .q = undefined,
+            .k = undefined,
+            .v = undefined,
+            .o = undefined,
+            .norm_q = try TinyPrefixModel.tensor(&.{16}, 1.3, 1),
+            .norm_k = try TinyPrefixModel.tensor(&.{16}, 1.7, 1),
+            .proj = try TinyPrefixModel.linear(256, 512, 0.5, .bfloat16, s),
+            .gate = try TinyPrefixModel.linear(256, 512, 0.6, .bfloat16, s),
+            .out = undefined,
+        };
+        inline for (.{ &b.proj, &b.gate }) |l| try l.toW8a8(s);
+    }
+    defer for (&blocks) |*b| {
+        b.gate.deinit();
+        b.proj.deinit();
+        if (b.gp) |*q| q.deinit();
+        free(b.norm_q);
+        free(b.norm_k);
+    };
+    const fused = &blocks[0];
+    const apart = &blocks[1];
+    fused.gp = try w8a8.fuse(&.{ &fused.gate.w8, &fused.proj.w8 }, .interleave, s);
+    try testing.expect(fused.gp != null and fused.gate.w8 == null and apart.gp == null);
+
+    const x = try w8a8.randn(&.{ 1, 300, 256 }, 20, .bfloat16, s);
+    defer free(x);
+    const plain_f = try dit.swiglu(fused, x);
+    defer free(plain_f);
+    const plain_a = try dit.swiglu(apart, x);
+    defer free(plain_a);
+    const p0 = try w8a8.agreement(plain_f, plain_a, s);
+    std.debug.print("[qwen swiglu] plain fused vs apart cos={d:.6} rms={d:.6}\n", .{ p0.cos, p0.rms_ratio });
+    try testing.expect(p0.cos > 0.999);
+
+    var refs: [2]lora_mod.Ref = undefined;
+    for (&refs, 0..) |*r, i| {
+        r.* = .{ .at = try w8a8.randn(&.{ 256, 4 }, 30 + i, .bfloat16, s), .bt = try w8a8.randn(&.{ 4, 512 }, 40 + i, .bfloat16, s), .scale = 0.05 };
+    }
+    defer for (refs) |r| {
+        free(r.at);
+        free(r.bt);
+    };
+    for (&blocks) |*b| {
+        b.lora.gate.set(refs[0..1]);
+        b.lora.proj.set(refs[1..2]);
+    }
+    const lora_f = try dit.swiglu(fused, x);
+    defer free(lora_f);
+    const lora_a = try dit.swiglu(apart, x);
+    defer free(lora_a);
+    const p1 = try w8a8.agreement(lora_f, lora_a, s);
+    const p2 = try w8a8.agreement(lora_f, plain_f, s);
+    std.debug.print("[qwen swiglu] lora fused vs apart cos={d:.6}; lora vs plain cos={d:.6}\n", .{ p1.cos, p2.cos });
+    try testing.expect(p1.cos > 0.999);
+    try testing.expect(p2.cos < 0.999); // the adapter moved the output
 }
 
 test "QwenImage VAE parity (env-gated)" {
@@ -3391,6 +3748,19 @@ test "QwenImage edit segment walk: adjacent image blocks stay separate" {
 // Whole pipeline on a REAL converted pack (QWEN_IMAGE_E2E_MODEL), text encoder
 // staged. Asserts a finite, non-flat image; QWEN_IMAGE_E2E_OUT=<file.png> keeps
 // it for a look, QWEN_IMAGE_E2E_STEPS / _SIZE / _GUIDANCE override the run.
+test "QwenImage load leaves the DiT and VAE resident (env-gated)" {
+    const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_E2E_MODEL") orelse return error.SkipZigTest);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const engine = try Engine.load(io, testing.allocator, dir, true);
+    defer engine.deinit();
+    const last_stage = engine.vae.h.stages[engine.vae.h.stages.len - 1];
+    for ([_]A{ engine.dit.img_in.w, engine.dit.blocks[engine.dit.blocks.len - 1].out.w, last_stage.res[0].c1.w }) |w| {
+        var ready = false;
+        _ = mlx._mlx_array_is_available(&ready, w);
+        try testing.expect(ready);
+    }
+}
+
 test "QwenImage e2e on a real pack (env-gated)" {
     const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_E2E_MODEL") orelse return error.SkipZigTest);
     const a = testing.allocator;

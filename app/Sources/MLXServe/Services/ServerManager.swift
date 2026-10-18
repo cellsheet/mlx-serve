@@ -10,6 +10,14 @@ class ServerManager: ObservableObject {
     /// loop. UI uses this for the "Loaded Models" section and the model
     /// picker. First entry mirrors `modelInfo` (server sorts default first).
     @Published var allModels: [ModelInfo] = []
+    /// Each model mid-load, by path, whichever client asked for it, while the server process is up.
+    @Published private(set) var loadProgress: [String: LoadProgress] = [:]
+    private var loadsInFlight = 0
+    /// `/props` `registry_generation` as last read (`modelListMoved`).
+    private var seenRegistryGeneration: UInt64?
+    private var loadProgressPoll: Task<Void, Never>?
+    /// LAN peers running with --api-key that we hold no working key for.
+    @Published var lanPeersNeedingKey: [String] = []
     /// Chat target when the user picked a LAN model in the tray: the remote
     /// routing id (`<model>@<peer>`). nil = the local server's default model.
     /// Persisted so the choice survives relaunch; cleared by picking a local
@@ -35,6 +43,8 @@ class ServerManager: ObservableObject {
         if let lan = lanChatModelId, let info = allModels.first(where: { $0.name == lan }) { return info }
         return residentChatModel
     }
+    /// This server answers the chat (no provider, no LAN peer), so its generation defaults apply.
+    var chatIsLocal: Bool { chatModelInfo?.provider == nil && lanChatModelId == nil }
     /// The local entry that can ANSWER a chat request. Also the benchmark
     /// target: `modelInfo` is whatever loaded first (an image model counts),
     /// and a LAN entry would measure another Mac under this one's hardware row.
@@ -150,6 +160,12 @@ class ServerManager: ObservableObject {
         running && launchedModelPath.isEmpty && !chatResident && !selectedModelPath.isEmpty
     }
 
+    /// Whether `ensureDefaultChatModel` would load the selected model first.
+    func chatLoadNeeded(selectedModelPath: String) -> Bool {
+        Self.shouldEnsureChatDefault(running: status == .running, launchedModelPath: currentModelPath,
+                                     chatResident: residentChatModel != nil, selectedModelPath: selectedModelPath)
+    }
+
     /// Called by chat surfaces (chat window / quick launcher via
     /// ChatTurnEngine, the avatar) before a turn: when the running server was
     /// started headless for media generation, hot-load the user's selected
@@ -158,10 +174,7 @@ class ServerManager: ObservableObject {
     /// default, so the alias-addressed request that follows resolves).
     /// Failures are left to the request itself to surface.
     func ensureDefaultChatModel(selectedModelPath: String) async {
-        guard Self.shouldEnsureChatDefault(running: status == .running,
-                                           launchedModelPath: currentModelPath,
-                                           chatResident: residentChatModel != nil,
-                                           selectedModelPath: selectedModelPath) else { return }
+        guard chatLoadNeeded(selectedModelPath: selectedModelPath) else { return }
         if (try? await loadModel(id: selectedModelPath)) != nil {
             // Recorded here, not in `loadModel`: this hot-load passes no `setDefault`.
             StartupModelChoice.recordLoaded(path: selectedModelPath)
@@ -189,6 +202,12 @@ class ServerManager: ObservableObject {
     /// carries `--model`/`--model-dir`; this wires the env, stderr capture,
     /// termination handler, and health polling.
     private func launch(args: [String], options: ServerOptions) {
+        do { try GenerationDefaultsFile.migrate(options) }
+        catch {
+            lastError = "Could not save generation defaults: \(error.localizedDescription)"
+            status = .error(lastError)
+            return
+        }
         port = options.port
         api.host = options.host
         status = .starting
@@ -252,6 +271,7 @@ class ServerManager: ObservableObject {
             try proc.run()
             process = proc
             startHealthPolling()
+            startLoadProgressPolling()
         } catch {
             status = .error(error.localizedDescription)
             lastError = error.localizedDescription
@@ -278,6 +298,7 @@ class ServerManager: ObservableObject {
     func stop() {
         pollSource?.cancel()
         pollSource = nil
+        stopLoadProgressPolling()
         healthTask?.cancel()
         healthTask = nil
         healthTimer?.invalidate()
@@ -307,6 +328,7 @@ class ServerManager: ObservableObject {
         // model that was resident before the stop instead of the one just
         // picked, and Start looked like it might launch either one.
         allModels = []
+        lanPeersNeedingKey = []
         memoryInfo = nil
         specCost = nil
         batching = nil
@@ -373,6 +395,7 @@ class ServerManager: ObservableObject {
     private func handleTermination(exitCode: Int32) {
         pollSource?.cancel()
         pollSource = nil
+        stopLoadProgressPolling()
         healthTask?.cancel()
         healthTask = nil
         healthTimer?.invalidate()
@@ -618,6 +641,9 @@ class ServerManager: ObservableObject {
             memoryInfo = memory
             specCost = props.specCost
             batching = props.batching
+            let moved = Self.modelListMoved(seen: seenRegistryGeneration, reported: props.registryGeneration)
+            seenRegistryGeneration = props.registryGeneration ?? seenRegistryGeneration
+            if moved { await refreshModels() }
         }
         if let snap = try? await api.fetchThroughput(port: port) {
             if let prev = throughput {
@@ -626,19 +652,22 @@ class ServerManager: ObservableObject {
             }
             throughput = snap
         }
-        // Intentionally do NOT poll /v1/models here. The registry snapshot is
-        // already populated once on `transitionToRunning` and again after every
-        // explicit `loadModel(id:)` the app makes — those are the only events
-        // that can change the loaded/unloaded badges from within this app.
-        // Hot-load / eviction triggered by a different client (curl, another
-        // app) won't be reflected until the next user-initiated load or a
-        // restart; that's an acceptable trade for not hitting /v1/models
-        // every 3 s for the lifetime of the session.
+        // `/v1/models` reads every model's config, so it is re-read only when
+        // `registry_generation` says a load, unload or eviction (from any
+        // client) has changed it.
+    }
+
+    /// Whether the registry changed since the last `/props`: the first reading only records it
+    /// (opening the tray re-reads the list anyway).
+    nonisolated static func modelListMoved(seen: UInt64?, reported: UInt64?) -> Bool {
+        guard let seen, let reported else { return false }
+        return seen != reported
     }
 
     func refreshModels() async {
-        if let all = try? await api.fetchAllModels(port: port) {
+        if let (all, needsKey) = try? await api.fetchModelList(port: port) {
             allModels = all
+            lanPeersNeedingKey = needsKey
             // Headless servers sort no default first, so the head row can be an unloaded stub.
             modelInfo = all.first { $0.loaded && $0.lanPeer == nil }
         }
@@ -676,7 +705,13 @@ class ServerManager: ObservableObject {
     /// the refreshed list sorts the new model first (`modelInfo` follows) and
     /// aliased requests route to it — the parts a restart used to provide.
     func loadModel(id: String, setDefault: Bool = false) async throws -> ModelInfo {
+        watchLoads(1)
+        defer { watchLoads(-1) }
+        let started = Date()
         let info = try await api.loadModel(port: port, id: id, setDefault: setDefault)
+        if LoadProgress.notifiesReady(after: Date().timeIntervalSince(started), appActive: NSApp.isActive) {
+            TaskNotifier.shared.notifyModelReady(name: ModelDisplayName.pretty(info.name))
+        }
         // A switch moves what the process is serving without restarting it;
         // keep `currentModelPath` honest for the readers that gate on it
         // (TaskScheduler's pinned-model check, TestServer's status).
@@ -687,6 +722,42 @@ class ServerManager: ObservableObject {
         }
         await refreshModels()
         return info
+    }
+
+    /// A load this app asks for reads progress from its first moment, not the next slow poll.
+    private func watchLoads(_ delta: Int) {
+        loadsInFlight += delta
+        if delta > 0, loadsInFlight == 1, process != nil { startLoadProgressPolling() }
+    }
+
+    /// How often `/v1/load-progress` is read: often while anything loads, else a slow look for a
+    /// load another client starts. It reads no configs, so the slow look costs next to nothing.
+    nonisolated static func loadProgressInterval(loading: Bool) -> Duration {
+        loading ? .milliseconds(400) : .seconds(2)
+    }
+
+    /// From launch (the startup load answers too) until the process stops.
+    private func startLoadProgressPolling() {
+        loadProgressPoll?.cancel()
+        loadProgressPoll = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if let p = try? await self.api.loadProgress(port: self.port), !Task.isCancelled {
+                    let ended = !self.loadProgress.isEmpty && p.isEmpty
+                    self.loadProgress = p
+                    // Another client's load ended: the model list moved.
+                    if ended, self.loadsInFlight == 0, self.status == .running { await self.refreshModels() }
+                }
+                let loading = !self.loadProgress.isEmpty || self.loadsInFlight > 0
+                try? await Task.sleep(for: Self.loadProgressInterval(loading: loading))
+            }
+        }
+    }
+
+    private func stopLoadProgressPolling() {
+        loadProgressPoll?.cancel()
+        loadProgressPoll = nil
+        loadProgress = [:]
     }
 
     /// Free a model's resident GPU state (registry keeps the stub). Used by the

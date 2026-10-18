@@ -660,6 +660,20 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertTrue(supportedModelTypes.contains("laguna"))
     }
 
+    func testMiniCPMV47IsSupportedArchitecture() {
+        // MiniCPM-V 4.7 (model_type minicpmv4_7): a Qwen3.5 trunk behind a SigLIP2 tower.
+        let m = mlx(id: "mlx-community/MiniCPM-V-4.7-35B-A3B-4bit",
+                    tags: ["mlx", "safetensors", "minicpmv4_7", "image-text-to-text",
+                           "minicpm-v", "multimodal", "moe", "conversational", "4-bit"])
+        XCTAssertTrue(m.isSupportedArchitecture)
+        XCTAssertNil(m.incompatibleReason)
+        XCTAssertTrue(supportedModelTypes.contains("minicpmv4_7"))
+        // Only 4.7 is served; earlier MiniCPM-V generations are a different trunk.
+        let older = mlx(id: "mlx-community/MiniCPM-V-4.6-4bit",
+                        tags: ["mlx", "safetensors", "minicpmv4_6", "image-text-to-text"])
+        XCTAssertFalse(older.isSupportedArchitecture)
+    }
+
     func testMuseGlimmerIsSupportedArchitecture() {
         // meta-models Muse-Glimmer-30B (config.json model_type=muse_glimmer) is
         // served by the MLX engine — same class as hy_v3/laguna: the model_type
@@ -718,6 +732,15 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertNil(m.incompatibleReason)
     }
 
+    func testNemotronVariantTagsAreSupportedArchitectures() {
+        for type in ["nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni"] {
+            let model = mlx(id: "org/Nemotron-MLX-4bit",
+                            tags: ["mlx", "safetensors", type, "image-text-to-text"])
+            XCTAssertTrue(model.isSupportedArchitecture, "\(type) must be recognized in search")
+            XCTAssertNil(model.incompatibleReason)
+        }
+    }
+
     func testGlm5NextIsSupportedButOtherGlmIsNot() {
         // GLM-5.3-Flash packs carry model_type glm5_next (text config glm5_next_text).
         for type in ["glm5_next", "glm5_next_text"] {
@@ -725,7 +748,7 @@ final class HFModelQuantGateTests: XCTestCase {
             XCTAssertTrue(mlx(id: "TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP",
                               tags: ["mlx", "safetensors", type, "glm", "text-generation"]).isSupportedArchitecture)
         }
-        // GLM-5 (glm_moe_dsa) and GLM-4 MoE are other architectures we do not serve.
+        // GLM-5 (glm_moe_dsa) loads only from an mlx-stream pack, so the search does not offer it; GLM-4 MoE is not served.
         XCTAssertFalse(mlx(id: "mlx-community/GLM-5-4bit", tags: ["mlx", "safetensors", "glm_moe_dsa", "glm"]).isSupportedArchitecture)
         XCTAssertFalse(mlx(id: "mlx-community/GLM-4.6-4bit", tags: ["mlx", "safetensors", "glm4_moe", "glm"]).isSupportedArchitecture)
     }
@@ -750,7 +773,7 @@ final class HFModelQuantGateTests: XCTestCase {
                            "bonsai", "text-generation", "conversational"])
         XCTAssertTrue(m.isSupportedArchitecture)
         XCTAssertNil(m.incompatibleReason)
-        for type in supportedModelTypes {
+        for type in supportedModelTypes.subtracting(streamOnlyModelTypes) {
             XCTAssertTrue(mlx(id: "org/x", tags: ["mlx", type]).isSupportedArchitecture,
                           "a repo tagged with served model_type \"\(type)\" reads as unsupported")
         }

@@ -34,6 +34,8 @@ const mage_flow = @import("mage_flow.zig");
 /// Runtime LoRA adapters, shared with the image/LTX backends — ONE loader for
 /// every adapter format we accept, Turbo included.
 const lora_mod = @import("lora.zig");
+const w8a8 = @import("w8a8.zig");
+const int8_attn = @import("int8_attn.zig");
 const h3_glue = @import("h3_glue.zig");
 const add_norm = @import("add_norm.zig");
 const ane = @import("ane.zig");
@@ -77,9 +79,8 @@ pub const PATCH_W: u32 = 2;
 
 /// Snap UP to the model's 17k+5 grid. 40 -> 56, 200 -> 209, 363 -> 379.
 pub fn alignFrameCount(n: u32) u32 {
-    var v = n;
-    while (v % 17 != 5) v += 1;
-    return v;
+    // Saturates near the u32 limit, where no ladder rung exists; the transport cap refuses it.
+    return n +| (22 - n % 17) % 17;
 }
 
 /// Snap DOWN to the same ladder, with the model's 5-frame floor. A ref2va
@@ -103,7 +104,8 @@ pub const TemporalShape = struct { frame_count: u32, latent_t: u32, audio_t: u32
 
 /// Aligned frame count + its latent-frame and audio-latent counts.
 pub fn temporalShape(length: u32) TemporalShape {
-    const frame_count = alignFrameCount(@max(5, length));
+    // 2^24 frames is past what the transport cap admits at any canvas, and keeps audio_t in range.
+    const frame_count = alignFrameCount(std.math.clamp(length, 5, 1 << 24));
     const fc: f64 = @floatFromInt(frame_count);
     // audio_t = round(frame_count / 24 * 40) = round(frame_count * 5 / 3). The
     // reference uses Python's banker's rounding, but frame_count*5/3 can only
@@ -917,13 +919,22 @@ fn concat(arrs: []const mlx.mlx_array, axis: c_int, s: S) !mlx.mlx_array {
     try mlx.check(mlx.mlx_concatenate_axis(&o, vec, axis, s));
     return o;
 }
+/// Equal views along `axis`, taken with `mlx_slice`: MLX 0.32.3's split view records its element
+/// COUNT as its data size, so elementwise kernels pick 32-bit indexing and read out of bounds once
+/// `row * stride` passes 2^31 (fc1's [S, 28672] past S = 74,898: a NaN latent, a black clip).
 fn splitEqual(x: mlx.mlx_array, n: usize, axis: c_int, out: []mlx.mlx_array, s: S) !void {
-    var vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    try mlx.check(mlx.mlx_split(&vec, x, @intCast(n), axis, s));
+    const shp = mlx.getShape(x);
+    const ax: usize = @intCast(axis);
+    const part = @divExact(shp[ax], @as(c_int, @intCast(n)));
+    var start: [8]c_int = @splat(0);
+    var stop: [8]c_int = undefined;
+    var step: [8]c_int = @splat(1);
+    @memcpy(stop[0..shp.len], shp);
     for (0..n) |i| {
+        start[ax] = @as(c_int, @intCast(i)) * part;
+        stop[ax] = start[ax] + part;
         var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(&o, vec, i));
+        try mlx.check(mlx.mlx_slice(&o, x, &start, shp.len, &stop, shp.len, &step, shp.len, s));
         out[i] = o;
     }
 }
@@ -1046,43 +1057,13 @@ pub const Config = struct {
 
 // ── Weights ─────────────────────────────────────────────────────────────────
 
-/// The low-rank adapters attached to ONE linear, applied at RUN TIME:
-/// `y = base(x) + Σᵢ scaleᵢ·(x @ Aᵀᵢ) @ Bᵀᵢ`. Never folded into the base
-/// weight — the reference node is explicit that merging rounds the delta away
-/// in bf16 and requantizes it away on quantized bases, and both our packs are
-/// quantized.
-///
-/// Non-owning, exactly like flux/krea: the arrays belong to the `lora.Stack`
-/// the generation holds, which outlives the model. The Turbo LoRA is simply
-/// the first file in that stack — it IS a LoRA, so it gets no private path.
-const LoraSlot = struct {
-    refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
-    count: u8 = 0,
-
-    fn set(self: *LoraSlot, refs: []const lora_mod.Ref) void {
-        self.count = @intCast(refs.len);
-        @memcpy(self.refs[0..refs.len], refs);
-    }
-    fn active(self: *const LoraSlot) []const lora_mod.Ref {
-        return self.refs[0..self.count];
-    }
-};
-
-/// `y + Σ deltas` when anything is attached; `y` unchanged otherwise.
-/// Consumes `y` either way, so call sites stay one-line.
-fn loraAdd(y: mlx.mlx_array, x: mlx.mlx_array, slot: LoraSlot, s: S) !mlx.mlx_array {
-    if (slot.count == 0) return y;
-    defer _ = mlx.mlx_array_free(y);
-    return lora_mod.addTo(y, x, slot.active(), s);
-}
-
 const AttnW = struct {
     qkv: MfLinear,
     q_norm: mlx.mlx_array,
     k_norm: mlx.mlx_array,
     out: MfLinear,
-    qkv_lora: LoraSlot = .{},
-    out_lora: LoraSlot = .{},
+    qkv_lora: lora_mod.Slot = .{},
+    out_lora: lora_mod.Slot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, dt: mlx.mlx_dtype, s: S) !AttnW {
         const qkv_p = try std.fmt.allocPrint(a, "{s}.qkv_proj", .{prefix});
@@ -1096,6 +1077,10 @@ const AttnW = struct {
             .out = try MfLinear.load(w, a, out_p, cfg.innerDim(), dt, s),
         };
         errdefer r.deinit();
+        if (!ane.media_offload.video) { // the ANE seam reads the packed weights
+            try r.qkv.toW8a8(s);
+            try r.out.toW8a8(s);
+        }
         return r;
     }
     fn deinit(self: *AttnW) void {
@@ -1109,8 +1094,8 @@ const AttnW = struct {
 const MlpW = struct {
     fc1: MfLinear, // [2*ffn, hidden] — gate and up FUSED
     fc2: MfLinear,
-    fc1_lora: LoraSlot = .{},
-    fc2_lora: LoraSlot = .{},
+    fc1_lora: lora_mod.Slot = .{},
+    fc2_lora: lora_mod.Slot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, dt: mlx.mlx_dtype, s: S) !MlpW {
         const p1 = try std.fmt.allocPrint(a, "{s}.fc1", .{prefix});
@@ -1122,6 +1107,10 @@ const MlpW = struct {
             .fc2 = try MfLinear.load(w, a, p2, cfg.ffn_hidden_size, dt, s),
         };
         errdefer r.deinit();
+        if (!ane.media_offload.video) {
+            try r.fc1.toW8a8(s);
+            try r.fc2.toW8a8(s);
+        }
         return r;
     }
     fn deinit(self: *MlpW) void {
@@ -1281,7 +1270,7 @@ const AdalnW = struct {
     /// reference node re-injects on pruned bases — so hooking `forward` covers
     /// BOTH the precompute path and the per-step MINIMAX_H3_ADALN_PRECOMPUTE=0
     /// path, and the pair is freed with the weight after precompute.
-    lora: LoraSlot = .{},
+    lora: lora_mod.Slot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, expand: u32, modalities: u32, dt: mlx.mlx_dtype, s: S) !AdalnW {
         const p = try std.fmt.allocPrint(a, "{s}.linear", .{prefix});
@@ -1308,7 +1297,7 @@ const AdalnW = struct {
         const inp = if (apply_silu) try siluA(t_emb, s) else try contig(t_emb, s);
         defer _ = mlx.mlx_array_free(inp);
         const y_base = try self.linear.forward(inp, self.bias, s);
-        const y = try loraAdd(y_base, inp, self.lora, s);
+        const y = try lora_mod.addSlot(y_base, inp, &self.lora, s);
         defer _ = mlx.mlx_array_free(y);
         const m: c_int = @intCast(mlx.getShape(y)[0]);
         const rows = m * @as(c_int, @intCast(self.modalities));
@@ -1668,7 +1657,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     const hd: c_int = @intCast(cfg.attention_head_dim);
 
     const qkv_base = try aw.qkv.forward(x, null, s);
-    const qkv = try loraAdd(qkv_base, x, aw.qkv_lora, s);
+    const qkv = try lora_mod.addSlot(qkv_base, x, &aw.qkv_lora, s);
     defer _ = mlx.mlx_array_free(qkv);
     var t = try qkvHeadMajor(aw, qkv, cfg, rope, s);
     defer for (&t) |*p| {
@@ -1676,6 +1665,12 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     };
 
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.attention_head_dim)));
+    const dense = sparse == null or sparse.?.mode == .dense;
+    if (w8a8.enabled and dense and ablate == .none) if (try int8_attn.attention(t[0], t[1], t[2], scale, s)) |flat8| {
+        defer _ = mlx.mlx_array_free(flat8);
+        const out8 = try aw.out.forward(flat8, null, s);
+        return lora_mod.addSlot(out8, flat8, &aw.out_lora, s);
+    };
     var attn: mlx.mlx_array = undefined;
     if (ablate == .sdpa) {
         attn = try contig(t[2], s);
@@ -1706,7 +1701,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     const flat = try reshape(bc, &[_]c_int{ n, h * hd }, s);
     defer _ = mlx.mlx_array_free(flat);
     const out_base = try aw.out.forward(flat, null, s);
-    return loraAdd(out_base, flat, aw.out_lora, s);
+    return lora_mod.addSlot(out_base, flat, &aw.out_lora, s);
 }
 
 /// silu(gate) * up over the fused [S, 2*ffn] fc1 output.
@@ -1725,12 +1720,12 @@ fn swigluAct(y: mlx.mlx_array, s: S) !mlx.mlx_array {
 /// fc1 emits gate and up FUSED as [S, 2*ffn]; SwiGLU is silu(gate) * up.
 fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
     const y_base = try mw.fc1.forward(x, null, s);
-    const y = try loraAdd(y_base, x, mw.fc1_lora, s);
+    const y = try lora_mod.addSlot(y_base, x, &mw.fc1_lora, s);
     defer _ = mlx.mlx_array_free(y);
     const act = try swigluAct(y, s);
     defer _ = mlx.mlx_array_free(act);
     const o_base = try mw.fc2.forward(act, null, s);
-    return loraAdd(o_base, act, mw.fc2_lora, s);
+    return lora_mod.addSlot(o_base, act, &mw.fc2_lora, s);
 }
 
 // ── Modulation over packed segments ─────────────────────────────────────────
@@ -2270,7 +2265,7 @@ pub const Model = struct {
     ane_eng: ?*ane.AnePrefill = null,
     ane_rest: []AneRestMlp = &.{},
 
-    pub fn load(allocator: std.mem.Allocator, w: *const Weights, cfg: Config, dt: mlx.mlx_dtype, s: S) !Model {
+    pub fn load(allocator: std.mem.Allocator, w: *Weights, cfg: Config, dt: mlx.mlx_dtype, s: S) !Model {
         var m: Model = undefined;
         m.allocator = allocator;
         m.cfg = cfg;
@@ -2298,11 +2293,17 @@ pub const Model = struct {
         m.inv_freq = try ownWeightAs(w, allocator, "rope", ".inv_freq", f32t, s);
 
         m.refiner = try allocator.alloc(RefinerBlockW, cfg.token_refiner_num_layers);
-        for (m.refiner, 0..) |*b, i| b.* = try RefinerBlockW.load(w, allocator, @intCast(i), cfg, dt, s);
+        for (m.refiner, 0..) |*b, i| {
+            b.* = try RefinerBlockW.load(w, allocator, @intCast(i), cfg, dt, s);
+            if (w8a8.enabled) w.dropBlock("token_refiner.blocks.{d}.", i);
+        }
         m.refiner_final_norm = try ownWeightAs(w, allocator, "token_refiner.final_norm", ".weight", dt, s);
 
         m.blocks = try allocator.alloc(BlockW, cfg.num_layers);
-        for (m.blocks, 0..) |*b, i| b.* = try BlockW.load(w, allocator, @intCast(i), cfg, dt, s);
+        for (m.blocks, 0..) |*b, i| {
+            b.* = try BlockW.load(w, allocator, @intCast(i), cfg, dt, s);
+            if (w8a8.enabled) w.dropBlock("blocks.{d}.", i);
+        }
 
         m.final_norm = try ownWeightAs(w, allocator, "final_layer.norm", ".weight", dt, s);
         m.final_adaln = try AdalnW.load(w, allocator, "final_layer.adaln_proj", cfg, 2, 1, dt, s);
@@ -2448,7 +2449,7 @@ pub const Model = struct {
                 lp(v, w.fc1_lora);
                 lp(v, w.fc2_lora);
             }
-            fn lp(v: mlx.mlx_vector_array, slot: LoraSlot) void {
+            fn lp(v: mlx.mlx_vector_array, slot: lora_mod.Slot) void {
                 for (slot.active()) |r| {
                     arr(v, r.at);
                     arr(v, r.bt);
@@ -2487,9 +2488,7 @@ pub const Model = struct {
         try mlx.check(mlx.mlx_eval(vec));
     }
 
-    /// Every linear a LoRA may target, in ONE list, so attach and the
-    /// completeness check below cannot disagree about what "all of them" is.
-    /// The 259 modules the Turbo LoRA ships: 50 blocks x (qkv, out, fc1, fc2,
+    /// Every linear a LoRA may target: 50 blocks x (qkv, out, fc1, fc2,
     /// adaln) + 2 refiner blocks x (qkv, out, fc1, fc2) + the final adaln.
     pub const LORA_TARGETS: u32 = 259;
 
@@ -2498,9 +2497,9 @@ pub const Model = struct {
     /// model. Must run BEFORE `precomputeAdaln` — the adaln delta has to be
     /// in place while the tables are built, since the weights are freed after.
     /// Returns per-file attachment counts (index = position in the stack), so
-    /// the caller can hold a file to its own expectation: a Turbo file that
-    /// attaches to fewer than `LORA_TARGETS` modules is a broken artifact, not
-    /// a smaller speedup, while a style LoRA targeting a subset is ordinary.
+    /// the caller can hold a file to its own expectation: a Turbo file must
+    /// attach every module it ships (`turboAttachComplete`), while a style LoRA
+    /// targeting a subset is ordinary.
     pub fn attachLoras(self: *Model, stack: *const lora_mod.Stack) ![lora_mod.MAX_LORAS]u32 {
         var counts: [lora_mod.MAX_LORAS]u32 = @splat(0);
         var buf: [96]u8 = undefined;
@@ -2510,7 +2509,7 @@ pub const Model = struct {
         // point: a whole-stack total cannot tell "the style LoRA matched 40
         // modules" from "the Turbo file is missing 40 of its own".
         const bind = struct {
-            fn f(st: *const lora_mod.Stack, key: []const u8, slot: *LoraSlot, rb: *[lora_mod.MAX_LORAS]lora_mod.Ref, cnt: *[lora_mod.MAX_LORAS]u32) void {
+            fn f(st: *const lora_mod.Stack, key: []const u8, slot: *lora_mod.Slot, rb: *[lora_mod.MAX_LORAS]lora_mod.Ref, cnt: *[lora_mod.MAX_LORAS]u32) void {
                 var n: usize = 0;
                 for (st.files[0..st.count], st.scales[0..st.count], 0..) |*fl, user_scale, fi| {
                     const e = fl.find(key) orelse continue;
@@ -3554,9 +3553,9 @@ pub const GenRequest = struct {
     seed: u64 = 0,
     shift_video: f64 = SIGMA_SHIFT_VIDEO,
     shift_audio: f64 = SIGMA_SHIFT_AUDIO,
-    /// Fast recipe switch: null/true = ON (the default), false = full-quality
-    /// per-step compute (every forward, dense attention branch every step).
-    fast: ?bool = null,
+    /// The recipe `resolveSpeed` picked from the request's `fast`, `turbo` and the env; the
+    /// caller bills its attention cache before the run, so both read one answer.
+    speed: SpeedConfig = resolveSpeed(null, false, null, null),
     /// Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora): 4-8 step
     /// sampling instead of ~30. Requires `paths.turbo_lora`; forces the fast
     /// recipe OFF (its slow-drift premise is false at giant steps) and switches
@@ -3930,6 +3929,13 @@ fn wantedLoras(paths: GenPaths, req: GenRequest, out_paths: *[lora_mod.MAX_LORAS
     return n;
 }
 
+/// A Turbo file is whole when EVERY module it ships attaches: distillations train different
+/// subsets (Lightx2v's skips the AdaLN projections larryvrh's trains), while a module that finds
+/// no linear means a file for another layout.
+pub fn turboAttachComplete(attached: u32, shipped: usize) bool {
+    return attached == shipped;
+}
+
 /// Loads every wanted adapter into `stack` and binds it to `model`, holding each file to its own
 /// expectation: engagement is COUNTED and logged, because a rejected or half-matching adapter is
 /// otherwise a silent no-op that looks exactly like a working one.
@@ -3952,10 +3958,9 @@ fn bindLoras(allocator: std.mem.Allocator, stack: *lora_mod.Stack, model: *Model
             i + 1,          stack.count, n, Model.LORA_TARGETS, sc,
             if (is_turbo) " (turbo)" else "", std.fs.path.basename(p),
         });
-        // The Turbo file names every target; anything less is a broken artifact, not a smaller
-        // speedup. A style LoRA legitimately targets a subset, but matching NOTHING means the
-        // file is for another architecture and the user would wait an hour for an unchanged render.
-        if (is_turbo and n < Model.LORA_TARGETS) return error.TurboLoraIncomplete;
+        // A style LoRA legitimately targets a subset, but matching NOTHING means the file is for
+        // another architecture and the user would wait an hour for an unchanged render.
+        if (is_turbo and !turboAttachComplete(n, stack.files[i].entries.len)) return error.TurboLoraIncomplete;
         if (n == 0) return error.LoraNoMatch;
     }
 }
@@ -4415,8 +4420,8 @@ fn generateOne(
         // only on every k-th mid-schedule step and reuses the cached output
         // between — the branch is ~70% of a 768p step. Cache cost: one
         // [S, hidden] bf16 per block (~20 GB at 768p, ~1.4 GB at 256px).
-        const speed = resolveSpeed(req.fast, req.turbo, envStr("MINIMAX_H3_STEP_CACHE"), envStr("MINIMAX_H3_ATTN_BCAST"));
-        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (fast={any}, turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.fast, req.turbo });
+        const speed = req.speed;
+        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.turbo });
         const bcast_k: u32 = speed.bcast_k;
         var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len) else null;
         defer if (attn_bcast) |*ab| ab.deinit();
@@ -4660,7 +4665,7 @@ fn generateOne(
 /// Unique frames a chained clip delivers: each seam drops the duplicate frame
 /// (window N+1's frame 0 reproduces its conditioning keyframe).
 pub fn chainDeliveredFrames(windows: u32, window_frames: u32) u32 {
-    return windows * window_frames - (windows - 1);
+    return windows *| window_frames -| (windows - 1);
 }
 
 /// One video frame of audio — the cross-fade width at each seam.
@@ -5139,7 +5144,7 @@ test "minimax h3 live: generates a clip" {
 }
 
 /// libc getenv, matching generate.zig's allocator-free env idiom.
-fn envStr(name: [:0]const u8) ?[]const u8 {
+pub fn envStr(name: [:0]const u8) ?[]const u8 {
     const raw = std.c.getenv(name.ptr) orelse return null;
     const slice = std.mem.sliceTo(raw, 0);
     return if (slice.len == 0) null else slice;
@@ -6297,6 +6302,107 @@ fn sumAll(x: mlx.mlx_array, s: S) !f32 {
     return v;
 }
 
+test "minimax h3: splitEqual returns the n column blocks in order" {
+    const s = mlx.gpuStream();
+    var buf: [12]f32 = undefined;
+    for (&buf, 0..) |*v, i| v.* = @floatFromInt(i);
+    const x = mlx.mlx_array_new_data(&buf, &[_]c_int{ 2, 6 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(x);
+    var parts: [3]mlx.mlx_array = undefined;
+    try splitEqual(x, 3, 1, &parts, s);
+    defer for (parts) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    for (parts, 0..) |p, k| {
+        const c = try contig(p, s);
+        defer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_array_eval(c));
+        const got = (mlx.mlx_array_data_float32(c) orelse return error.NoData)[0..4];
+        const b: f32 = @floatFromInt(2 * k);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ b, b + 1, b + 6, b + 7 }, got);
+    }
+}
+
+test "minimax h3 live: the SwiGLU fallback reads every row of a [S, 28672] fc1 output past 2^31" {
+    // 6.5 GB of GPU memory. Rows from 74,898 on read out of bounds when the split view picks
+    // 32-bit indexing (a black clip).
+    _ = std.c.getenv("MINIMAX_H3_SPLIT_OVERFLOW") orelse return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const rows: c_int = 75_157;
+    const f: c_int = 14_336;
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_ones(&x, &[_]c_int{ rows, 2 * f }, 2, mlx.mlx_dtype.bfloat16, s));
+    var halves: [2]mlx.mlx_array = undefined;
+    try splitEqual(x, 2, 1, &halves, s);
+    defer for (halves) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    const act = try siluA(halves[1], s);
+    defer _ = mlx.mlx_array_free(act);
+    const tail = try sliceRows(act, 74_898, rows, s);
+    defer _ = mlx.mlx_array_free(tail);
+    var ones = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones);
+    try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ rows - 74_898, f }, 2, mlx.mlx_dtype.bfloat16, s));
+    const want = try siluA(ones, s);
+    defer _ = mlx.mlx_array_free(want);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, tail, want, false, s));
+    try mlx.check(mlx.mlx_array_eval(eq));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try std.testing.expect(same);
+}
+
+test "minimax h3: DiT block linears under w8a8 stay within their bar of the packed block" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    // The same toy fixture as below; its qkv and fc1 take the route (K = 256), out and fc2 do not.
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    var w = model_mod.loadWeightsSingleFile(a, "src/fixtures/minimax_h3_dit.safetensors") catch return error.SkipZigTest;
+    defer w.deinit();
+    const cfg = Config{ .hidden_size = 256, .num_attention_heads = 4, .attention_head_dim = 32, .ffn_hidden_size = 128, .time_embed_dim = 32, .timestep_input_dim = 32, .rope_inv_freq_len = 4 };
+    const x = try ownWeight(&w, "x.attn_in");
+    defer _ = mlx.mlx_array_free(x);
+    const seq: c_int = @intCast(mlx.getShape(x)[0]);
+    const rc = try ownWeight(&w, "x.rope_cos");
+    defer _ = mlx.mlx_array_free(rc);
+    const rs = try ownWeight(&w, "x.rope_sin");
+    defer _ = mlx.mlx_array_free(rs);
+    const half: c_int = @intCast(cfg.rotDim() / 2);
+    var rope = RopeTables{ .cos = try reshape(rc, &[_]c_int{ 1, seq, 1, half }, s), .sin = try reshape(rs, &[_]c_int{ 1, seq, 1, half }, s) };
+    defer rope.deinit();
+
+    const prev = w8a8.enabled;
+    defer w8a8.enabled = prev;
+    var outs: [2][2]mlx.mlx_array = undefined; // [arm][attn, mlp]
+    for (&outs, [_]bool{ false, true }) |*o, on| {
+        w8a8.enabled = on;
+        var attn = try AttnW.load(&w, a, "attn", cfg, .bfloat16, s);
+        defer attn.deinit();
+        var mlp_w = try MlpW.load(&w, a, "mlp", cfg, .bfloat16, s);
+        defer mlp_w.deinit();
+        try testing.expectEqual(on, attn.qkv.w8 != null and mlp_w.fc1.w8 != null);
+        try testing.expect(attn.out.w8 == null and mlp_w.fc2.w8 == null);
+        o[0] = try attnForward(&attn, x, cfg, rope, .none, null, s);
+        o[1] = try mlpForward(&mlp_w, x, s);
+        try mlx.check(mlx.mlx_array_eval(o[0]));
+        try mlx.check(mlx.mlx_array_eval(o[1]));
+    }
+    defer for (outs) |o| for (o) |t| {
+        _ = mlx.mlx_array_free(t);
+    };
+    inline for (.{ "attn", "mlp" }, 0..) |name, i| {
+        const g = try w8a8.agreement(outs[1][i], outs[0][i], s);
+        std.debug.print("[h3 {s} w8a8] cos={d:.6} rms_ratio={d:.6}\n", .{ name, g.cos, g.rms_ratio });
+        try testing.expect(g.cos < 0.99999); // the route engaged
+        try testing.expect(g.cos > 0.998);
+        try testing.expectApproxEqAbs(@as(f64, 1.0), g.rms_ratio, 0.02);
+    }
+}
+
 test "minimax h3: DiT block matches the reference transcription" {
     // Hermetic: a 1.8 MB toy-geometry fixture with synthetic weights, from
     // tests/dump_minimax_h3_fixtures.py. See that file's header for exactly
@@ -6893,6 +6999,12 @@ test "minimax h3: resolveSpeed — turbo forces the recipe off, env still strong
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
 }
 
+test "minimax h3: a Turbo file is held to the modules it ships, not to one exporter's list" {
+    try testing.expect(turboAttachComplete(Model.LORA_TARGETS, Model.LORA_TARGETS));
+    try testing.expect(turboAttachComplete(208, 208)); // Lightx2v: no AdaLN projections
+    try testing.expect(!turboAttachComplete(200, 208)); // ships modules this DiT does not have
+}
+
 test "minimax h3: audioStepFactor — exact mapped delta under turbo, first-order otherwise" {
     const sv = SIGMA_SHIFT_VIDEO; // 12
     const sa = SIGMA_SHIFT_AUDIO; // 3
@@ -6916,6 +7028,15 @@ test "minimax h3: audioStepFactor — exact mapped delta under turbo, first-orde
     const fine_exact = audioStepFactor(true, 0.5, 0.49, sv, sa);
     const fine_first = audioStepFactor(false, 0.5, 0.49, sv, sa);
     try testing.expect(@abs(fine_exact - fine_first) < @abs(fine_first) * 0.02);
+}
+
+test "minimax h3: a frame count near the u32 limit reaches the transport cap instead of overflowing" {
+    const max = std.math.maxInt(u32);
+    try testing.expectEqual(@as(u32, 22), alignFrameCount(18));
+    try testing.expectEqual(@as(u32, 22), alignFrameCount(22));
+    try testing.expectEqual(@as(u32, max), alignFrameCount(max - 3));
+    try testing.expect(chainDeliveredFrames(6, max) > 1 << 24);
+    try testing.expect(temporalShape(max).frame_count >= 1 << 24);
 }
 
 test "minimax h3: chain math — delivered frames, overlap width, cross-fade seam" {
@@ -6956,7 +7077,7 @@ test "minimax h3: chain math — delivered frames, overlap width, cross-fade sea
     try testing.expectEqualSlices(f32, &s1, j3);
 }
 
-test "minimax h3: loraAdd sums every attached adapter onto the base output" {
+test "minimax h3: addSlot sums every attached adapter onto the base output" {
     const s = mlx.gpuStream();
     const f32t = mlx.mlx_dtype.float32;
 
@@ -6979,7 +7100,7 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
 
     // Turbo at 1.0 plus a style adapter at 0.5 — the stacking case, on the
     // same linear. expected[m][o] = 1.5 * Σ_r (Σ_i X[m][i]·AT[i][r])·BT[r][o].
-    var slot: LoraSlot = .{};
+    var slot: lora_mod.Slot = .{};
     slot.set(&[_]lora_mod.Ref{
         .{ .at = at, .bt = bt, .scale = 1.0 },
         .{ .at = at, .bt = bt, .scale = 0.5 },
@@ -6988,7 +7109,7 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
     const zbuf = [_]f32{ 0, 0, 0, 0, 0, 0, 0, 0 }; // zero base: the deltas alone come back
     const shZ = [_]c_int{ 2, 4 };
     const zero = mlx.mlx_array_new_data(@ptrCast(@constCast(&zbuf)), &shZ, 2, f32t);
-    const got = try loraAdd(zero, x, slot, s); // consumes `zero`
+    const got = try lora_mod.addSlot(zero, x, &slot, s); // consumes `zero`
     defer _ = mlx.mlx_array_free(got);
     try mlx.check(mlx.mlx_array_eval(got));
     const raw = mlx.mlx_array_data_float32(got) orelse return error.NoData;
@@ -7005,10 +7126,10 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
 
     // An empty slot is the identity — and returns the SAME handle, since the
     // no-adapter path must cost nothing on a 50-block DiT.
-    const empty: LoraSlot = .{};
+    const empty: lora_mod.Slot = .{};
     const base2 = mlx.mlx_array_new_data(@ptrCast(@constCast(&zbuf)), &shZ, 2, f32t);
     defer _ = mlx.mlx_array_free(base2);
-    const same = try loraAdd(base2, x, empty, s);
+    const same = try lora_mod.addSlot(base2, x, &empty, s);
     try testing.expectEqual(base2.ctx, same.ctx);
 }
 

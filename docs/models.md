@@ -8,10 +8,13 @@
 | **Gemma 3** | `gemma3` | `gemma-3-12b-it-qat-4bit` | Gemma turns | -- |
 | **DiffusionGemma** | `diffusion_gemma` | `diffusiongemma-26B-A4B-it-4bit` | Gemma turns (block diffusion) | -- |
 | **Qwen 2 / 3 / 3.5 / 3.6 / 3.8** | `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.6-27B`, `Qwen3.6-35B-A3B`, [`Qwen3.8-27B`](https://huggingface.co/ddalcu/Qwen3.8-27B-MLX-Serve-4bit) (18.2 GB, draft head baked in, effort levels `xhigh`/`medium`/`low`) | ChatML | Qwen3-VL |
-| **MiMo V2.6 Flash** | `mimo_v2`, `mimo_v2_flash` | Xiaomi MiMo-V2.6-Flash (309B-A15B): `mlx-community/MiMo-V2.6-Flash-RL-mxfp4-q8` and the other mlx-lm-layout packs, or the MOPD release via `tests/convert_mimo_v2.py` (158 GB: the release's MXFP4 experts unchanged, 8-bit trunk) | ChatML + XML tool calls, thinking default on | -- |
+| **MiMo V2.6 Flash** | `mimo_v2`, `mimo_v2_flash` | Xiaomi MiMo-V2.6-Flash (309B-A15B): `mlx-community/MiMo-V2.6-Flash-RL-mxfp4-q8` and the other mlx-lm-layout packs, or the MOPD release via `tests/convert_mimo_v2.py` (158 GB: the release's MXFP4 experts unchanged, 8-bit trunk). The MOPD release prepared for mlx-stream (residents + `experts.bin`, its config declares `expert_streaming`) streams its experts from SSD on a 128 GB Mac | ChatML + XML tool calls, thinking default on | -- |
+| **MiniCPM-V 4.7** | `minicpmv4_7` | OpenBMB MiniCPM-V 4.7 35B-A3B (Qwen3.6 trunk, SigLIP2 tower): convert the HF checkpoint with `tests/convert_minicpmv4_7.py`, or use a community pack in the same mlx-vlm layout | ChatML, XML tool calls | SigLIP2, big images sliced into crops |
 | **Muse-Glimmer** | `muse_glimmer` | Meta's Muse-Glimmer-30B ([4-bit](https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit) / [8-bit](https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit), DFlash draft companion built in, up to 75 tok/s on M4 Max) | Harmony channels + ATEM tools | Muse ViT (images) |
 | **Ling 3.0** | `bailing_hybrid` | inclusionAI Ling 3.0, e.g. `rapid-mlx/Ling-3.0-tiny-MLX-4bit` (4.2 GB, KDA + MLA hybrid MoE) | GLM tags, thinking default on | -- |
 | **DeepSeek V4 Flash** | `deepseek_v4` | DeepSeek-V4-Flash-0731 (284B-A13B, 1M ctx) — **native MLX** for safetensors builds, embedded [ds4](https://github.com/antirez/ds4) for `.gguf` | DSV4 + DSML tools | -- |
+| **DeepSeek V4.1 Flash** | `deepseek_v41` | DeepSeek-V4.1-Flash: the MLX packs (pipenetwork's REAP50, Jundot's oQ) and the OpensourceWTF EXL3 streaming repack on mlx-stream (experts stream from SSD; a 128 GB Mac serves it). Engram tables stay on disk | V4.1 DSML tools, thinking default on, effort low/medium/high/max | -- |
+| **GLM-5.3** | `glm_moe_dsa` | Z.ai GLM-5.3 (744B MoE) as an mlx-stream pack: the trunk beside an `experts.bin` bank from mlx-stream's converter. The experts stream from SSD. A 256 GB Mac serves it: set the GPU ceiling to 240 GiB (`sudo sysctl iogpu.wired_limit_mb=245760`) and start the server with `--wired-margin-gib 2`. One request at a time, no draft lane | GLM tags, thinking default on, effort low/high/max | -- |
 | **Inkling Small** | `inkling_mm_model` | Thinking Machines Inkling Small (276B-A12B MoE, 2-bit) | role-less channel messages | -- |
 | **Hunyuan 3** | `hy_v3` | `Hy3-295B-Instruct` (295B-A21B MoE, 2-bit) | Hunyuan tags | -- |
 | **Laguna** | `laguna` | poolside Laguna S 2.1 / XS (117.6B-A8.5B MoE coder, nvfp4) | GLM tags, pre-opened think | -- |
@@ -22,7 +25,7 @@
 | **Mistral** | `mistral` | Mistral 7B Instruct v0.3 | Mistral turns | -- |
 | **Laya** (typed decisions) | `laya` | `aac6fef/laya-multilingual-mlx` (mmBERT-base encoder + decision head; `POST /v1/decisions`) | n/a | -- |
 | **Kev** (typed decisions) | `kev` | `aselea/Kev-4B-MLX-Serve-8bit` (Qwen3.5-4B + pointer head; `POST /v1/decisions`; packs from `tests/convert_kev_weights.py`) | n/a | -- |
-| **Embeddings** | `bert`, `gemma3_text`, `qwen3` | bge, mxbai, EmbeddingGemma, Qwen3-Embedding (pooling read from the checkpoint) | n/a | -- |
+| **Embeddings** | `bert`, `gemma3_text`, `embedding_gemma2`, `qwen3` | bge, mxbai, EmbeddingGemma 1 and 2 (2: 768 dims, `dimensions` down to 128, 8192 tokens, text, image and video), Qwen3-Embedding (pooling read from the checkpoint) | n/a | EmbeddingGemma 2: SigLIP (images, video) |
 | **Anything else as GGUF** | via embedded llama.cpp | any `.gguf` on HuggingFace | per-template | -- |
 
 Media models live in the same registry and are classified the same way: FLUX.2, Krea-2, Mage-Flow and Qwen-Image-2.1 (image), Qwen3-TTS, Kokoro, ACE-Step and MiniMax Music 3 (speech + music), LTX-Video 2.3 / 2.5 and MiniMax-H3 (video), Hunyuan3D-2.1 (3D). A chat request naming one of them gets a 400 that names the endpoint to use instead.

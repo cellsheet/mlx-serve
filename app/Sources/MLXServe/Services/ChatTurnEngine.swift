@@ -179,8 +179,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         steering.append(text, for: sessionId)
     }
 
-    func clearSteeringNote(for sessionId: UUID) {
-        steering.clear(for: sessionId)
+    func pauseSteeringNote(for sessionId: UUID) {
+        steering.pause(for: sessionId)
+    }
+
+    func restoreSteeringNote(for sessionId: UUID, into draft: String,
+                             hasMarkedText: Bool) -> String? {
+        steering.restore(for: sessionId, into: draft, hasMarkedText: hasMarkedText)
     }
 
     /// Only the turn that still owns the slot hands its note on; a stopped or
@@ -257,9 +262,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// defense in depth for any future removal path.
     func stopIfOrphaned() {
         let existing = Set(appState.chatSessions.map(\.id))
+        steering.retain(only: existing)
         for sid in ledger.orphaned(existingSessions: existing) {
             stop(sessionId: sid)
-            steering.clear(for: sid)
             activity.markSeen(sid)
         }
     }
@@ -360,19 +365,32 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             thinking ? reasoningEffort.rawValue : nil
         }
 
-        /// The per-request defaults for this turn: the user's saved sampling
-        /// with the agent's overrides laid on top. An override REPLACES the
-        /// saved value — including with the canonical "off" (top_k 0, repeat
-        /// 1.0, presence 0.0, budget -1), which clears the global rather than
-        /// leaving it standing, mapped to an omitted field exactly as
-        /// `RequestDefaults.from` maps it.
-        func requestDefaults(from opts: ServerOptions) -> APIClient.RequestDefaults {
-            var d = APIClient.RequestDefaults.from(opts)
+        func thinkingForRequest(_ options: ServerOptions, inheritGeneration: Bool) -> Bool {
+            enableThinking || (!inheritGeneration && options.defaultEnableThinking)
+        }
+
+        /// Local servers resolve inherited generation defaults; explicit agent
+        /// values, including neutral values, stay in the request. Remote clients
+        /// retain their saved sampling behavior.
+        func requestDefaults(from opts: ServerOptions, inheritGeneration: Bool = false) -> APIClient.RequestDefaults {
+            var d = inheritGeneration ? APIClient.RequestDefaults() : APIClient.RequestDefaults.from(opts)
+            d.inheritGeneration = inheritGeneration
+            d.temperatureOverride = temperature
+            d.maxTokensOverride = maxTokens
+            if inheritGeneration {
+                d.enablePLD = opts.perRequestEnablePLD.asOptionalBool
+                d.enableDrafter = opts.perRequestEnableDrafter.asOptionalBool
+                d.topK = topK
+                d.repeatPenalty = repeatPenalty
+                d.presencePenalty = presencePenalty
+                d.reasoningBudget = reasoningBudget
+            } else {
+                if let v = topK { d.topK = v > 0 ? v : nil }
+                if let v = repeatPenalty { d.repeatPenalty = v != 1.0 ? v : nil }
+                if let v = presencePenalty { d.presencePenalty = v != 0.0 ? v : nil }
+                if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
+            }
             if let v = topP { d.topP = v }
-            if let v = topK { d.topK = v > 0 ? v : nil }
-            if let v = repeatPenalty { d.repeatPenalty = v != 1.0 ? v : nil }
-            if let v = presencePenalty { d.presencePenalty = v != 0.0 ? v : nil }
-            if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
             return d
         }
 
@@ -736,7 +754,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                      token: UUID, continuing: Bool = false) async {
         var failed = false
         do {
-            let thinking = config.enableThinking || appState.serverOptions.defaultEnableThinking
+            let thinking = config.thinkingForRequest(appState.serverOptions,
+                                                      inheritGeneration: server.chatIsLocal)
             let stream: AsyncThrowingStream<SSEEvent, Error>
             if appState.useAppleModel {
                 // Apple's on-device model needs no server and no load.
@@ -756,7 +775,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 temperature: turnTemperature(config, default: appState.serverOptions.defaultTemperature),
                 enableThinking: thinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: thinking),
-                defaults: config.requestDefaults(from: appState.serverOptions),
+                defaults: config.requestDefaults(from: appState.serverOptions,
+                                                  inheritGeneration: server.chatIsLocal),
                 modelId: requestModelId(config),
                 continueFinalMessage: continuing
             )
@@ -793,6 +813,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     break
                 }
             }
+            try Task.checkCancellation()   // a cancelled stream ends rather than throws
             applyStreamBatch(coalescer.drain(), to: sessionId)   // flush the trailing batch
         } catch is CancellationError {
             // Stopped by user (`stop(sessionId:)`) or superseded by a new
@@ -851,6 +872,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // same dir the agent's built-in tools use. Per-entry `cwd` in mcp.json still wins.
                 self.mcpManager.defaultCwd = config.workingDirectory
                 await self.mcpManager.startEnabled()
+                // Stopped while servers started: end the turn without a word.
+                if Task.isCancelled { self.endTurn(sessionId: sessionId, token: token); return }
                 // Surface startup failures inline in chat — otherwise they're hidden behind the
                 // marketplace gear icon and the user just sees "MCP doesn't seem to do anything".
                 if !self.mcpManager.startErrors.isEmpty {
@@ -1088,7 +1111,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 enableThinking: config.enableThinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: config.enableThinking),
                 toolsJSON: combinedToolsJSON,
-                defaults: config.requestDefaults(from: appState.serverOptions),
+                defaults: config.requestDefaults(from: appState.serverOptions,
+                                                  inheritGeneration: server.chatIsLocal),
                 modelId: requestModelId(config)
             )
             }
@@ -1128,6 +1152,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                         break
                     }
                 }
+                // A cancelled stream ENDS rather than throws, so Stop is checked
+                // here and after every wait below, before anything is written.
+                try Task.checkCancellation()
                 // Flush the trailing batch so the message content is complete
                 // before the post-stream truncation/pad checks read it back.
                 self.applyStreamBatch(coalescer.drain(), to: sessionId)
@@ -1146,6 +1173,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             } catch is CancellationError {
                 throw CancellationError()
             }
+            try Task.checkCancellation()
             appState.updateLastMessage(in: sessionId, streaming: false)
 
             // A repetition-loop cut ENDS the turn, ahead of every recovery path
@@ -1328,6 +1356,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // one decision, made when the agent was configured, instead of a
                 // dialog per call.
                 let approved = config.autoApprove ? true : await approval(tc)
+                try Task.checkCancellation()
                 guard approved else {
                     let denied = AgentEngine.ToolResult(
                         id: tc.id,
@@ -1373,6 +1402,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     // Re-read: Tools can go off while this round streamed.
                     allowedTools: config.revokingTools(ledger.toolsRevoked(session: sessionId)).dispatchTools
                 )
+                try Task.checkCancellation()
                 roundOutputs.append(result.output)
                 if let handle = result.backgroundHandle { roundHandles.append(handle) }
 

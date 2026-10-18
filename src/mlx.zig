@@ -3,6 +3,8 @@
 // potential issues with C++ headers and keep the dependency surface explicit.
 
 const std = @import("std");
+const crt = @import("crt.zig");
+const os_mutex = @import("os_mutex.zig");
 const builtin = @import("builtin");
 const log = @import("log.zig");
 
@@ -89,15 +91,123 @@ pub extern "c" fn mlx_default_gpu_stream_new() mlx_stream;
 pub extern "c" fn mlx_stream_get_device(dev: *mlx_device, stream: mlx_stream) c_int;
 pub extern "c" fn mlx_device_get_type(dtype: *mlx_device_type, dev: mlx_device) c_int;
 
-/// True when the stream targets the GPU (custom Metal kernels require it).
+/// True when the stream targets a GPU that runs custom Metal kernels: every
+/// `metal_kernel` helper gates on this, so on CUDA they all take the MLX-op path.
 pub fn streamIsGpu(s: mlx_stream) bool {
     var dev = mlx_device{ .ctx = null };
     if (mlx_stream_get_device(&dev, s) != 0) return false;
     defer _ = mlx_device_free(dev);
     var dt: mlx_device_type = .cpu;
     if (mlx_device_get_type(&dt, dev) != 0) return false;
-    return dt == .gpu;
+    return dt == .gpu and metalKernelsAvailable();
 }
+
+/// MLX's CUDA JIT looks for the toolkit headers under CUDA_HOME/CUDA_PATH, else only
+/// /usr/local/cuda; Arch installs to /opt/cuda. The root to export as CUDA_HOME, if any.
+pub fn cudaHomeDefault(env_set: bool, usr_local_has_headers: bool, opt_has_headers: bool) ?[:0]const u8 {
+    if (env_set or usr_local_has_headers or !opt_has_headers) return null;
+    return "/opt/cuda";
+}
+
+/// `PATH` with the toolkit's DLL folders (CUDA 13 keeps them in bin\x64) first; null when it
+/// would not fit `buf`.
+pub fn cudaDllSearchPath(buf: []u8, cuda_path: []const u8, path: []const u8) ?[:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}\\bin\\x64;{s}\\bin;{s}", .{ cuda_path, cuda_path, path }, 0) catch null;
+}
+
+/// Windows: the installed toolkit's DLLs (CUDA_PATH) go first on PATH before any CUDA DLL loads, so
+/// llama.cpp's ggml-cuda binds the cuBLAS MLX uses: two copies in one process leave one engine on CPU.
+fn exportCudaDllPath() void {
+    const cuda = std.c.getenv("CUDA_PATH") orelse return;
+    if (cuda[0] == 0) return; // an empty value would put the drive root's \bin first on PATH
+    const path = std.c.getenv("PATH") orelse "";
+    const buf = std.heap.page_allocator.alloc(u8, 64 * 1024) catch return;
+    defer std.heap.page_allocator.free(buf);
+    if (cudaDllSearchPath(buf, std.mem.span(cuda), std.mem.span(path))) |p| crt.setEnv("PATH", p.ptr);
+}
+
+/// Export CUDA_HOME before MLX compiles its first kernel (see cudaHomeDefault); on Windows the
+/// toolkit's DLL search path instead.
+pub fn exportCudaHome() void {
+    if (comptime builtin.os.tag == .windows) return exportCudaDllPath();
+    if (comptime builtin.os.tag != .linux) return;
+    const env_set = std.c.getenv("CUDA_HOME") != null or std.c.getenv("CUDA_PATH") != null;
+    const has = struct {
+        fn headers(comptime root: []const u8) bool {
+            return std.c.access(root ++ "/include/cuda.h", 0) == 0;
+        }
+    };
+    if (cudaHomeDefault(env_set, has.headers("/usr/local/cuda"), has.headers("/opt/cuda"))) |home| crt.setEnv("CUDA_HOME", home);
+}
+
+var cuda_cache: ?bool = null;
+
+/// The stream weight files load on. A CPU-stream load allocates host memory: on native Linux
+/// that is CUDA managed memory and migrates to the GPU, but where NVIDIA's unified memory is
+/// "limited" (Windows, WSL) it is pinned host memory that every kernel reads over PCIe, so
+/// there CUDA loads on the GPU stream. Metal has no GPU `Load`.
+pub fn weightLoadStream() mlx_stream {
+    return if (weightsInDeviceMemory()) mlx_default_gpu_stream_new() else mlx_default_cpu_stream_new();
+}
+
+/// Whether loaded weights live in device memory (see `weightLoadStream`).
+pub fn weightsInDeviceMemory() bool {
+    if (limited_unified_memory == null) limited_unified_memory = limitedUnifiedMemory();
+    return weightLoadOnGpu(cudaAvailable(), limited_unified_memory.?);
+}
+
+pub fn weightLoadOnGpu(cuda: bool, limited_um: bool) bool {
+    return cuda and limited_um;
+}
+
+var limited_unified_memory: ?bool = null;
+
+fn limitedUnifiedMemory() bool {
+    if (comptime builtin.os.tag == .windows) return true;
+    if (comptime builtin.os.tag != .linux) return false;
+    var buf: [256]u8 = undefined;
+    const fd = crt.openRead("/proc/sys/kernel/osrelease");
+    if (fd < 0) return false;
+    defer crt.close(fd);
+    const n = crt.read(fd, &buf);
+    return n > 0 and kernelReleaseIsWsl(buf[0..@intCast(n)]);
+}
+
+/// WSL kernels name themselves in their release string ("…-microsoft-standard-WSL2").
+pub fn kernelReleaseIsWsl(release: []const u8) bool {
+    return std.ascii.findIgnoreCase(release, "microsoft") != null;
+}
+
+/// MLX runs on its CUDA backend (NVIDIA): `mlx_fast_cuda_kernel` instead of Metal.
+pub fn cudaAvailable() bool {
+    if (cuda_cache == null) {
+        var cuda = false;
+        if (comptime !builtin.os.tag.isDarwin()) _ = mlx_cuda_is_available(&cuda);
+        cuda_cache = cuda;
+    }
+    return cuda_cache.?;
+}
+
+/// Only Metal runs `mlx_fast_metal_kernel`; CUDA and Vulkan run MLX ops only.
+/// mlx-omarchy's Vulkan backend translates a subset of MSL and refuses the
+/// rest at EVAL, which fails the request instead of declining the kernel.
+pub fn metalKernelsAvailable() bool {
+    return comptime builtin.os.tag.isDarwin();
+}
+pub extern "c" fn mlx_cuda_is_available(res: *bool) c_int;
+
+pub const mlx_fast_cuda_kernel_config = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_fast_cuda_kernel_config_new() mlx_fast_cuda_kernel_config;
+pub extern "c" fn mlx_fast_cuda_kernel_config_free(cls: mlx_fast_cuda_kernel_config) void;
+pub extern "c" fn mlx_fast_cuda_kernel_config_add_output_arg(cls: mlx_fast_cuda_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_set_grid(cls: mlx_fast_cuda_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_set_thread_group(cls: mlx_fast_cuda_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_add_template_arg_dtype(cls: mlx_fast_cuda_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_add_template_arg_int(cls: mlx_fast_cuda_kernel_config, name: [*:0]const u8, value: c_int) c_int;
+pub const mlx_fast_cuda_kernel = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_fast_cuda_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, shared_memory: c_int) mlx_fast_cuda_kernel;
+pub extern "c" fn mlx_fast_cuda_kernel_free(cls: mlx_fast_cuda_kernel) void;
+pub extern "c" fn mlx_fast_cuda_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_cuda_kernel, inputs: mlx_vector_array, config: mlx_fast_cuda_kernel_config, s: mlx_stream) c_int;
 pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
 
 // Metal
@@ -183,6 +293,24 @@ pub extern "c" fn mlx_map_string_to_string_get(value: *[*:0]const u8, map: mlx_m
 
 // IO
 pub extern "c" fn mlx_load_safetensors(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) c_int;
+pub const mlx_io_reader = extern struct { ctx: ?*anyopaque = null };
+/// A custom reader's callbacks over its own descriptor (mlx/c/io_types.h `mlx_io_vtable`).
+pub const mlx_io_vtable = extern struct {
+    is_open: *const fn (?*anyopaque) callconv(.c) bool,
+    good: *const fn (?*anyopaque) callconv(.c) bool,
+    tell: *const fn (?*anyopaque) callconv(.c) usize,
+    seek: *const fn (?*anyopaque, i64, c_int) callconv(.c) void,
+    read: *const fn (?*anyopaque, [*]u8, usize) callconv(.c) void,
+    read_at_offset: *const fn (?*anyopaque, [*]u8, usize, usize) callconv(.c) void,
+    write: *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+    label: *const fn (?*anyopaque) callconv(.c) [*:0]const u8,
+    free: *const fn (?*anyopaque) callconv(.c) void,
+};
+pub extern "c" fn mlx_io_reader_new(desc: ?*anyopaque, vtable: mlx_io_vtable) mlx_io_reader;
+pub extern "c" fn mlx_io_reader_free(io: mlx_io_reader) c_int;
+pub extern "c" fn mlx_load_safetensors_reader(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, in_stream: mlx_io_reader, s: mlx_stream) c_int;
+pub extern "c" fn mlx_einsum(res: *mlx_array, subscripts: [*:0]const u8, operands: mlx_vector_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_slice_update_dynamic(res: *mlx_array, src: mlx_array, update: mlx_array, start: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_save_safetensors(file: [*:0]const u8, param: mlx_map_string_to_array, metadata: mlx_map_string_to_string) c_int;
 
 // ── Ops ──
@@ -255,6 +383,12 @@ pub extern "c" fn mlx_var_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepd
 pub extern "c" fn mlx_min_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_astype(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_view(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_to_fp8(res: *mlx_array, x: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_from_fp8(res: *mlx_array, x: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_bitwise_and(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_left_shift(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_right_shift(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_array_equal(res: *mlx_array, a: mlx_array, b: mlx_array, equal_nan: bool, s: mlx_stream) c_int;
@@ -304,6 +438,7 @@ pub extern "c" fn mlx_conv1d(res: *mlx_array, input: mlx_array, weight: mlx_arra
 // `mlx_fft_norm`: BACKWARD=0 (no scaling on forward; matches mx.fft.rfft default).
 pub const mlx_fft_norm = c_int;
 pub const MLX_FFT_NORM_BACKWARD: mlx_fft_norm = 0;
+pub extern "c" fn mlx_as_strided(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, strides: [*]const i64, strides_num: usize, offset: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_fft_rfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
 // Real-output inverse transform — the iSTFT head of Kokoro's iSTFTNet generator
 // (`src/kokoro.zig`). `n` is the OUTPUT length in samples, so the caller states
@@ -699,12 +834,24 @@ pub fn wiredFitTarget(active_bytes: usize, slack_bytes: usize, max_rec: usize) ?
 pub const WiredPolicyResult = struct { mode: WiredMode, target: ?usize };
 
 pub fn maxRecommendedWorkingSet() usize {
-    return defaultDeviceInfoSize("max_recommended_working_set_size");
+    const v = defaultDeviceInfoSize("max_recommended_working_set_size");
+    // CUDA has no working-set key; a discrete GPU's ceiling is its VRAM.
+    return if (v != 0) v else defaultDeviceInfoSize("total_memory");
+}
+
+/// Free VRAM across all processes (NVML, else this process's view); 0 when unknown (Metal).
+pub fn freeDeviceMemory() usize {
+    return defaultDeviceInfoSize("free_memory");
 }
 
 /// `MTLDevice.maxBufferLength`; 0 when the query fails.
 pub fn maxBufferLength() usize {
     return defaultDeviceInfoSize("max_buffer_length");
+}
+
+/// The default CUDA device's compute capability (`.major` 12, `.minor` 0 on sm_120); 0 when unknown.
+pub fn cudaComputeCapability(part: enum { major, minor }) usize {
+    return defaultDeviceInfoSize(if (part == .major) "compute_capability_major" else "compute_capability_minor");
 }
 
 fn defaultDeviceInfoSize(key: [*:0]const u8) usize {
@@ -759,6 +906,79 @@ pub fn applyWiredPolicy() WiredPolicyResult {
     }
 }
 
+test "custom Metal kernels run on the Metal backend only" {
+    try std.testing.expectEqual(builtin.os.tag.isDarwin(), metalKernelsAvailable());
+}
+
+/// Evaluates every array reachable through `value`'s fields (structs, optionals, arrays, slices),
+/// so weights a loader bound lazily are resident, and billed, before the first request.
+pub fn evalFields(value: anytype) !void {
+    const vec = mlx_vector_array_new();
+    defer _ = mlx_vector_array_free(vec);
+    appendFields(vec, value);
+    try check(mlx_eval(vec));
+}
+
+fn appendFields(vec: mlx_vector_array, value: anytype) void {
+    const T = @TypeOf(value);
+    if (T == mlx_array) {
+        if (value.ctx != null) _ = mlx_vector_array_append_value(vec, value);
+        return;
+    }
+    switch (@typeInfo(T)) {
+        .@"struct" => |st| inline for (st.field_names) |name| appendFields(vec, @field(value, name)),
+        .optional => if (value) |v| appendFields(vec, v),
+        .array => for (value) |v| appendFields(vec, v),
+        .pointer => |p| if (p.size == .slice) for (value) |v| appendFields(vec, v),
+        else => {},
+    }
+}
+
+test "evalFields evaluates the arrays nested in structs, optionals, arrays and slices" {
+    if (noGpuBackend()) return error.SkipZigTest;
+    const s = gpuStream();
+    const one = mlx_array_new_float(1.0);
+    defer _ = mlx_array_free(one);
+    var lazy: [5]mlx_array = undefined;
+    for (&lazy) |*a| {
+        a.* = mlx_array_new();
+        try check(mlx_add(a, one, one, s));
+    }
+    defer for (lazy) |a| {
+        _ = mlx_array_free(a);
+    };
+    const Inner = struct { w: mlx_array, none: mlx_array = .{ .ctx = null } };
+    const Outer = struct { inner: Inner, opt: ?mlx_array, rows: [2]mlx_array, blocks: []const Inner, name: []const u8 = "x", n: u32 = 7 };
+    const v = Outer{ .inner = .{ .w = lazy[0] }, .opt = lazy[1], .rows = .{ lazy[2], lazy[3] }, .blocks = &.{.{ .w = lazy[4] }} };
+    try evalFields(v);
+    for (lazy) |a| {
+        var ready = false;
+        _ = _mlx_array_is_available(&ready, a);
+        try std.testing.expect(ready);
+    }
+}
+
+test "cudaHomeDefault: export /opt/cuda only when nothing else names a toolkit" {
+    try std.testing.expectEqualStrings("/opt/cuda", cudaHomeDefault(false, false, true).?);
+    try std.testing.expect(cudaHomeDefault(true, false, true) == null);
+    try std.testing.expect(cudaHomeDefault(false, true, true) == null);
+    try std.testing.expect(cudaHomeDefault(false, false, false) == null);
+}
+
+test "weight loads go to the GPU on CUDA only where host memory never migrates there" {
+    try std.testing.expect(weightLoadOnGpu(true, true));
+    try std.testing.expect(!weightLoadOnGpu(true, false)); // native Linux: managed memory migrates
+    try std.testing.expect(!weightLoadOnGpu(false, true)); // Metal/CPU: no GPU `Load`
+    try std.testing.expect(kernelReleaseIsWsl("6.18.54.1-microsoft-standard-WSL2"));
+    try std.testing.expect(!kernelReleaseIsWsl("7.2.9-2-cachyos"));
+}
+
+test "cudaDllSearchPath: the toolkit's DLL folders go first, the old PATH keeps its order" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("C:\\cuda\\bin\\x64;C:\\cuda\\bin;C:\\Windows;C:\\tools", cudaDllSearchPath(&buf, "C:\\cuda", "C:\\Windows;C:\\tools").?);
+    try std.testing.expect(cudaDllSearchPath(buf[0..8], "C:\\cuda", "x") == null); // too long: leave PATH alone
+}
+
 test "wired mode from env" {
     const t = std.testing;
     // Default (unset) is the historical behavior until the fit-policy A/B
@@ -792,12 +1012,12 @@ var mlx_error_latched = std.atomic.Value(bool).init(false);
 var mlx_error_buf: [512]u8 = undefined;
 var mlx_error_len: usize = 0;
 /// pthread mutex: mlx-c calls the handler from whatever thread raised, none carry an `Io`.
-var mlx_error_mtx: std.c.pthread_mutex_t = .{};
+var mlx_error_mtx: os_mutex.Mutex = .{};
 fn lockErrBuf() void {
-    _ = std.c.pthread_mutex_lock(&mlx_error_mtx);
+    mlx_error_mtx.lock();
 }
 fn unlockErrBuf() void {
-    _ = std.c.pthread_mutex_unlock(&mlx_error_mtx);
+    mlx_error_mtx.unlock();
 }
 
 /// Memory-class latched messages become a memory 503 (`[METAL] ... Insufficient Memory`,
@@ -980,6 +1200,8 @@ test "an MLX memory failure is classified as a memory error, an argument error i
 
 test "the latch turns an mlx-c error into a Zig error instead of exiting, once" {
     const t = std.testing;
+    var stale: [512]u8 = undefined;
+    _ = takeError(&stale); // an earlier test's latch would shadow this one's
     try t.expect(!errorPending());
     try checkError();
 

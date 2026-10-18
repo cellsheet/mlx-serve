@@ -800,6 +800,9 @@ The tile's hover bubble carries the whole picture, and every preview came out a 
 ## `onGeometryChange` fires when its value changes, so return the answer (2026-09-20)
 Three observers returned raw rects and widths, so a window drag wrote pane state on every frame and rebuilt the whole pane with it — the resize dragged. Returning a Bool at a threshold, an Int, or a rect quantised to 8pt fires only when the answer changes. And never measure the thing whose size depends on the answer: a `fixedSize` menu never re-fits once the segmented picker has shrunk, and a grid chunked from its own container's width goes into one long row and stays there (the row widens the form, the form measures as room for the row). Rows are decided inside the layout pass, or by the container: `LazyVGrid` with `adaptive(minimum:maximum:)` at ONE value packs fixed cells leading. A `ViewThatFits` over a segmented `Picker` never picks the fallback either, because the picker accepts any width and squeezes.
 
+## A segmented control's floor is the smallest it has ever reported (2026-10-13)
+On macOS 27 the Video pane's Quality picker turned into a menu and back while the form scrolled (reported on [mlx-serve#810](https://github.com/ddalcu/mlx-serve/pull/810)). Cause: asked for its narrowest width, the five-segment control answered 350.5 pt most times and its natural 530 pt sometimes, and `ViewThatFits` asks again on each update; a column between the two flips. Fix: `SegmentFloors` keeps the smallest floor per natural width (the label set), so a later natural-width answer cannot move the choice. Guard: `SegmentedOrMenuTests.testTheChoiceHoldsWhenTheControlMisreportsItsFloor`.
+
 ## A padded stack that will not compress is centred by the ScrollView (2026-09-20)
 A child that refuses to compress makes the padded form wider than its column, and `ScrollView` centres content it cannot fit, so the overflow hangs off the leading edge. The fix is a full-width, leading-aligned frame with the padding INSIDE it; with the frame inside the padding the frame takes the column and the padding adds 32pt on top, which moves the form by less but still moves it. All three relaid panes carry the frame now.
 
@@ -864,3 +867,29 @@ Defect: the trash button on the last Providers row crashed the app (`Array._chec
 ## Full-size pictures decoded in a view body stall the window
 
 Defect: window moves and typing stuttered while photos or generated media were on screen. Cause: drop wells, reference tiles, previews and chat attachment bubbles built full-size `NSImage`s on the main thread, several straight from `body`, which re-runs on every streamed token and progress tick. Fix: `MediaImage` downsamples with ImageIO off the main thread and caches the result by path, mtime, size and display size; video frames and WAV payloads decode their base64 off the main actor too. Guard: `MediaImageTests`.
+
+## The AI Radio banner ran under the sidebar
+
+Defect: while AI Radio ran, the Music pane's grey "Settings are locked" bar reached past the column and showed under the sidebar. Cause: `.background(.regularMaterial)` takes a shape STYLE, and that overload fills the safe areas (`ignoresSafeAreaEdges: .all`); the floating sidebar covers the detail's leading safe area, so the material drew there. A `.background(view)` stays in bounds, which is why the panes' other cards never did it. Fix: `RadioLockBanner` is a card inside the column's margin, its material drawn `in:` a rounded rectangle, set above the settings with `safeAreaInset`; with the sidebar hidden it no longer touches the window's edge either. Guard: `RadioLockBannerTests` (renders the banner beside a leading safe area and reads the pixels there and in the margin).
+
+### Composer note recovery must wait for the IME
+
+Recovering a steering note while the composer held marked text lost the note:
+the engine cleared it, SwiftUI wrote it into the binding, the redraw guard
+refused to overwrite the composition, and the eventual commit overwrote the
+binding with only the field's text. Keep paused notes in a session-keyed
+restoring store owned by the engine; sending reads only the sending store.
+Restore after SwiftUI observes the end of composition and the committed
+binding is available. Window removal preserves the store; deleting a session
+prunes both stores, even without a running turn.
+Guards: `SteeringNotesTests`, `ComposerMarkedTextTests`.
+
+## Qwen-Image infographics came back as gibberish
+
+Defect: Qwen-Image-2.1 garbled the lettering of every infographic, while the title and headline numbers came out right. Cause: the prompt asked for "icons and statistics" without giving their words, so the model invented filler labels, and those render as gibberish; our tokenizer matched Hugging Face's token for token. Enhance made it worse: it asked the chat model for "one or two sentences", which drops the exact words, and `clean` trimmed every quote off both ends, cutting the closing quote of a prompt that ended on quoted text. Fix: the format of Qwen's own prompt enhancer (every string in double quotes with where it sits, exact words for every label, "There is no other text in the image"), shipped as Qwen's Infographics templates and as Enhance's layout rules for a `rendersDenseText` model; `clean` strips only a wrapping pair. Same seed and size, the quoted layout rendered every word. Guards: `PromptRewriterTests`, `testQwenImageOffersInfographicTemplates`.
+
+## A placeholder over a `TextEditor` ran under its scroller (2026-10-13)
+With "Show scroll bars: Always" (or a mouse attached), the Video prompt's placeholder ran under the editor's scroll bar: "Click" sat on the track. A legacy scroller takes 17 pt from the column the editor's text wraps in; the placeholder is a `Text` laid over the editor at full width. Fix: `.clearOfEditorScroller()` pads it by `EditorScrollerInset.trailing(for: NSScroller.preferredScrollerStyle)` and follows the style-change notification; every laid-over text uses it (Video prompt, Music lyrics and score, New Task goal, the Enhance sheet's thought). Guard: `EditorScrollerInsetTests`.
+
+## A nested shard the index names was never downloaded, so the folder read "Missing shards" (2026-10-16)
+Defect: `mlx-community/humanizer-12b-OptiQ-4bit` finished downloading and the Models list flagged it "Missing shards". Cause: its `model.safetensors.index.json` names `optiq/optiq_vision.safetensors`, and the downloader (app and `mlx-serve pull`) keeps nested files only from a hand-kept allowlist (`mtp/`, `drafter/`, `engram/`, `optiq/mtp.safetensors`), so each new pack layout was a new miss. `weightDefect` reads the index, so the two disagreed by construction. Fix: the root index is fetched first and any file it names rides along at any depth (`indexedShards`, `Resolved.indexed`); a nested copy no index names (`original/`) stays out. The server only loads top-level shards, so this pack's vision tower is still not used. Guards: `testSelectNeededFilesPullsEveryShardTheIndexNames`, `cli: a nested shard the index names is part of the pack`.

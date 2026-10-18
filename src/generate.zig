@@ -4,6 +4,8 @@ const mlx = @import("mlx.zig");
 const keyed_sample = @import("keyed_sample.zig");
 const transformer_mod = @import("transformer.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
+const dsv41_mod = @import("deepseek_v41.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
@@ -20,6 +22,7 @@ const mimo_mtp = @import("mimo_mtp.zig");
 const glm_mtp = @import("glm_mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const round_cost = @import("round_cost.zig");
+const dflash_policy = @import("dflash_policy.zig");
 const group_cost = @import("mtp_group_cost.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const ane_mod = @import("ane.zig");
@@ -36,7 +39,13 @@ const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
+const lilicorr_mod = @import("lilicorr.zig");
 const DflashModel = dflash_mod.DflashModel;
+
+fn embedTrunk(ctx: *const anyopaque, ids: mlx.mlx_array) anyerror!mlx.mlx_array {
+    const xfm: *const transformer_mod.Transformer = @ptrCast(@alignCast(ctx));
+    return xfm.rawEmbedding(ids);
+}
 const gdn_decode = @import("gdn_decode.zig");
 const KVCache = transformer_mod.KVCache;
 
@@ -54,6 +63,12 @@ pub const WIDE_PREFILL_CHUNK: usize = 16384;
 /// without this flag the default 8192 is indistinguishable from a request.
 /// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
 pub var prefill_chunk_explicit: bool = false;
+
+/// `--prefill-chunk` for an embedded engine's u32 chunk (ds4): 0 = the engine's default.
+pub fn explicitPrefillChunkU32() u32 {
+    if (!prefill_chunk_explicit) return 0;
+    return std.math.cast(u32, prefill_chunk_override) orelse std.math.maxInt(u32);
+}
 pub var prefill_trace_force: bool = false;
 
 /// Set once by the serve CLI before request construction. Direct callers may
@@ -116,7 +131,7 @@ pub const SpecDisableReason = enum {
     tool_choice,
     /// The measured round cost more per token than a measured serial token (`MtpAdaptive`).
     adaptive,
-    /// A DFlash slot gained company: it decodes plain so it can join the batched group.
+    /// A speculating slot gained company: it decodes plain so it can join the batched group.
     company,
 };
 
@@ -265,6 +280,17 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     const env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
     try std.testing.expectEqual(@as(usize, 8192), env);
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(env, 1024));
+}
+
+/// The `[spec-stats] mode=` word of an mlx-stream lane: the first word of the plugin's lane name.
+fn laneMode(lane: []const u8) []const u8 {
+    return lane[0 .. std.mem.indexOfScalar(u8, lane, ' ') orelse lane.len];
+}
+
+test "laneMode: the spec-stats mode is the first word of the lane name" {
+    try std.testing.expectEqualStrings("dspark", laneMode("dspark typical 0.3"));
+    try std.testing.expectEqualStrings("mtp", laneMode("mtp typical 0.5 depth 2"));
+    try std.testing.expectEqualStrings("serial", laneMode("serial"));
 }
 
 /// Read an unsigned integer from an environment variable, falling back to
@@ -991,12 +1017,16 @@ pub fn fillSuppressMask(buf: []bool, ids: []const u32, defined_vocab: usize) voi
 /// `MLX_SERVE_SUPPRESS_RESERVED=0`. Never fails a load — any error logs and
 /// leaves the mask null (suppression off), and engagement is one-shot-logged
 /// so a silent no-op is visible (the silent-fallback class).
+/// `MLX_SERVE_SUPPRESS_RESERVED=0`: reserved specials and padding rows sample like any other id.
+pub fn suppressionDisabled() bool {
+    const v = std.c.getenv("MLX_SERVE_SUPPRESS_RESERVED") orelse return false;
+    return v[0] == '0';
+}
+
 pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_template: []const u8, eos_ids: []const u32) void {
-    if (std.c.getenv("MLX_SERVE_SUPPRESS_RESERVED")) |v| {
-        if (v[0] == '0') {
-            log.info("[suppress] reserved-token suppression disabled by env\n", .{});
-            return;
-        }
+    if (suppressionDisabled()) {
+        log.info("[suppress] reserved-token suppression disabled by env\n", .{});
+        return;
     }
     const ids = tokenizer_mod.reservedOutputIds(xfm.allocator, tok.flagged_specials, chat_template, eos_ids) catch |err| {
         log.warn("[suppress] derivation failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
@@ -1133,6 +1163,8 @@ pub const GenerationResult = struct {
     /// reflects real compute rather than an inflated full-prompt rate.
     cached_tokens: u32 = 0,
     logprobs: ?[]LogprobResult = null, // per-token logprobs (caller must free)
+    /// `/v1/completions` echo: prompt tokens 1..N-1, each scored by the row before it (caller must free).
+    prompt_logprobs: ?[]LogprobResult = null,
     /// Non-null only when the degenerate-tail guard cut this generation:
     /// the `finish_details.type` value emitted beside `finish_reason`
     /// ("stop" for loop cuts — see `scheduler.loopStopReason`).
@@ -1212,17 +1244,29 @@ pub fn nextChunkEnd(
     ssm_cp_offset: usize,
     // Is the per-chunk adaptive width live for this prefill? Only then does the merge bound scale.
     adaptive_width: bool,
+    // Does this arch get the dense low anchors? Same gate as the checkpoint-retention
+    // `ssm_low_anchors` (`longCtxGated`, #794). A non-gated arch keeps its previous
+    // stride-boundary chunking byte-for-byte: a coarsened stride must not buy
+    // extra MoE chunks (each one re-streams the expert weights).
+    dense_low_grid: bool,
 ) usize {
     var end = @min(pos + default_chunk, prefix_len);
     if (want_ssm_cp and ssm_cp_stride > 0) {
         const abs_pos = pos + ssm_cp_offset;
         const abs_end = end + ssm_cp_offset;
         const next_boundary_abs = ((abs_pos / ssm_cp_stride) + 1) * ssm_cp_stride;
-        if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) {
-            // A stride boundary lands inside this chunk — end exactly on it
-            // (never tail-merge past it; the boundary IS the snapshot point).
-            return next_boundary_abs - ssm_cp_offset;
-        }
+        // A stride boundary lands inside this chunk — end exactly on it
+        // (never tail-merge past it; the boundary IS the snapshot point).
+        var cut_abs: usize = if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) next_boundary_abs else 0;
+        // A dense low anchor inside the chunk cuts there too: a snapshot may only
+        // stamp an evaluated position, and an anchor earlier than the stride
+        // boundary must win the cut or a wide chunk jumps over it. 0 for a
+        // non-gated arch, and whenever stride <= 8192 — there the grid already
+        // has this spacing and fine-stride chunking stays byte-identical.
+        const low_anchor = if (dense_low_grid) ssmLowAnchorEnd(pos, end, ssm_cp_offset, ssm_cp_stride) else @as(usize, 0);
+        if (low_anchor > pos and low_anchor < end and (cut_abs == 0 or low_anchor + ssm_cp_offset < cut_abs))
+            cut_abs = low_anchor + ssm_cp_offset;
+        if (cut_abs != 0) return cut_abs - ssm_cp_offset;
     }
     if (end < prefix_len and prefix_len - end < tailMergeMaxFor(default_chunk, adaptive_width)) {
         // Absorb a tiny tail instead of paying a full graph build + eval
@@ -1268,6 +1312,39 @@ pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) 
     if (!want_ssm_cp) return 0;
     if (prefix_len <= SSM_SNAPSHOT_BACKOFF) return if (restored) prefix_len else 0;
     return SSM_SNAPSHOT_BACKOFF;
+}
+
+/// Under `longCtxGated` the chunk loop lays dense checkpoint anchors every 8192
+/// through the first 65536, whatever stride the request coarsened to (#794): a
+/// deep entry's grid then always answers `highestSsmPosAtOrBelow` for a fork
+/// inside the low band. At stride <= 8192 the grid already has this spacing, so
+/// every path below is a no-op there. Every other arch passes `dense_low_grid`
+/// false and keeps its previous grid.
+pub const SSM_GRID_LOW_DENSE_STRIDE: usize = 8192;
+pub const SSM_GRID_LOW_DENSE_TOP: usize = 65_536;
+
+/// PURE: must the chunk loop snapshot a chunk that ends exactly at absolute
+/// position `abs_end`? The stride multiples, plus the dense low anchors when
+/// `dense_low_grid`. A snapshot may only stamp a position the chunk actually
+/// evaluated, so the anchors are realised by cutting the chunk at them in
+/// `nextChunkEnd` — never by stamping a future state at an earlier position.
+pub fn ssmCapturePos(stride: usize, abs_end: usize, dense_low_grid: bool) bool {
+    if (stride == 0) return false;
+    if (abs_end % stride == 0) return true;
+    return dense_low_grid and abs_end % SSM_GRID_LOW_DENSE_STRIDE == 0 and abs_end <= SSM_GRID_LOW_DENSE_TOP;
+}
+
+/// PURE: end the chunk at the first dense low anchor strictly inside
+/// `(pos, end)` (relatives to `prompt_ids[0]`, i.e. what `nextChunkEnd`
+/// returns). 0 when there is none or the stride is already dense — chunk
+/// boundaries stay byte-identical at stride <= 8192.
+pub fn ssmLowAnchorEnd(pos: usize, end: usize, offset: usize, stride: usize) usize {
+    if (stride <= SSM_GRID_LOW_DENSE_STRIDE) return 0;
+    const abs_pos = pos + offset;
+    const abs_end = end + offset;
+    const a: usize = (abs_pos / SSM_GRID_LOW_DENSE_STRIDE + 1) * SSM_GRID_LOW_DENSE_STRIDE;
+    if (a > SSM_GRID_LOW_DENSE_TOP or a <= abs_pos or a >= abs_end) return 0;
+    return a - offset;
 }
 
 /// Effective SSM-checkpoint stride for a model, given the base (configured)
@@ -1346,7 +1423,7 @@ pub fn visionPrefillUnchunked(has_vision: bool) bool {
 pub fn countSpliceRows(ids: []const i32, image_token_id: u32, audio_token_id: u32, video_token_id: u32) usize {
     var n: usize = 0;
     for (ids) |id| {
-        if (id == @as(i32, @intCast(image_token_id)) or
+        if ((image_token_id > 0 and id == @as(i32, @intCast(image_token_id))) or
             (audio_token_id > 0 and id == @as(i32, @intCast(audio_token_id))) or
             (video_token_id > 0 and id == @as(i32, @intCast(video_token_id)))) n += 1;
     }
@@ -1366,11 +1443,12 @@ pub fn prefillChunkCount(
     ssm_cp_stride: usize,
     ssm_cp_offset: usize,
     adaptive_width: bool,
+    dense_low_grid: bool,
 ) usize {
     var pos: usize = 0;
     var n: usize = 0;
     while (pos < prefix_len) {
-        const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width);
+        const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width, dense_low_grid);
         pos = end;
         n += 1;
     }
@@ -1449,6 +1527,35 @@ test "every speculative decoder caps accepted drafts before commit" {
 /// Uses a fully-lazy async pipeline matching mlx-lm: sample + next forward are
 /// built as a single lazy computation graph, async_eval'd together. The GPU
 /// never idles between token generation steps.
+/// A request's round-policy state (`dflash_policy.zig`).
+const DflashPol = struct {
+    calib: dflash_policy.Calibration = .{},
+    drafting: dflash_policy.Drafting = .{},
+    /// Verify exactly this many rows (t1 included) whenever the draft has them; 0 = the policy chooses.
+    /// `MLX_SERVE_DFLASH_ROWS`: how width costs and accepts are measured.
+    pin_rows: u32 = 0,
+    /// What a plain tick costs on this machine at this context, from this request's own pipelined ticks.
+    /// The shared round-cost table is no source: its plain cell folds transition ticks and, once stale,
+    /// takes one outlier at half weight.
+    plain: dflash_policy.PlainCost = .{},
+    /// How copied continuations have fared.
+    copy: dflash_policy.CopyStats = .{},
+    /// Since the last pipelined plain tick ended; null once any other kind of round has run.
+    plain_watch: ?io_util.Stopwatch = null,
+};
+
+/// One pipelined step's recurrent state: the position it describes and a refcount snapshot per layer.
+const SsmLag = struct {
+    pos: usize = 0,
+    snaps: []SSMCacheEntrySnapshot = &.{},
+
+    fn deinit(self: *SsmLag, allocator: std.mem.Allocator) void {
+        for (self.snaps) |*s| ssmSnapshotDeinit(s);
+        allocator.free(self.snaps);
+        self.* = .{};
+    }
+};
+
 pub const Generator = struct {
     /// The verify forward's inputs for a draft tree of `parents` (row 0 the root,
     /// -1) at `depth`: the GDN tree table and each row's ancestor path.
@@ -1620,6 +1727,22 @@ pub const Generator = struct {
     dflash_round_width: u32 = 0,
     /// Stats: count of nextDflash calls that ran a verify forward.
     dflash_attempted: u64 = 0,
+    /// Round policy (`dflash_policy.zig`); null = the fixed block and the sticky yield gate.
+    dflash_pol: ?DflashPol = null,
+    /// Stats: rounds drafted from the context (no assistant forward), the tokens they proposed and the ones kept.
+    dflash_copies: u64 = 0,
+    dflash_copy_drafted: u64 = 0,
+    dflash_copy_accepted: u64 = 0,
+    /// Stats: rounds that verified one row (no drafts), whether or not the assistant drafted for them.
+    dflash_plain: u64 = 0,
+    /// The round's wall time bills a draft nobody verified, so it says nothing about the width's cost.
+    dflash_unobserved: bool = false,
+    /// Per-position acceptance and verify widths (`[spec-stats]`).
+    dflash_stats: dflash_policy.PositionStats = .{},
+    /// Plain-round captures not yet appended to the assistant context: one array per target layer
+    /// per round, oldest first. One append later costs what one token's does, so a plain stretch pays none.
+    dflash_pending: std.ArrayList(mlx.mlx_array) = .empty,
+    dflash_pending_rounds: u32 = 0,
     /// Tree rounds that verified a context copy: consecutive ones that kept
     /// none of it, and rounds left without copies after four of those.
     dflash_copy_misses: u8 = 0,
@@ -1627,6 +1750,10 @@ pub const Generator = struct {
     /// Emitted tokens past the KV cache: the last one, when the budget ended on
     /// a token the previous verify already decided. Commits key on the rest.
     unforwarded_tail: u32 = 0,
+    /// A plain pipelined step forwards the stop token and one lookahead before it sees the stop,
+    /// and recurrent state cannot be rewound: the state at the last two such steps, shared by
+    /// refcount, so a finishing slot rolls back to what it commits (`rollbackSsmTo`).
+    ssm_lag: [2]SsmLag = .{ .{}, .{} },
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
     /// Per-phase wall-time trace (MLX_SERVE_DFLASH_TRACE=1; else untouched).
@@ -1944,6 +2071,15 @@ pub const Generator = struct {
         return on;
     }
 
+    /// The round policy (`dflash_policy.zig`) drives DFlash on a sparse target whose verify rows cost
+    /// (GLM-5.3); every other arch keeps the fixed block until it is A/B'd on its own.
+    /// `MLX_SERVE_DFLASH_POLICY=0` restores the fixed block and the sticky yield gate.
+    pub fn dflashPolicyFor(config: *const model_mod.ModelConfig) bool {
+        if (!config.isGlm5()) return false;
+        const raw = std.c.getenv("MLX_SERVE_DFLASH_POLICY") orelse return true;
+        return !std.mem.eql(u8, std.mem.span(raw), "0");
+    }
+
     pub fn dflashGateWarmup() u64 {
         const n = readEnvUsize("DFLASH_GATE_WARMUP", @intCast(DFLASH_GATE_WARMUP));
         if (n < 1 or n > 64) return DFLASH_GATE_WARMUP;
@@ -2061,11 +2197,24 @@ pub const Generator = struct {
         StepTrace.report();
         var table_buf: [256]u8 = undefined;
         var hist_buf: [256]u8 = undefined;
+        var acc_buf: [128]u8 = undefined;
+        var rows_buf: [160]u8 = undefined;
         var lookup_buf: [256]u8 = undefined;
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
         if (self.dspark_enabled and self.dspark_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.dspark_attempted));
+            if (self.xfm.mlx_stream_ext) |m| {
+                // The plugin's lane names the mode (DeepSeek-V4.1: dspark, MiMo: mtp).
+                const lane = mlx_stream.laneName(m);
+                log.info(
+                    "  [spec-stats] mode={s} attempts={d} accepts={d} avg_per_round={d:.2} plugin=mlx-stream lane=\"{s}\"\n",
+                    .{ laneMode(lane), self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, lane },
+                );
+                var lane_buf: [512]u8 = undefined;
+                if (mlx_stream.laneReceipt(m, &lane_buf)) |line| if (line.len > 0) log.info("  [spec-stats] {s}\n", .{line});
+                return;
+            }
             log.info(
                 "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2}\n",
                 .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round },
@@ -2130,9 +2279,9 @@ pub const Generator = struct {
             });
             return;
         }
-        if (self.dflash != null and self.dflash_attempted > 0) {
+        if (self.dflash != null and self.dflash_attempted + self.dflash_plain > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
-                @as(f64, @floatFromInt(self.dflash_attempted));
+                @as(f64, @floatFromInt(@max(self.dflash_attempted, 1)));
             const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
             // Under the chooser the width varies per round: drafts proposed
             // is the histogram's sum, not attempts x a fixed block.
@@ -2143,7 +2292,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d} plain={d} skipped={d} probes={d} copies={d}/{d}/{d} acc_pos={s} rows_hist={s}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
@@ -2162,6 +2311,14 @@ pub const Generator = struct {
                     if (self.dflash_chooser) |ch| ch.avgWidth() else @as(f32, @floatFromInt(drafts_per_round)),
                     if (self.dflash_chooser) |*ch| ch.formatHist(&hist_buf) else "",
                     if (self.dflash_chooser) |ch| ch.trial.trials else 0,
+                    self.dflash_plain,
+                    if (self.dflash_pol) |pol| pol.drafting.skipped else 0,
+                    if (self.dflash_pol) |pol| pol.drafting.probes else 0,
+                    self.dflash_copies,
+                    self.dflash_copy_drafted,
+                    self.dflash_copy_accepted,
+                    self.dflash_stats.formatAcc(&acc_buf),
+                    self.dflash_stats.formatRows(&rows_buf),
                 },
             );
             return;
@@ -2299,6 +2456,9 @@ pub const Generator = struct {
         /// M5/block-16 calibration to the effective draft width and lowers it
         /// for requests whose resolved mode has thinking enabled.
         dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
+        /// Drive the DFlash rounds with `dflash_policy` (a sparse target, where a verify row costs):
+        /// plain rounds replace the sticky serial fallback and the rows verified follow the draft's confidence.
+        dflash_policy: bool = false,
         /// Enable the Qwen native MTP head. When set, `mtp` must be non-null
         /// and `bind()`-ed to `xfm`. Prefill builds the head's committed-
         /// history KV cache chunk-by-chunk (full-hidden capture) and the
@@ -2353,6 +2513,11 @@ pub const Generator = struct {
         /// Cap on retained checkpoints. Past it the list is thinned span-preservingly
         /// (`transformer.ssmCheckpointDropIndex`): lowest and newest always survive. 0 = unlimited.
         ssm_checkpoint_max: u32 = 16,
+        /// Protect the first N positions (the lowest grid points) when thinning
+        /// the capture list to its cap: they are the only restore anchor for a
+        /// request that forked below a coarse grid's first multiple (#794).
+        /// 0 = the plain thinning (upstream behaviour, byte-identical).
+        ssm_low_anchors: usize = 0,
         /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
         /// On a cold prefill this is 0. On the warm path (where the
         /// scheduler restored some prefix and now forwards only the tail),
@@ -2389,11 +2554,11 @@ pub const Generator = struct {
         cancelled_checkpoint_sink: ?*CancelledCheckpointSink = null,
         /// Per-token logprobs count for this request (0 = disabled). Callers
         /// that set `Generator.logprobs_n` after init must ALSO pass it here:
-        /// init's split-prefill final-token forward is a single-row dispatch,
-        /// and the certified lm_head prune may only engage when the request
-        /// consumes nothing but the argmax — a logprobs request reads the
-        /// full logit row, which the pruned head does not produce.
+        /// init's split-prefill final-token forward reads it for the first token.
         logprobs_n: u32 = 0,
+        /// `/v1/completions` echo: every prompt token after the first gets its
+        /// `logprobs_n`-wide entry here. The prompt must be forwarded whole (no restore).
+        prompt_logprobs: ?*std.ArrayList(LogprobResult) = null,
         /// LIVE prefill progress, in tokens actually forwarded so far by THIS
         /// prefill. Bumped once per chunk (not per token), read off-thread by
         /// the metrics gauge sampler.
@@ -2479,6 +2644,11 @@ pub const Generator = struct {
         return if (stoch_enabled) .stochastic else .off;
     }
 
+    /// Shared by dispatch and /props; this disables drafting, not resident stages.
+    pub fn dsparkEnabled() bool {
+        return if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] != '0' else true;
+    }
+
     /// Stochastic-DSpark kill switch — MLX_SERVE_DSV4_DSPARK_STOCH=0
     /// restores the greedy-only chokepoint gate for A/Bs.
     var dspark_stoch_cache: ?bool = null;
@@ -2513,11 +2683,12 @@ pub const Generator = struct {
         // inherits the model's mask without per-site wiring.
         var sampling = sampling_in;
         sampling.suppress_mask = xfm.suppress_mask;
-        sampling.keyed = xfm.config.rowExactDecode();
+        sampling.keyed = xfm.config.rowExactDecode() and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
         sampling.position_base = pickLookupPromptSource(prompt_ids, options_in.lookup_prompt).len;
-        // Spec drafts and verify rows share the serial sampler's keys, so an
-        // unseeded sampled request gets its own random seed.
-        if (sampling.keyed and sampling.seed == null and sampling.temperature > 0.01) {
+        // Spec drafts and verify rows share the serial sampler's keys (and
+        // mlx-stream's lane draws from the seed), so an unseeded sampled
+        // request gets its own random seed.
+        if ((sampling.keyed or xfm.mlx_stream_ext != null) and sampling.seed == null and sampling.temperature > 0.01) {
             var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) ^ @intFromPtr(xfm)));
             sampling.seed = prng.random().int(u64);
         }
@@ -2533,7 +2704,7 @@ pub const Generator = struct {
         var options = options_in;
         var dspark_active = false;
         var dspark_stochastic = false;
-        if (xfm.dsv4 != null and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+        if ((xfm.dsv4 != null or xfm.dsv41 != null or xfm.mlx_stream_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
             // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
             // snapshot rollback inside deepseek_v4.zig) may engage when the
             // checkpoint ships stages and the request is CLEAN (no
@@ -2546,19 +2717,31 @@ pub const Generator = struct {
             // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
             // remain hard-off regardless: their verify forwards go through
             // machinery this arch cannot roll back.
-            const mdl_ds = xfm.dsv4.?;
-            const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
-            const arm = dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
-            if (mdl_ds.n_mtp > 0 and !dspark_env_off and arm != .off) {
+            const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
+            const dspark_env_off = !dsparkEnabled();
+            const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
+                DsparkArm.off
+            else
+                dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
+            // mlx-stream's lane samples a sampled request itself, from the request's own settings.
+            const lane_sampling: ?mlx_stream.SamplingParams = if (dspark_env_off or arm == .off) null else .{
+                .temperature = sampling.temperature,
+                .top_p = sampling.top_p,
+                .top_k = sampling.top_k,
+                .min_p = sampling.min_p,
+                .seed = sampling.seed orelse 0,
+            };
+            const lane_arms = if (xfm.mlx_stream_ext) |m| mlx_stream.arm(m, lane_sampling) else true;
+            if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off and lane_arms) {
                 dspark_active = true;
                 dspark_stochastic = arm == .stochastic;
                 if (dspark_stochastic) {
-                    log.info("  spec=dspark (stochastic; deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+                    log.info("  spec=dspark (stochastic; {s} native draft stages, block={d})\n", .{ xfm.config.model_type, ds_block });
                 } else {
-                    log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+                    log.info("  spec=dspark ({s} native draft stages, block={d})\n", .{ xfm.config.model_type, ds_block });
                 }
             } else {
-                log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
+                log.info("  spec=disabled ({s} serves serial-only)\n", .{xfm.config.model_type});
             }
             options.pld_enabled = false;
             options.drafter_enabled = false;
@@ -2575,18 +2758,6 @@ pub const Generator = struct {
         // `&ctx` to every forward call below; the cache/moe/ssm fields
         // mutate in-place through their pointers.
         var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
-
-        // Certified lm_head prune gate: the pruned projection proves the
-        // ARGMAX, not the tail distribution, so it may engage only when this
-        // request consumes nothing else — greedy (or top-1) sampling with no
-        // logit-modifying penalties, no per-token logprobs and no grammar
-        // mask. Mirrors the `logprobs>0 + grammar disable spec` precedent:
-        // no request gets slower, some get faster.
-        ctx.argmax_only = (sampling.temperature < 0.01 or sampling.top_k == 1) and
-            sampling.repeat_penalty == 1.0 and
-            sampling.presence_penalty == 0.0 and
-            sampling.constraint == null and
-            options.logprobs_n == 0;
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
@@ -2693,6 +2864,10 @@ pub const Generator = struct {
         // length so the snapshots stamp positions valid in the full original
         // sequence, not relative offsets inside the tail-only prefill.
         const ssm_cp_offset: usize = options.ssm_checkpoint_pos_offset;
+        // Gate for the dense low grid (#794): the same predicate as the
+        // checkpoint-retention `ssm_low_anchors` wiring. A non-gated arch keeps the
+        // coarsened stride's own boundary chunking — the grid adds it no chunks.
+        const dense_low_grid: bool = xfm.config.longCtxGated();
 
         // Qwen native MTP: build the head's committed-history KV cache during
         // prefill. Entry j pairs (trunk hidden at prompt position j, token at
@@ -2758,7 +2933,7 @@ pub const Generator = struct {
         var dfl_cl: transformer_mod.CaptureLayers = undefined;
         if (dflash_active) {
             dfl_out_buf = try allocator.alloc(mlx.mlx_array, options.dflash.?.config.target_layer_ids.len);
-            dfl_cl = .{ .ids = options.dflash.?.config.target_layer_ids, .out = dfl_out_buf };
+            dfl_cl = .{ .ids = options.dflash.?.config.captureIds(), .out = dfl_out_buf };
         }
 
         // Start of the final (logits) forward's token span. Without SSM
@@ -2768,7 +2943,7 @@ pub const Generator = struct {
         // where the next turn's prefix match can actually reach it (see
         // ssmSnapshotBackoff), and the final forward covers the held-back
         // tail + the last token in the same weight sweep.
-        var final_start: usize = prompt_ids.len - 1;
+        var final_start: usize = if (xfm.prefillsWholePrompt()) 0 else prompt_ids.len - 1;
         // Chunked vision prefill (issue #197): placeholder rows consumed by
         // completed chunks, fed to ctx.vision_splice_offset per forward
         // (chunk loop AND final-span forward). Stays 0 on the kill-switch arm
@@ -2780,7 +2955,7 @@ pub const Generator = struct {
             .width_max = @intCast(PREFILL_CHUNK),
         };
 
-        if (prompt_ids.len > 1) {
+        if (final_start > 0) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
             const loop_end = prefix_len - snapshot_backoff;
@@ -2881,7 +3056,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
+                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -2933,6 +3108,10 @@ pub const Generator = struct {
                     defer _ = mlx.mlx_array_free(last_unused);
                     break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
                 } else try xfm.forwardWith(&ctx, chunk_input);
+                if (options.prompt_logprobs) |out| promptLogprobs(allocator, chunk_logits, prompt_ids[pos + 1 .. end + 1], options.logprobs_n, xfm.s, out) catch |err| {
+                    _ = mlx.mlx_array_free(chunk_logits);
+                    return err;
+                };
                 _ = mlx.mlx_array_free(chunk_logits);
                 if (dflash_active) {
                     ctx.capture_layers = null;
@@ -3024,7 +3203,7 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
+                if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid)) {
                     const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
@@ -3045,7 +3224,12 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            transformer_mod.ssmCheckpointDropIndexLowAnchored(
+                                ssm_checkpoints.items,
+                                cp_thin,
+                                null,
+                                options.ssm_low_anchors,
+                            ),
                         );
                         dropped.deinit(allocator);
                     }
@@ -3162,7 +3346,12 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            transformer_mod.ssmCheckpointDropIndexLowAnchored(
+                                ssm_checkpoints.items,
+                                cp_thin,
+                                null,
+                                options.ssm_low_anchors,
+                            ),
                         );
                         dropped.deinit(allocator);
                     }
@@ -3268,6 +3457,11 @@ pub const Generator = struct {
                 _ = mlx.mlx_array_free(a.*);
                 a.* = .{ .ctx = null };
             }
+        }
+        if (options.prompt_logprobs) |out| {
+            errdefer _ = mlx.mlx_array_free(raw_logits);
+            try promptLogprobs(allocator, raw_logits, prompt_ids[final_start + 1 ..], options.logprobs_n, xfm.s, out);
+            if (out.items.len != prompt_ids.len - 1) return error.PromptLogprobsUnavailable;
         }
         // Slice to the last position when the span is longer than one token,
         // so downstream sampling/grammar paths see the classic shape.
@@ -3419,7 +3613,8 @@ pub const Generator = struct {
                 .dflash = if (dflash_active) options.dflash else null,
                 .dflash_ctx = dflash_ctx,
                 .dflash_block_size = dflash_bs,
-                .dflash_chooser = if (dflash_active and dflashChooserEnabled())
+                .dflash_pol = if (dflash_active and options.dflash_policy) .{ .pin_rows = @intCast(@min(readEnvUsize("MLX_SERVE_DFLASH_ROWS", 0), dflash_policy.MAX_ROWS)) } else null,
+                .dflash_chooser = if (dflash_active and dflashChooserEnabled() and !options.dflash_policy)
                     round_cost.WidthChooser.init(@max(dflash_bs, 2) - 1, options.dflash.?.config.block_size -| 1)
                 else
                     null,
@@ -3731,6 +3926,7 @@ pub const Generator = struct {
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
         // A GPU-arm PLE settle still owed dies with the slot's history (the finish settled it first when the cache kept it).
         self.xfm.discardDeferredPle(&self.ctx);
+        for (&self.ssm_lag) |*lag| lag.deinit(self.xfm.allocator);
         if (group_planner.enabled() and self.mtp_planner_owned) log.info("[mtp-planner-stats] tokens={d} plain={d} prime={d} spec={d} probes={d} max_gap_ms={d:.2} recovery={d}\n", .{ self.completion_tokens, self.mtp_planner_plain_ticks, self.mtp_planner_prime_ticks, self.mtp_planner_spec_rounds, self.mtp_planner_probes, self.mtp_planner_max_gap_ms, self.mtp_planner_recovery.rounds });
         if (self.last_logprob) |*lp| {
             allocator.free(lp.top_logprobs);
@@ -3764,6 +3960,10 @@ pub const Generator = struct {
             dc.deinit();
             self.dflash_ctx = null;
         }
+        for (self.dflash_pending.items) |a| _ = mlx.mlx_array_free(a);
+        self.dflash_pending.deinit(allocator);
+        self.dflash_pending = .empty;
+        self.dflash_pending_rounds = 0;
         if (self.mtp_hist_stash) |*st| {
             st.deinit();
             self.mtp_hist_stash = null;
@@ -4071,23 +4271,40 @@ pub const Generator = struct {
         }
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
         if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
-        const mdl = self.xfm.dsv4.?;
+        if (self.xfm.mlx_stream_ext) |m| {
+            const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+            const r = try mlx_stream.round(m, allocator, self.next_token_id, cap);
+            return self.commitDsparkRound(allocator, .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token }, mlx_stream.position(m));
+        }
+        if (self.xfm.dsv41) |mdl| return self.dsparkStep(allocator, dsv41_mod, mdl);
+        return self.dsparkStep(allocator, dsv4_mod, self.xfm.dsv4.?);
+    }
+
+    /// One DSpark round on module `mod` (deepseek_v4 or deepseek_v41, which
+    /// share the round API) and its bookkeeping on the Generator.
+    fn dsparkStep(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype) !?DrafterStepResult {
         const t1 = self.next_token_id;
         const accepted_cap = capAcceptedForTokenBudget(
             std.math.maxInt(u32),
             self.completion_tokens,
             self.max_tokens,
         );
-        var round = if (self.dspark_stochastic)
-            try self.dsparkStochasticRound(allocator, mdl, t1, accepted_cap)
+        const round = if (self.dspark_stochastic)
+            try self.dsparkStochasticRound(allocator, mod, mdl, t1, accepted_cap)
         else
-            try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
+            try mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
+        return self.commitDsparkRound(allocator, round, mdl.dec_state.?.n);
+    }
+
+    /// A draft round's bookkeeping; the module stands at `position`.
+    fn commitDsparkRound(self: *Generator, allocator: std.mem.Allocator, round_in: dsv4_mod.DsparkRound, position: usize) !?DrafterStepResult {
+        var round = round_in;
         errdefer round.deinit(allocator);
-        // dsparkRound advanced the module state — mirror it on the shell
+        // The round advanced the module state — mirror it on the shell
         // cache verbatim so a later serial fallback (or the fresh-request
         // check keying on step==0) sees a consistent position. Generator.step
         // itself moves through advanceStep below (the clear-cadence clock).
-        self.ctx.cache.step = mdl.dec_state.?.n;
+        self.ctx.cache.step = position;
         self.dspark_attempted += 1;
         self.dspark_accepted_tokens += round.accepted;
         try self.generated_ids.appendSlice(allocator, round.tokens);
@@ -4095,6 +4312,13 @@ pub const Generator = struct {
         self.next_token_id = round.next_token;
         // tokens ownership transfers to the caller (scheduler frees).
         return DrafterStepResult{ .tokens = round.tokens, .accepted_tokens = round.accepted };
+    }
+
+    /// This request's sampling for one more draw: a seeded request keys each draw apart (`seedKey`).
+    fn nextDraw(self: *Generator) SamplingParams {
+        const sp = self.sampling;
+        self.sampling.draw +%= 1;
+        return sp;
     }
 
     /// One stochastic DSpark round: dsv4's own greedy stage draft (a one-hot
@@ -4108,9 +4332,9 @@ pub const Generator = struct {
     /// (the toy-vocab exactness test's invariant), and the correction always
     /// derives from the ORIGINAL verify logits at the acceptance point — the
     /// house partial-accept invariant in sampled form.
-    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4_mod.Dsv4Model, t1: u32, accepted_cap: u32) !dsv4_mod.DsparkRound {
+    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32) !mod.DsparkRound {
         const s = self.xfm.s;
-        var pending = try dsv4_mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
+        var pending = try mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
         defer pending.deinit();
         const b: u32 = @intCast(pending.b);
 
@@ -4119,7 +4343,8 @@ pub const Generator = struct {
         var vl3 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(vl3);
         try mlx.check(mlx.mlx_reshape(&vl3, pending.vl_g, &vshape, 3, s));
-        const probs_all = try probsAllPositions(vl3, self.sampling, s);
+        const sp = self.nextDraw();
+        const probs_all = try probsAllPositions(vl3, sp, s);
         defer _ = mlx.mlx_array_free(probs_all);
 
         var accepted: u32 = 0;
@@ -4131,11 +4356,11 @@ pub const Generator = struct {
             var log_p = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(log_p);
             try mlx.check(mlx.mlx_log(&log_p, probs_all, s));
-            const null_key = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(null_key);
+            const key = seedKey(sp);
+            defer _ = mlx.mlx_array_free(key);
             var sampled = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(sampled);
-            try mlx.check(mlx.mlx_random_categorical(&sampled, log_p, -1, null_key, s));
+            try mlx.check(mlx.mlx_random_categorical(&sampled, log_p, -1, key, s));
             var samp_i = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(samp_i);
             try mlx.check(mlx.mlx_astype(&samp_i, sampled, .int32, s));
@@ -4157,7 +4382,7 @@ pub const Generator = struct {
                 draft_arrs[k] = mlx.mlx_array_new_data(&idv, &idshape, 1, .int32);
                 n_arrs += 1;
             }
-            var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..pending.b], null, b, .{}, s);
+            var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..pending.b], null, b, sp, s);
             defer bg.deinit();
 
             // ONE bounded sync: the accept vector + pre-sampled corrections
@@ -4186,8 +4411,8 @@ pub const Generator = struct {
         }
         pending.lapVerify(mdl);
 
-        const round = try dsv4_mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, accepted, next_token);
-        dsv4_mod.dsparkObserve(mdl, round.phases);
+        const round = try mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, accepted, next_token);
+        mod.dsparkObserve(mdl, round.phases);
         return round;
     }
 
@@ -5129,8 +5354,9 @@ pub const Generator = struct {
     /// hiddens, anchor row DROPPED — reference `[:, 1:]`); sampled requests
     /// use the same one-hot Leviathan acceptance the drafter/PLD paths use.
     pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-        // The budget's last token is the previous verify's: emit it without a round.
-        if (!self.done and !self.spec_disabled_runtime and self.max_tokens -| self.completion_tokens == 1) {
+        // The budget's last token is the previous verify's: emit it without a round. (A pipelined plain
+        // stretch has no such token: its last one comes out of `next`.)
+        if (!self.done and !self.spec_disabled_runtime and self.max_tokens -| self.completion_tokens == 1 and !self.has_pending_logits and !self.has_pending_token) {
             if (try self.checkStop()) return null;
             const tokens = try allocator.alloc(u32, 1);
             errdefer allocator.free(tokens);
@@ -5152,13 +5378,14 @@ pub const Generator = struct {
         // the "no spec" candidate a width chooser needs).
         const dflash_gen_before = self.generated_ids.items.len;
         self.dflash_round_width = 0;
-        const dflash_rounds_before: u64 = if (self.dflash_chooser) |ch| ch.rounds else self.dflash_attempted;
+        self.dflash_unobserved = false;
+        const dflash_rounds_before: u64 = if (self.dflash_chooser) |ch| ch.rounds else self.dflash_attempted + self.dflash_plain;
         defer {
             const ms = @as(f32, @floatFromInt(dflash_kv_watch.read())) / @as(f32, std.time.ns_per_ms);
             const emitted = self.generated_ids.items.len - dflash_gen_before;
             const post_warmup = dflash_rounds_before >= dflashGateWarmup();
             const wall = if (post_warmup) self.mtpRegimeWallMs(ms) else ms;
-            self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0, false);
+            self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0 and !self.dflash_unobserved, false);
             if (self.dflash_chooser) |*ch| ch.note(self.dflash_round_width);
         }
         if (self.done) return null;
@@ -5178,6 +5405,15 @@ pub const Generator = struct {
             const tokens = try allocator.alloc(u32, 1);
             tokens[0] = tok_opt.?;
             return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+        }
+
+        // The round policy: a plain tick runs on the serial pipeline; every other round starts from the drained state.
+        var policy_draft = true;
+        if (self.dflash_pol) |*pol| {
+            policy_draft = pol.drafting.shouldDraft();
+            if (!policy_draft and self.dflashCanPipeline()) return try self.dflashPlainPipelined(allocator);
+            pol.plain_watch = null;
+            if (self.has_pending_logits or self.has_pending_token) return try self.dflashLeavePipeline(allocator);
         }
 
         // Per-round width: the chooser's argmax over measured tokens/ms
@@ -5205,8 +5441,11 @@ pub const Generator = struct {
                 }
             }
         }
+        // The round policy replaces the chooser and the serial fallback: a round with no drafts is the verify
+        // forward at one row, so DFlash resumes whenever drafting pays again.
+        if (self.dflash_pol != null and !policy_draft) round_width = 0;
         self.dflash_round_width = round_width;
-        if (round_width == 0) {
+        if (round_width == 0 and self.dflash_pol == null) {
             const tok_opt = try self.next(allocator);
             if (tok_opt == null) return null;
             const tokens = try allocator.alloc(u32, 1);
@@ -5220,8 +5459,9 @@ pub const Generator = struct {
         const s = xfm.s;
         const model = self.dflash.?;
         const dctx = &self.dflash_ctx.?;
-        const bs: u32 = round_width + 1;
-        const m: u32 = bs - 1;
+        // Drafts the assistant proposes (0 = a plain round) and drafts the verify carries: the policy may keep fewer.
+        const m_draft: u32 = round_width;
+        var m: u32 = m_draft;
         const t1: u32 = self.next_token_id;
         // On the moe/GDN path positions come from moe_seq_offset (cache.step
         // is a bookkeeping counter the model never reads there — same rule as
@@ -5235,7 +5475,9 @@ pub const Generator = struct {
         const hybrid_path = self.xfm.hybrid_layers != null;
         const anchor_pos: usize = if (moe_path or hybrid_path) self.ctx.moe_seq_offset.* else self.ctx.cache.step;
         const kv_step_snap = self.ctx.cache.step;
-        std.debug.assert(dctx.absLen() == anchor_pos);
+        // A drafted round reads the whole context: whatever the plain rounds parked joins it first.
+        if (m_draft > 0) try self.dflashFlushPending(allocator);
+        std.debug.assert(dctx.absLen() + self.dflash_pending_rounds == anchor_pos);
 
         const tracing = dflashTraceEnabled();
         var ph: io_util.Stopwatch = undefined;
@@ -5256,6 +5498,11 @@ pub const Generator = struct {
         // drawn with the verify row's key, rows kept only while they match.
         const serial = self.sampling.keyed and self.sampling.temperature > 0.01 and self.sampling.seed != null;
         const stochastic = self.sampling.temperature > 0.01 and !serial;
+        // Prefix snapshots keep assistant K/V without the LiLiCorr anchor.
+        // A plain round supplies a fresh committed row for the next draft.
+        if (m_draft == 0 or (model.lilicorr != null and dctx.anchor.ctx == null))
+            return try self.dflashPlainRound(allocator, t1, serial, stochastic);
+        if (self.dflash_pol != null) if (try self.dflashCopyRound(allocator, t1, anchor_pos, kv_step_snap, serial, stochastic, tracing, &ph, dflash_kv_watch)) |res| return res;
         // DFlash2 path selector: when the sidecar ships one, drafts come from
         // the pairwise-scored path trace instead of per-position argmax /
         // block sampling. Greedy requests keep the byte-equality bar (a
@@ -5271,7 +5518,7 @@ pub const Generator = struct {
         // is what the head is for — dropping it drafts every position from
         // an uncorrected distribution the sidecar was never trained to emit.
         const use_markov = model.markov != null and dflashMarkovEnabled();
-        const tree_round = use_selector and !use_markov and (serial or !stochastic) and xfm.specTreeSupported();
+        const tree_round = use_selector and !use_markov and (serial or !stochastic) and xfm.specTreeSupported() and self.dflash_pol == null;
         // A continuation the context backs long enough to fill the tree is
         // verified as the round's chain, with no assistant forward.
         if (tree_round and self.dflash_copy_silent > 0) {
@@ -5291,7 +5538,12 @@ pub const Generator = struct {
         // DFlash reads mask rows 1..bs-1 (anchor row dropped), DSpark reads
         // ALL rows starting at the anchor — so DSpark needs only m noise rows
         // for the same m drafts and the same verify width.
-        const noise_rows: u32 = if (model.config.anchor_row_drafts) m else bs;
+        const noise_rows: u32 = if (model.lilicorr != null)
+            model.config.block_size
+        else if (model.config.anchor_row_drafts)
+            m_draft
+        else
+            m_draft + 1;
         const noise_ids = try allocator.alloc(i32, noise_rows);
         defer allocator.free(noise_ids);
         noise_ids[0] = @intCast(t1);
@@ -5313,6 +5565,49 @@ pub const Generator = struct {
         const draft_logits_all = try model.draftLogits(xfm, blk_hidden);
         defer _ = mlx.mlx_array_free(draft_logits_all);
 
+        if (model.lilicorr) |*hd| {
+            const slots: u32 = model.config.block_size - 1;
+            if (m > slots) m = slots;
+            var slot_logits = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(slot_logits);
+            const vocab = mlx.getShape(draft_logits_all)[2];
+            const start = [_]c_int{ 0, 1, 0 };
+            const stop = [_]c_int{ 1, 1 + @as(c_int, @intCast(slots)), vocab };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&slot_logits, draft_logits_all, &start, 3, &stop, 3, &strides, 3, s));
+            const ids = try hd.draft(allocator, .{ .ctx = xfm, .call = embedTrunk }, dctx.anchor, blk_hidden, slot_logits, m);
+            defer allocator.free(ids);
+            const ids_i32 = try allocator.alloc(i32, m);
+            defer allocator.free(ids_i32);
+            for (ids, ids_i32) |v, *dst| dst.* = @intCast(v);
+            const row_shape = [_]c_int{ 1, @as(c_int, @intCast(m)) };
+            const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(host_arr);
+            var lili_ids = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(lili_ids);
+            try mlx.check(mlx.mlx_array_set(&lili_ids, host_arr));
+            if (tracing) {
+                try mlx.check(mlx.mlx_array_eval(lili_ids));
+                self.dflash_trace.add(.head, ph.read());
+                ph.reset();
+            }
+            return try self.dflashVerify(allocator, .{
+                .t1 = t1,
+                .m = m,
+                .m_draft = m_draft,
+                .anchor_pos = anchor_pos,
+                .kv_step_snap = kv_step_snap,
+                .serial = serial,
+                .stochastic = stochastic,
+                .tracing = tracing,
+                .ph = &ph,
+                .watch = dflash_kv_watch,
+                .draft_ids = lili_ids,
+                .sel_path = null,
+                .draft_q = .{ .ctx = null },
+            });
+        }
+
         // Slice the m draft rows: DFlash drops the anchor row (1..bs-1),
         // DSpark reads every row (0..m) — the anchor row IS draft 0.
         const dl_shape = mlx.getShape(draft_logits_all);
@@ -5321,7 +5616,7 @@ pub const Generator = struct {
         {
             const row0: c_int = if (model.config.anchor_row_drafts) 0 else 1;
             const start = [_]c_int{ 0, row0, 0 };
-            const stop = [_]c_int{ 1, row0 + @as(c_int, @intCast(m)), dl_shape[2] };
+            const stop = [_]c_int{ 1, row0 + @as(c_int, @intCast(m_draft)), dl_shape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
             try mlx.check(mlx.mlx_slice(&draft_logits, draft_logits_all, &start, 3, &stop, 3, &strides, 3, s));
         }
@@ -5421,9 +5716,20 @@ pub const Generator = struct {
                 self.prng.random(),
                 s,
             );
+            // The policy verifies the rows the selector's confidence pays for; none at all makes this a plain round.
+            if (self.dflash_pol != null) {
+                m = self.dflashPolicyRows(&sel_path.?, m_draft) - 1;
+                self.dflash_round_width = m;
+                if (m == 0) {
+                    self.dflash_unobserved = true;
+                    const plain = try self.dflashPlainRound(allocator, t1, serial, stochastic);
+                    self.dflashRecordDrafted(1, dflash_kv_watch.read());
+                    return plain;
+                }
+            }
             const ids_i32 = try allocator.alloc(i32, m);
             defer allocator.free(ids_i32);
-            for (sel_path.?.ids, ids_i32) |v, *d| d.* = @intCast(v);
+            for (sel_path.?.ids[0..m], ids_i32) |v, *d| d.* = @intCast(v);
             const row_shape = [_]c_int{ 1, @intCast(m) };
             const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(host_arr);
@@ -5455,6 +5761,64 @@ pub const Generator = struct {
             ph.reset();
         }
 
+        return try self.dflashVerify(allocator, .{
+            .t1 = t1,
+            .m = m,
+            .m_draft = m_draft,
+            .anchor_pos = anchor_pos,
+            .kv_step_snap = kv_step_snap,
+            .serial = serial,
+            .stochastic = stochastic,
+            .tracing = tracing,
+            .ph = &ph,
+            .watch = dflash_kv_watch,
+            .draft_ids = draft_ids,
+            .sel_path = if (sel_path) |*sp| sp else null,
+            .draft_q = draft_q,
+        });
+    }
+
+    /// What a DFlash round's verify needs from its draft: the drafts as an int32 `[1, m]` array, the selector's
+    /// path (its confidences and q) when there is one, and the density they were drawn from when sampled.
+    const VerifyIn = struct {
+        t1: u32,
+        m: u32,
+        m_draft: u32,
+        anchor_pos: usize,
+        kv_step_snap: usize,
+        serial: bool,
+        stochastic: bool,
+        tracing: bool,
+        ph: *io_util.Stopwatch,
+        watch: io_util.Stopwatch,
+        draft_ids: mlx.mlx_array,
+        sel_path: ?*dflash_mod.SelectedPath,
+        draft_q: mlx.mlx_array,
+    };
+
+    /// Phases 2-4 of a DFlash round: verify `[t1, drafts]` with the layer taps, accept, roll back and commit.
+    fn dflashVerify(self: *Generator, allocator: std.mem.Allocator, r: VerifyIn) !DrafterStepResult {
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const model = self.dflash.?;
+        const dctx = &self.dflash_ctx.?;
+        const moe_path = xfm.moe_layers != null;
+        const hybrid_path = xfm.hybrid_layers != null;
+        const t1 = r.t1;
+        const m = r.m;
+        const m_draft = r.m_draft;
+        const anchor_pos = r.anchor_pos;
+        const kv_step_snap = r.kv_step_snap;
+        const serial = r.serial;
+        const stochastic = r.stochastic;
+        const tracing = r.tracing;
+        const ph = r.ph;
+        const dflash_kv_watch = r.watch;
+        const draft_ids = r.draft_ids;
+        const sel_path = r.sel_path;
+        const draft_q = r.draft_q;
+        const bs: u32 = m + 1;
+
         // ── Phase 2: verify input [t1, drafts...] — [1, bs] int32, lazy ──
         const t1_i32: i32 = @intCast(t1);
         const t1_shape = [_]c_int{ 1, 1 };
@@ -5478,7 +5842,7 @@ pub const Generator = struct {
             allocator.free(cap_out);
         }
         for (cap_out) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
         // Per-position SSM capture on a GDN trunk so partial accept can roll
@@ -5547,8 +5911,8 @@ pub const Generator = struct {
         }
         var drafts = try allocator.alloc(u32, m);
         errdefer allocator.free(drafts);
-        if (sel_path) |*sp| {
-            @memcpy(drafts, sp.ids);
+        if (sel_path) |sp| {
+            @memcpy(drafts, sp.ids[0..m]);
         } else {
             try mlx.check(mlx.mlx_array_eval(draft_ids));
             const draft_data = mlx.mlx_array_data_int32(draft_ids) orelse return error.MlxArrayDataNull;
@@ -5567,10 +5931,10 @@ pub const Generator = struct {
                     const q_row = try sliceProbRow(draft_q, k, s);
                     defer _ = mlx.mlx_array_free(q_row);
                     break :blk specAcceptProb(p_draft, try probAt(q_row, drafts[k], s));
-                } else if (sel_path) |*sp| blk: {
+                } else if (sel_path) |sp| blk: {
                     // Selector-sampled draft: q is the traced step's own
                     // candidate softmax — exact, no GPU read.
-                    const kk = sp.cand_ids.len / @as(usize, m);
+                    const kk = sp.cand_ids.len / @as(usize, m_draft);
                     break :blk specAcceptProb(p_draft, sp.q.?[@as(usize, k) * kk + sp.chosen_idx[k]]);
                 } else @min(1.0, p_draft);
                 const u: f32 = self.prng.random().float(f32);
@@ -5609,8 +5973,8 @@ pub const Generator = struct {
                     // sampled draft, and wrong silently.
                     const q_row = if (draft_q.ctx != null)
                         try sliceProbRow(draft_q, accepted, s)
-                    else if (sel_path) |*sp|
-                        try selectorQRow(sp, accepted, m, vl_shape[2], s)
+                    else if (sel_path) |sp|
+                        try selectorQRow(sp, accepted, m_draft, vl_shape[2], s)
                     else
                         try pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(q_row);
@@ -5711,6 +6075,17 @@ pub const Generator = struct {
         self.next_token_id = next_pending;
         self.advanceStep(@intCast(n_commit));
         if (self.dflash_chooser) |*ch| ch.observe(m, accepted, MTP_EV_EMA_BETA);
+        self.dflash_stats.record(m, accepted);
+        if (self.dflash_pol) |*pol| {
+            if (sel_path) |sp| {
+                for (sp.conf[0..m], 0..) |c, k| {
+                    if (k > accepted) break;
+                    pol.calib.observe(c, k < accepted);
+                }
+                if (log.enabled(.debug)) self.logDflashRound(sp.conf[0..m_draft], m, accepted);
+            }
+        }
+        self.dflashRecordDrafted(n_commit, dflash_kv_watch.read());
         // The calibrated sticky gate stays as the bootstrap that gets serial
         // MEASURED (the chooser picks serial only from a measured w0 cell).
         self.checkDflashRuntimeGate();
@@ -5728,6 +6103,286 @@ pub const Generator = struct {
             .tokens = tokens,
             .accepted_tokens = accepted,
         };
+    }
+
+    var dflash_copy_off_cache: ?bool = null;
+    /// `MLX_SERVE_DFLASH_COPY=0` drafts only from the assistant (the A/B arm for copied continuations).
+    fn dflashCopyOff() bool {
+        if (dflash_copy_off_cache) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_DFLASH_COPY");
+        const off = raw != null and raw.?[0] == '0';
+        dflash_copy_off_cache = off;
+        return off;
+    }
+
+    /// Longest copied continuation a round verifies: the fused row kernels reach 16 rows.
+    const DFLASH_COPY_MAX: u32 = dflash_policy.MAX_DRAFTS;
+
+    /// A round whose drafts are the context's own continuation after `t1` (an echo, an edit, a repeated block):
+    /// no assistant forward, and as many rows as the cost ladder and the copies' record pay for.
+    fn dflashCopyRound(self: *Generator, allocator: std.mem.Allocator, t1: u32, anchor_pos: usize, kv_step_snap: usize, serial: bool, stochastic: bool, tracing: bool, ph: *io_util.Stopwatch, watch: io_util.Stopwatch) !?DrafterStepResult {
+        if (dflashCopyOff()) return null;
+        const pol = &self.dflash_pol.?;
+        const idx = try self.mtpLookupIndex(allocator);
+        const found = idx.matchBest(t1, DFLASH_COPY_MAX) orelse return null;
+        if (found.suffix < mtp_lookup.MIN_SUFFIX or found.draft.len == 0) return null;
+        var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+        const avail: usize = @min(found.draft.len, p.len, @as(usize, self.max_tokens -| self.completion_tokens -| 1));
+        if (avail == 0) return null;
+        @memset(p[0..avail], pol.copy.probability(found.suffix));
+        const costs = dflash_policy.priorCosts(pol.plain.ms);
+        const rows = self.dflashRowsFor(p[0..avail], &costs);
+        if (rows < 2) return null;
+        const m: u32 = rows - 1;
+        var ids: [dflash_policy.MAX_DRAFTS]i32 = undefined;
+        for (found.draft[0..m], ids[0..m]) |t, *d| d.* = @intCast(t);
+        const draft_ids = mlx.mlx_array_new_data(&ids, &[_]c_int{ 1, @intCast(m) }, 2, .int32);
+        defer _ = mlx.mlx_array_free(draft_ids);
+        self.dflash_round_width = m;
+        const suffix = found.suffix;
+        const res = try self.dflashVerify(allocator, .{
+            .t1 = t1,
+            .m = m,
+            .m_draft = m,
+            .anchor_pos = anchor_pos,
+            .kv_step_snap = kv_step_snap,
+            .serial = serial,
+            .stochastic = stochastic,
+            .tracing = tracing,
+            .ph = ph,
+            .watch = watch,
+            .draft_ids = draft_ids,
+            .sel_path = null,
+            .draft_q = .{ .ctx = null },
+        });
+        pol.copy.observe(suffix, m, res.accepted_tokens);
+        log.debug("  [dflash-copy] suffix={d} avail={d} drafts={d} accepted={d}\n", .{ suffix, avail, m, res.accepted_tokens });
+        self.dflash_copies += 1;
+        self.dflash_copy_drafted += m;
+        self.dflash_copy_accepted += res.accepted_tokens;
+        return res;
+    }
+
+    /// Parked captures per target layer before a plain stretch appends them anyway (a stretch the
+    /// policy's backoff allows is at most 32 rounds; this bounds the parked arrays whatever the caller does).
+    const DFLASH_PENDING_MAX: u32 = 32;
+
+    /// A plain DFlash round: t1 through the trunk alone, the verify forward at one row. Its captures
+    /// are parked in `dflash_pending` and join the assistant context with the next drafted round's append.
+    fn dflashPlainRound(self: *Generator, allocator: std.mem.Allocator, t1: u32, serial: bool, stochastic: bool) !DrafterStepResult {
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const model = self.dflash.?;
+        self.dflash_round_width = 0;
+
+        const t1_i32: i32 = @intCast(t1);
+        const t1_arr = mlx.mlx_array_new_data(&t1_i32, &[_]c_int{ 1, 1 }, 2, .int32);
+        defer _ = mlx.mlx_array_free(t1_arr);
+        const caps = try allocator.alloc(mlx.mlx_array, model.config.target_layer_ids.len);
+        defer {
+            for (caps) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(caps);
+        }
+        for (caps) |*a| a.* = mlx.mlx_array_new();
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps };
+        self.ctx.capture_layers = &cl;
+        self.ctx.capture_ssm_seq = false; // one row never rolls back
+        const forward = xfm.forwardWith(&self.ctx, t1_arr);
+        self.ctx.capture_layers = null;
+        const logits = try forward;
+        defer _ = mlx.mlx_array_free(logits);
+
+        // The captures are no dependency of the logits: evaluate them with the next token, or the
+        // forward's streams stay alive behind them.
+        const eval_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(eval_vec);
+        for (caps) |c| _ = mlx.mlx_vector_array_append_value(eval_vec, c);
+        var picked: CommittedArgmax = .{};
+        defer picked.deinit();
+        const next_pending: u32 = blk: {
+            if (stochastic) {
+                const probs = try probsAtLastPos(logits, self.sampling, s);
+                defer _ = mlx.mlx_array_free(probs);
+                try mlx.check(mlx.mlx_async_eval(eval_vec));
+                break :blk try sampleFromProbs(probs, s);
+            }
+            picked = if (serial) try self.verifySerialSamples(logits, 1) else try verifyArgmax(logits, self.sampling.suppress_mask, s);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, picked.lazy());
+            try mlx.check(mlx.mlx_async_eval(eval_vec));
+            try mlx.check(mlx.mlx_array_eval(picked.lazy()));
+            break :blk @intCast((try picked.ids(1))[0]);
+        };
+        if (serial) self.sampling.draw = self.generated_ids.items.len + 2;
+
+        try self.dflashPark(allocator, caps);
+
+        const tokens = try allocator.alloc(u32, 1);
+        errdefer allocator.free(tokens);
+        tokens[0] = t1;
+        try self.generated_ids.append(allocator, t1);
+        self.dflash_plain += 1;
+        self.dflash_stats.record(0, 0);
+        self.next_token_id = next_pending;
+        self.advanceStep(1);
+        if (self.completion_tokens >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+        }
+        return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+    }
+
+    /// Park one forward's captures (and take them over: the caller's handles are left empty).
+    fn dflashPark(self: *Generator, allocator: std.mem.Allocator, caps: []mlx.mlx_array) !void {
+        try self.dflash_pending.appendSlice(allocator, caps);
+        for (caps) |*a| a.* = .{ .ctx = null };
+        self.dflash_pending_rounds += 1;
+        if (self.dflash_pending_rounds >= DFLASH_PENDING_MAX) try self.dflashFlushPending(allocator);
+    }
+
+    /// Whether a plain tick can ride the serial pipeline (`next`'s fast path).
+    fn dflashCanPipeline(self: *const Generator) bool {
+        return self.logprobs_n == 0 and !self.sampling.penalized() and self.sampling.constraint == null and self.step + 1 < self.max_tokens;
+    }
+
+    /// A plain tick on the serial pipeline: `next` overlaps the following forward with the host's work,
+    /// which a round of its own cannot. Its forwards carry the DFlash taps, parked like a plain round's.
+    fn dflashPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        const model = self.dflash.?;
+        const caps = try allocator.alloc(mlx.mlx_array, model.config.target_layer_ids.len);
+        defer {
+            for (caps) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(caps);
+        }
+        for (caps) |*a| a.* = mlx.mlx_array_new();
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps };
+        self.ctx.capture_layers = &cl;
+        defer self.ctx.capture_layers = null;
+        self.ctx.capture_ssm_seq = false; // one row never rolls back
+        // The stretch starts from the DFlash invariant (t1 not in the cache): forward it as `next`'s own bootstrap
+        // would, here with the taps, so `next` finds the pipeline seeded and runs only its lookahead.
+        if (!self.has_pending_logits and !self.has_pending_token) {
+            const t1_i32: i32 = @intCast(self.next_token_id);
+            const t1_arr = mlx.mlx_array_new_data(&t1_i32, &[_]c_int{ 1, 1 }, 2, .int32);
+            defer _ = mlx.mlx_array_free(t1_arr);
+            self.pending_logits = try self.xfm.forwardWith(&self.ctx, t1_arr);
+            self.has_pending_logits = true;
+            try self.dflashEvalPark(allocator, caps);
+        }
+        const tok = (try self.next(allocator)) orelse return null;
+        // The lookahead's forward (none on the budget's last token) is already queued; its taps are small work behind it.
+        if (caps[0].ctx != null) try self.dflashEvalPark(allocator, caps);
+        const tokens = try allocator.alloc(u32, 1);
+        tokens[0] = tok;
+        self.dflash_plain += 1;
+        self.dflash_stats.record(0, 0);
+        // Consecutive pipelined ticks are the machine's plain period; the first of a stretch has no predecessor.
+        const pol = &self.dflash_pol.?;
+        if (pol.plain_watch) |*w| pol.plain.sample(@as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms));
+        pol.plain_watch = io_util.Stopwatch.init(self.timer.io);
+        return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+    }
+
+    /// Evaluate a forward's taps (they are no dependency of its logits) and park them.
+    fn dflashEvalPark(self: *Generator, allocator: std.mem.Allocator, caps: []mlx.mlx_array) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (caps) |c| _ = mlx.mlx_vector_array_append_value(vec, c);
+        try mlx.check(mlx.mlx_async_eval(vec));
+        try self.dflashPark(allocator, caps);
+        for (caps) |*a| a.* = mlx.mlx_array_new();
+    }
+
+    /// A drafted round after a pipelined stretch: land on the spec entry invariant, one token of the stretch emitted.
+    fn dflashLeavePipeline(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        switch (try self.drainPipelineForSpec(allocator)) {
+            .drained => |tok| {
+                const tokens = try allocator.alloc(u32, 1);
+                tokens[0] = tok;
+                self.dflash_unobserved = true;
+                return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+            },
+            .stopped => return null,
+            .already_clean, .stay_disabled => return error.PipelineHalfState,
+        }
+    }
+
+    /// Append the plain rounds' parked captures to the assistant context as one block.
+    fn dflashFlushPending(self: *Generator, allocator: std.mem.Allocator) !void {
+        const rounds = self.dflash_pending_rounds;
+        if (rounds == 0) return;
+        const model = self.dflash.?;
+        const dctx = &self.dflash_ctx.?;
+        const n_t = model.config.target_layer_ids.len;
+        const merged = try allocator.alloc(mlx.mlx_array, n_t);
+        defer {
+            for (merged) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(merged);
+        }
+        for (merged) |*a| a.* = mlx.mlx_array_new();
+        for (merged, 0..) |*out, t| {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            for (0..rounds) |r| _ = mlx.mlx_vector_array_append_value(vec, self.dflash_pending.items[r * n_t + t]);
+            try mlx.check(mlx.mlx_concatenate_axis(out, vec, 1, self.xfm.s));
+        }
+        try dflash_mod.appendContext(model, dctx, merged, dctx.absLen());
+        for (self.dflash_pending.items) |a| _ = mlx.mlx_array_free(a);
+        self.dflash_pending.clearRetainingCapacity();
+        self.dflash_pending_rounds = 0;
+        const eval_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(eval_vec);
+        dctx.appendEvalArrays(eval_vec);
+        try mlx.check(mlx.mlx_async_eval(eval_vec));
+    }
+
+    /// The assistant context's length once the parked captures are counted: the trunk's cursor, always.
+    pub fn dflashContextLen(self: *const Generator) usize {
+        return self.dflash_ctx.?.absLen() + self.dflash_pending_rounds;
+    }
+
+    /// Bring the assistant context to the position `covers` (the committed prefix): parked captures appended, and a
+    /// pipelined lookahead's position dropped. A prefix-cache commit pairs the two only when they end together.
+    pub fn dflashSettle(self: *Generator, allocator: std.mem.Allocator, covers: usize) !void {
+        const dctx = if (self.dflash_ctx) |*d| d else return;
+        try self.dflashFlushPending(allocator);
+        if (dctx.absLen() > covers and covers >= dctx.base_pos) try dctx.cache.truncate(covers - dctx.base_pos, self.xfm.s);
+    }
+
+    /// Tell the drafting backoff what a drafted round bought: the plain rounds its tokens would have cost, and what it took.
+    fn dflashRecordDrafted(self: *Generator, tokens: usize, wall_ns: u64) void {
+        const pol = if (self.dflash_pol) |*p| p else return;
+        const wall_ms = @as(f32, @floatFromInt(wall_ns)) / @as(f32, std.time.ns_per_ms);
+        pol.drafting.record(@as(f32, @floatFromInt(tokens)) * self.dflashPlainMs(), wall_ms);
+    }
+
+    /// ms of a plain round for this request (policy rounds only).
+    fn dflashPlainMs(self: *const Generator) f32 {
+        return self.dflash_pol.?.plain.ms;
+    }
+
+    /// Rows to verify (t1 included) for drafts with acceptance probabilities `p`: the pin, else the best tokens per ms.
+    fn dflashRowsFor(self: *const Generator, p: []const f32, costs: *const dflash_policy.Costs) u32 {
+        const pol = &self.dflash_pol.?;
+        if (pol.pin_rows > 0) return @min(pol.pin_rows, @as(u32, @intCast(p.len)) + 1);
+        return dflash_policy.chooseRows(p, costs).rows;
+    }
+
+    /// Rows to verify (t1 included) for a draft whose per-position confidence the selector reports.
+    fn dflashPolicyRows(self: *Generator, sel: *const dflash_mod.SelectedPath, m_draft: u32) u32 {
+        const pol = &self.dflash_pol.?;
+        var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+        for (sel.conf[0..m_draft], p[0..m_draft]) |c, *out| out.* = pol.calib.probability(c);
+        const costs = dflash_policy.priorCosts(self.dflashPlainMs());
+        return self.dflashRowsFor(p[0..m_draft], &costs);
+    }
+
+    /// `[dflash-round]`: what the selector was sure of against what the target kept (the calibration's raw material).
+    fn logDflashRound(self: *const Generator, conf: []const f32, rows_drafts: u32, accepted: u32) void {
+        _ = self;
+        var buf: [160]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        for (conf, 0..) |c, k| w.print("{s}{d:.2}", .{ if (k == 0) "" else "/", c }) catch break;
+        log.debug("  [dflash-round] verified={d}/{d} accepted={d} conf={s}\n", .{ rows_drafts, conf.len, accepted, w.buffered() });
     }
 
     var dflash_tree_logged = false;
@@ -5847,7 +6502,7 @@ pub const Generator = struct {
             allocator.free(cap_out);
         }
         for (cap_out) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out };
         self.ctx.capture_layers = &cl;
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         self.ctx.tree = &spec_tree;
@@ -5980,10 +6635,11 @@ pub const Generator = struct {
         return DrafterStepResult{ .tokens = tokens, .accepted_tokens = accepted };
     }
 
-    /// Sticky like every DFlash serial switch: plain rounds do not extend the assistant context.
-    pub fn dflashYieldToCompany(self: *Generator) void {
-        if (self.dflash == null or self.spec_disabled_runtime) return;
-        log.info("  dflash=disabled (company: decoding plain in the batched group)\n", .{});
+    /// Decode plain in the batched group. Sticky for DFlash (plain rounds do not extend the
+    /// assistant context); PLD's periodic re-enable check resumes once the slot is solo.
+    pub fn yieldSpecToCompany(self: *Generator, mode: []const u8) void {
+        if (self.spec_disabled_runtime) return;
+        log.info("  {s}=disabled (company: decoding plain in the batched group)\n", .{mode});
         self.spec_disabled_runtime = true;
         self.spec_disable_reason = .company;
     }
@@ -5994,7 +6650,7 @@ pub const Generator = struct {
     /// ticks use the regular pipelined decoder through `nextDflash`'s entry
     /// fallback.
     fn checkDflashRuntimeGate(self: *Generator) void {
-        if (self.spec_disabled_runtime) return;
+        if (self.spec_disabled_runtime or self.dflash_pol != null) return;
         if (!dflashGateShouldDisable(
             self.dflash_attempted,
             self.dflash_accepted_tokens,
@@ -11741,6 +12397,38 @@ pub const Generator = struct {
         t.reset();
     }
 
+    /// Keep the recurrent state this pipelined step starts from, dropping the oldest. Solo slots
+    /// only: a live batched group's states are copies, and qwen4_exp's aux buffers are written in place.
+    fn pushSsmLag(self: *Generator) void {
+        const entries = self.ctx.ssm_entries orelse return;
+        if (self.xfm.config.isQwen4()) return;
+        for (entries) |*e| if (e.group) |g| if (g.live) return;
+        var oldest = self.ssm_lag[0];
+        self.ssm_lag[0] = self.ssm_lag[1];
+        self.ssm_lag[1] = .{};
+        for (oldest.snaps) |*s| ssmSnapshotDeinit(s);
+        if (oldest.snaps.len != entries.len) {
+            self.xfm.allocator.free(oldest.snaps);
+            oldest.snaps = self.xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len) catch return;
+        }
+        for (entries, oldest.snaps) |*e, *s| s.* = ssmSnapshot(e);
+        oldest.pos = self.ctx.moe_seq_offset.*;
+        self.ssm_lag[1] = oldest;
+    }
+
+    /// Restore the recurrent state a pipelined step started from at `pos` (the committed length), so
+    /// the finishing slot's live state is exactly what it commits. False when no kept step is there.
+    pub fn rollbackSsmTo(self: *Generator, pos: usize) bool {
+        const entries = self.ctx.ssm_entries orelse return false;
+        for (&self.ssm_lag) |*lag| {
+            if (lag.snaps.len != entries.len or lag.pos != pos) continue;
+            for (entries, lag.snaps) |*e, *s| ssmRestore(e, s) catch return false;
+            self.ctx.moe_seq_offset.* = pos;
+            return true;
+        }
+        return false;
+    }
+
     /// Returns the next token ID, or null when generation is finished.
     ///
     /// Pipeline architecture (matches mlx-lm's generator pattern):
@@ -11793,6 +12481,7 @@ pub const Generator = struct {
             defer if (!adopted) {
                 _ = mlx.mlx_array_free(lazy_token);
             };
+            self.pushSsmLag();
             if (lazyForward(self.xfm, &self.ctx, lazy_token)) |next_logits| {
                 defer if (!adopted) {
                     _ = mlx.mlx_array_free(next_logits);
@@ -14311,6 +15000,19 @@ pub fn computeEmbeddingsBatch(
     xfm: *Transformer,
     seqs: []const []const u32,
 ) ![][]f32 {
+    return computeEmbeddingsBatchWith(allocator, xfm, seqs, null);
+}
+
+/// `computeEmbeddingsBatch` for ONE sequence carrying image/video placeholders: `vision` holds the soft-token
+/// rows [1, n, hidden] of every item in prompt order, spliced in at the placeholder ids.
+pub fn computeEmbeddingsBatchWith(
+    allocator: std.mem.Allocator,
+    xfm: *Transformer,
+    seqs: []const []const u32,
+    vision: ?mlx.mlx_array,
+) ![][]f32 {
+    // The rows are consumed in sequence order by one scatter: they belong to a single prompt.
+    if (vision != null and seqs.len != 1) return error.MultimodalNeedsOneSequence;
     const results = try allocator.alloc([]f32, seqs.len);
     var filled: usize = 0;
     errdefer {
@@ -14337,7 +15039,7 @@ pub fn computeEmbeddingsBatch(
         };
         if (sub.len > 1) mask = try buildKeyPadMask(allocator, pb.lengths, pb.max_len, xfm.s);
 
-        const hidden = try xfm.forwardEmbeddingMasked(input, mask);
+        const hidden = try xfm.forwardEmbeddingMasked(input, mask, vision);
         defer _ = mlx.mlx_array_free(hidden);
 
         // Sentence-transformers pipeline order: pool (per the checkpoint's
@@ -14563,99 +15265,104 @@ fn firstTokenLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chose
 pub const MAX_TOP_LOGPROBS: u32 = 1024;
 
 fn computeLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_token: u32, top_n: u32, s: mlx.mlx_stream) !LogprobResult {
-    // log_softmax in f32: `log(softmax(x))` in the logits dtype rounds every
-    // probability to bf16/f16 before the log, and f16 underflows to -inf.
-    var logits32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(logits32);
-    try mlx.check(mlx.mlx_astype(&logits32, logits, .float32, s));
-    var lse = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(lse);
-    try mlx.check(mlx.mlx_logsumexp_axis(&lse, logits32, -1, true, s));
-    var log_probs = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(log_probs);
-    try mlx.check(mlx.mlx_subtract(&log_probs, logits32, lse, s));
+    // Every caller passes one position, as [1, V] or [1, 1, V].
+    const shape = mlx.getShape(logits);
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    try mlx.check(mlx.mlx_reshape(&row, logits, &[_]c_int{ 1, shape[shape.len - 1] }, 2, s));
+    var one: std.ArrayList(LogprobResult) = .empty;
+    defer one.deinit(allocator);
+    try rowLogprobs(allocator, row, &.{chosen_token}, top_n, s, &one);
+    return one.items[0];
+}
 
-    const lp_shape = mlx.getShape(log_probs);
-    const rank = lp_shape.len;
-    const vocab_size: usize = @intCast(lp_shape[rank - 1]);
-    const k: usize = @min(@as(usize, @min(top_n, MAX_TOP_LOGPROBS)), vocab_size);
+/// argpartition leaves the winners UNORDERED; ties break on the lower id so
+/// the ranking is deterministic run to run.
+fn rankedBefore(_: void, a: TokenLogprob, b: TokenLogprob) bool {
+    if (a.logprob != b.logprob) return a.logprob > b.logprob;
+    return a.token_id < b.token_id;
+}
 
-    // Top-k INDICES, carried alongside their values. Negating turns "k largest"
-    // into the "k smallest" that argpartition puts in the leading slots.
-    var neg = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(neg);
-    try mlx.check(mlx.mlx_negative(&neg, log_probs, s));
+/// Row r of `logits` ([rows, V]) scores `chosen[r]` and lists its `top_n` best; an id past
+/// the vocab scores -100. log_softmax is a per-row shift, so ranks and gathers read the f32
+/// logits and only the gathered values subtract the row's logsumexp. Every intermediate
+/// handle is gone before the one eval, so the peak is the top-k argpartition: its f32
+/// input, its indices and the sort's scratch, five [rows, V] 4-byte arrays (none at top_n 0).
+fn rowLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen: []const u32, top_n: u32, s: mlx.mlx_stream, out: *std.ArrayList(LogprobResult)) !void {
+    const shape = mlx.getShape(logits);
+    const rows: c_int = @intCast(chosen.len);
+    const vocab: usize = @intCast(shape[shape.len - 1]);
+    const k: usize = @min(@as(usize, @min(top_n, MAX_TOP_LOGPROBS)), vocab);
+    const clamped = try allocator.alloc(u32, chosen.len);
+    defer allocator.free(clamped);
+    for (chosen, clamped) |c, *d| d.* = @min(c, @as(u32, @intCast(vocab - 1)));
 
-    var part_idx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(part_idx);
-    try mlx.check(mlx.mlx_argpartition_axis(&part_idx, neg, @intCast(if (k == 0) 0 else k - 1), -1, s));
-
-    var start_buf: [8]c_int = @splat(0);
-    var stop_buf: [8]c_int = @splat(1);
-    var stride_buf: [8]c_int = @splat(1);
-    for (0..rank) |i| stop_buf[i] = lp_shape[i];
-    stop_buf[rank - 1] = @intCast(k);
-
-    var idx_k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(idx_k);
-    try mlx.check(mlx.mlx_slice(&idx_k, part_idx, &start_buf, rank, &stop_buf, rank, &stride_buf, rank, s));
-
-    var vals_raw = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(vals_raw);
-    try mlx.check(mlx.mlx_take_axis(&vals_raw, log_probs, idx_k, @intCast(rank - 1), s));
-
-    var vals_k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(vals_k);
-    try mlx.check(mlx.mlx_astype(&vals_k, vals_raw, .float32, s));
-
-    var ids_k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ids_k);
-    try mlx.check(mlx.mlx_astype(&ids_k, idx_k, .int32, s));
-
-    try mlx.check(mlx.mlx_array_eval(log_probs));
-    try mlx.check(mlx.mlx_array_eval(vals_k));
-    try mlx.check(mlx.mlx_array_eval(ids_k));
-
-    // Read the logprob of the chosen token from the full array
-    const lp_data = mlx.mlx_array_data_float32(log_probs);
-    const chosen_logprob: f32 = if (lp_data) |ptr|
-        (if (chosen_token < vocab_size) ptr[chosen_token] else -100.0)
-    else
-        -100.0;
-
-    const val_ptr = mlx.mlx_array_data_float32(vals_k);
-    const id_ptr = mlx.mlx_array_data_int32(ids_k);
-
-    var top_logprobs = try allocator.alloc(TokenLogprob, k);
-    errdefer allocator.free(top_logprobs);
-    var filled: usize = 0;
-    if (val_ptr) |vp| {
-        if (id_ptr) |ip| {
-            for (0..k) |i| {
-                const tid = ip[i];
-                if (tid < 0 or @as(usize, @intCast(tid)) >= vocab_size) continue;
-                top_logprobs[filled] = .{ .token_id = @intCast(tid), .logprob = vp[i] };
-                filled += 1;
-            }
+    var chosen_lp = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(chosen_lp);
+    var top_vals = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(top_vals);
+    var top_ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(top_ids);
+    {
+        // f32 first: the logits dtype rounds bf16/f16 before the log, and f16 underflows to -inf.
+        var logits32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(logits32);
+        try mlx.check(mlx.mlx_astype(&logits32, logits, .float32, s));
+        var lse = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lse);
+        try mlx.check(mlx.mlx_logsumexp_axis(&lse, logits32, -1, true, s));
+        const ids = mlx.mlx_array_new_data(@ptrCast(clamped.ptr), &[_]c_int{ rows, 1 }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        var picked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(picked);
+        try mlx.check(mlx.mlx_take_along_axis(&picked, logits32, ids, -1, s));
+        try mlx.check(mlx.mlx_subtract(&chosen_lp, picked, lse, s));
+        if (k > 0) {
+            // Ascending partition at V - k leaves the k largest in the tail.
+            var part = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(part);
+            try mlx.check(mlx.mlx_argpartition_axis(&part, logits32, @intCast(vocab - k), -1, s));
+            var idx = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(idx);
+            try mlx.check(mlx.mlx_slice(&idx, part, &[_]c_int{ 0, @intCast(vocab - k) }, 2, &[_]c_int{ rows, @intCast(vocab) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            var vals = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(vals);
+            try mlx.check(mlx.mlx_take_along_axis(&vals, logits32, idx, -1, s));
+            try mlx.check(mlx.mlx_subtract(&top_vals, vals, lse, s));
+            try mlx.check(mlx.mlx_astype(&top_ids, idx, .int32, s));
         }
     }
-    // argpartition leaves the winners UNORDERED; ties break on the lower id so
-    // the ranking is deterministic run to run.
-    std.mem.sort(TokenLogprob, top_logprobs[0..filled], {}, struct {
-        fn lt(_: void, a: TokenLogprob, b: TokenLogprob) bool {
-            if (a.logprob != b.logprob) return a.logprob > b.logprob;
-            return a.token_id < b.token_id;
-        }
-    }.lt);
+    const outs = [_]mlx.mlx_array{ chosen_lp, top_vals, top_ids };
+    const vec = mlx.mlx_vector_array_new_data(&outs, if (k > 0) 3 else 1);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
 
-    if (filled < top_logprobs.len) {
-        top_logprobs = allocator.realloc(top_logprobs, filled) catch top_logprobs;
+    const chosen_ptr = mlx.mlx_array_data_float32(chosen_lp) orelse return error.LogprobsUnreadable;
+    const val_ptr: [*]const f32 = if (k > 0) mlx.mlx_array_data_float32(top_vals) orelse return error.LogprobsUnreadable else undefined;
+    const id_ptr: [*]const i32 = if (k > 0) mlx.mlx_array_data_int32(top_ids) orelse return error.LogprobsUnreadable else undefined;
+    try out.ensureUnusedCapacity(allocator, chosen.len);
+    for (chosen, 0..) |id, r| {
+        const top = try allocator.alloc(TokenLogprob, k);
+        for (top, 0..) |*t, j| t.* = .{ .token_id = @intCast(id_ptr[r * k + j]), .logprob = val_ptr[r * k + j] };
+        std.mem.sort(TokenLogprob, top, {}, rankedBefore);
+        out.appendAssumeCapacity(.{ .token_logprob = if (id < vocab) chosen_ptr[r] else -100.0, .top_logprobs = top });
     }
+}
 
-    return .{
-        .token_logprob = chosen_logprob,
-        .top_logprobs = top_logprobs,
-    };
+/// Logprobs of a prompt's own tokens (`/v1/completions` echo): row r of `logits`
+/// ([1, S, V]) scores `next_ids[r]`, the token after it.
+pub fn promptLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, next_ids: []const u32, top_n: u32, s: mlx.mlx_stream, out: *std.ArrayList(LogprobResult)) !void {
+    if (next_ids.len == 0) return;
+    const shape = mlx.getShape(logits);
+    if (shape.len != 3 or shape[1] < next_ids.len) return error.PromptLogprobsUnavailable;
+    const rows: c_int = @intCast(next_ids.len);
+    var head = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(head);
+    try mlx.check(mlx.mlx_slice(&head, logits, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, rows, shape[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, head, &[_]c_int{ rows, shape[2] }, 2, s));
+    try rowLogprobs(allocator, flat, next_ids, top_n, s, out);
 }
 
 /// Apply a grammar token mask to logits. `mask[i]==true` keeps `logits[i]`,
@@ -16234,7 +16941,7 @@ fn walkChunkEnds(
     var n: usize = 0;
     while (pos < prefix_len and n < out.len) {
         const w = widths[@min(n, widths.len - 1)];
-        const end = nextChunkEnd(pos, prefix_len, w, want_ssm_cp, stride, offset, true);
+        const end = nextChunkEnd(pos, prefix_len, w, want_ssm_cp, stride, offset, true, false);
         out[n] = end;
         n += 1;
         pos = end;
@@ -16328,8 +17035,8 @@ test "tailMergeMax: the tail a chunk may absorb scales with the width" {
         try t.expect(tailMergeMax(w) * 8 <= w);
     }
 
-    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true));
-    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true, false));
+    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true, false));
 }
 
 test "the scaled tail-merge bound is gated on the per-chunk adaptive width" {
@@ -16345,15 +17052,15 @@ test "the scaled tail-merge bound is gated on the per-chunk adaptive width" {
     try t.expectEqual(tailMergeMaxFor(4096, false), tailMergeMaxFor(4096, true));
     try t.expectEqual(tailMergeMaxFor(8192, false), tailMergeMaxFor(8192, true));
 
-    try t.expectEqual(@as(usize, 812), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
-    try t.expectEqual(@as(usize, 1324), nextChunkEnd(0, 1324, 1024, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 1024), nextChunkEnd(0, 1324, 1024, false, 0, 0, true));
-    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 812), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true, false));
+    try t.expectEqual(@as(usize, 1324), nextChunkEnd(0, 1324, 1024, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 1024), nextChunkEnd(0, 1324, 1024, false, 0, 0, true, false));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true, false));
 
-    try t.expectEqual(@as(usize, 1), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 2), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 1), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 2), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, true, false));
 }
 
 test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
@@ -16362,39 +17069,142 @@ test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
     // FULL graph + eval-barrier + cache-clear for one token — pure overhead.
     // Without checkpoint alignment, remainders under the merge floor extend
     // the current chunk instead.
-    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, false, 0, 0, false, false));
     // A substantial remainder stays its own chunk.
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8192 + 600, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8192 + 600, 8192, false, 0, 0, false, false));
     // Mid-prompt chunks are untouched.
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0, false));
-    try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0, false, false));
+    try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0, false, false));
     // With SSM-checkpoint alignment active, a tiny tail STILL merges: the old
     // 1-token trailing chunk existed only to lay a snapshot one token before
     // the always-on end-of-prompt snapshot — pure overhead. A boundary strictly
     // INSIDE the chunk still wins over merging (next case).
-    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0, false));
-    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0, false));
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0, false, false));
+    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0, false, false));
 }
 
 test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
     const PREFILL_CHUNK: usize = 8192;
     // Non-hybrid (or checkpointing off): a sub-PREFILL_CHUNK prompt is ONE chunk.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0, false));
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0, false, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0, false, false));
     // Tail merge: one token past a chunk boundary is still ONE chunk.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0, false));
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0, false, false));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0, false, false));
     // Mechanically, a raw fine stride still splits an 851-token prefill into 4
     // chunks (851 spans boundaries 256/512/768) — which is why
     // effectiveSsmCheckpointStride coarsens every stride to the prefill chunk:
     // per-chunk costs (expert re-streaming on MoE, sub-dq-gemm-floor GEMMs +
     // fixed overhead everywhere) taxed cold prefill 17-25%.
-    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0, false));
+    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0, false, false));
     // Boundary alignment is ABSOLUTE (warm path passes an offset): a tail-only
     // prefill starting mid-sequence still snaps to global strides. offset=2000,
     // prefix tail of 200 (abs 2000..2200), stride 256 -> boundary 2048/2304? only
     // 2048 falls inside (2000..2200) -> 2 chunks.
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000, false));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000, false, false));
+}
+
+test "the gated dense low grid anchors the first 65536 under a coarse stride" {
+    // Gated on `longCtxGated` (#794): the capture predicate is stride multiples
+    // plus the 8192 anchors under the dense low top, so a deep entry's grid
+    // always answers a restore point for a fork inside the low band.
+    try testing.expect(ssmCapturePos(32_768, 8_192, true));
+    try testing.expect(ssmCapturePos(32_768, 24_576, true));
+    try testing.expect(ssmCapturePos(32_768, 32_768, true)); // stride multiple — same point as before
+    try testing.expect(ssmCapturePos(32_768, 65_536, true)); // the top itself still counts
+    try testing.expect(!ssmCapturePos(32_768, 40_959, true));
+    try testing.expect(!ssmCapturePos(32_768, 73_728, true)); // the high band keeps the coarse spacing
+    try testing.expect(!ssmCapturePos(0, 8_192, false)); // checkpointing off stays off
+    // A stride at or under 8192 (v8's dense grid) captures EXACTLY what it always
+    // did: the dense rule adds no point to a grid that already has this spacing.
+    for ([_]usize{ 256, 512, 1024, 2048, 4096, 8192 }) |fine| {
+        var x: usize = 0;
+        while (x <= 70_000) : (x += 1_023) {
+            try testing.expectEqual(x % fine == 0, ssmCapturePos(fine, x, true));
+        }
+    }
+    // Chunking drives the grid: a cold 40k prefill at width 4096 under stride
+    // 32768 (the production boot's coarsening) now snapshots exactly the four low
+    // points — driven through `nextChunkEnd`, the same fn the real prefill loop
+    // runs. (A prompt ending within the tail-merge floor of a multiple merges
+    // that boundary into the always-on end-of-prompt snapshot instead — the
+    // end snapshot at `prefix_len - 30` covers every fork the swallowed point
+    // could have served.)
+    var grid: [64]u32 = undefined;
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (true) {
+        const end = nextChunkEnd(pos, 40_000, 4_096, true, 32_768, 0, false, true);
+        if (ssmCapturePos(32_768, end, true)) {
+            grid[n] = @intCast(end);
+            n += 1;
+        }
+        pos = end;
+        if (pos >= 40_000) break;
+    }
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqual(@as(u32, 8_192), grid[0]);
+    try testing.expectEqual(@as(u32, 16_384), grid[1]);
+    try testing.expectEqual(@as(u32, 24_576), grid[2]);
+    try testing.expectEqual(@as(u32, 32_768), grid[3]);
+    // The coarse-stride prefill chunks EXACTLY like the v8 fine grid for this
+    // prompt: same boundaries, so the dense anchors cost zero extra chunks.
+    try testing.expectEqual(
+        prefillChunkCount(40_000, 4_096, true, 8_192, 0, false, true),
+        prefillChunkCount(40_000, 4_096, true, 32_768, 0, false, true),
+    );
+    // A chunk WIDER than the anchor spacing gets cut at the anchor (the snapshot
+    // may only stamp evaluated positions): a 32k-wide chunk from 6k ends at 8192.
+    try testing.expectEqual(@as(usize, 8_192), nextChunkEnd(6_000, 40_000, 32_768, true, 32_768, 0, false, true));
+    try testing.expectEqual(@as(usize, 16_384), nextChunkEnd(8_192, 40_000, 32_768, true, 32_768, 0, false, true));
+    // Inside the dense band the FIRST anchor wins the cut, ahead of any later
+    // stride boundary: a 32k-wide chunk from 40k ends at 40960, not 65536.
+    try testing.expectEqual(@as(usize, 40_960), nextChunkEnd(40_000, 100_000, 32_768, true, 32_768, 0, false, true));
+    // Past the top the cut stops and the high band keeps the coarse stride alone.
+    try testing.expectEqual(@as(usize, 98_304), nextChunkEnd(65_536, 100_000, 32_768, true, 32_768, 0, false, true));
+    // Fine strides never get an extra cut: the helper answers 0 at every stride
+    // the dense rule is inactive for, whatever the chunk geometry.
+    for ([_]usize{ 0, 256, 512, 1024, 2048, 4096, 8192 }) |fine| {
+        var p: usize = 1_234;
+        while (p < 70_000) : (p += 3_037) {
+            try testing.expectEqual(@as(usize, 0), ssmLowAnchorEnd(p, p + 4_096, 61, fine));
+        }
+    }
+}
+
+test "the dense low grid is gated: a non-gated arch at width 16384 keeps main's chunk count" {
+    // Same gate as the retention `ssm_low_anchors`: a non-gated hybrid whose
+    // stride coarsened to 16384 keeps its stride-boundary chunking — a warm
+    // restore landing off the 8192 grid must not get its chunks cut at every
+    // multiple below 65536 (each extra MoE chunk re-streams the experts).
+    // `main`'s chunk loop, re-derived here: cut at a stride boundary inside
+    // the chunk, else absorb a tail under `TAIL_MERGE_MAX`.
+    const t = testing;
+    const stride = effectiveSsmCheckpointStride(2048, 16_384);
+    try t.expectEqual(@as(usize, 16_384), stride);
+    const offset = 4_096; // off the anchor grid: a warm restore mid-sequence
+    const prefix_len: usize = 100_000 - offset;
+    var main_chunks: usize = 0;
+    var pos: usize = 0;
+    while (pos < prefix_len) {
+        var end: usize = @min(pos + stride, prefix_len);
+        const abs_pos: usize = pos + offset;
+        const abs_end: usize = end + offset;
+        const nb: usize = ((abs_pos / stride) + 1) * stride;
+        if (nb > abs_pos and nb < abs_end) end = nb - offset;
+        if (end < prefix_len and prefix_len - end < TAIL_MERGE_MAX) end = prefix_len;
+        main_chunks += 1;
+        pos = end;
+    }
+    // Ungated: the count is main's, at fixed and adaptive width alike.
+    try t.expect(main_chunks > 0);
+    try t.expectEqual(main_chunks, prefillChunkCount(prefix_len, stride, true, stride, offset, false, false));
+    try t.expectEqual(main_chunks, prefillChunkCount(prefix_len, stride, true, stride, offset, true, false));
+    // Gated (the long-context line): the anchor cuts are paid — the first
+    // wide chunk is cut at abs 8192, and the anchor point captures.
+    try t.expectEqual(@as(usize, 4_096), nextChunkEnd(0, prefix_len, stride, true, stride, offset, false, true));
+    try t.expect(!ssmCapturePos(stride, 8_192, false));
+    try t.expect(ssmCapturePos(stride, 8_192, true));
 }
 
 test "boundedPrefillChunk: fused head dims and short contexts keep the base chunk" {
@@ -16605,10 +17415,10 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 16384), effectiveSsmCheckpointStride(16384, PREFILL_CHUNK));
     // End-to-end: an 851-tok prefill is 1 chunk (was 4 at the raw 256 stride
     // on dense hybrids — the llm_context_benchmarks small-prompt regression).
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false, false));
     // An 8K prefill splits only at the (memory-bound) chunk size, never
     // finer: 2 chunks at chunk 4096, not 33.
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false, false));
 }
 
 test "vision prefill checkpoints SSM state only when it chunks like text" {
@@ -16626,14 +17436,14 @@ test "vision prefill checkpoints SSM state only when it chunks like text" {
     try testing.expect(!vision_checkpoints);
     try testing.expectEqual(
         prefix_len,
-        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0, false),
+        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0, false, false),
     );
 
     const text_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, false);
     try testing.expect(text_checkpoints);
     try testing.expectEqual(
         @as(usize, checkpoint_stride),
-        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0, false),
+        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0, false, false),
     );
 }
 
@@ -18770,8 +19580,450 @@ test "gatherTokenPool: mean mode is not a gather — callers must dispatch it to
     try testing.expectError(error.InvalidPoolingMode, gatherTokenPool(testing.allocator, hidden, &lengths, .mean, s));
 }
 
+fn rowCosine(a: []const f32, b: []const f32) f64 {
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (a, b) |x, y| {
+        dot += @as(f64, x) * y;
+        na += @as(f64, x) * x;
+        nb += @as(f64, y) * y;
+    }
+    return dot / (@sqrt(na) * @sqrt(nb));
+}
+
+/// The tiny EmbeddingGemma 2 checkpoint (`tests/dump_embeddinggemma2_fixtures.py tiny`) written to a temp dir and loaded.
+const Eg2Tiny = struct {
+    tmp: std.testing.TmpDir,
+    config: model_mod.ModelConfig,
+    weights: model_mod.Weights,
+
+    fn open(allocator: std.mem.Allocator, io: std.Io) !Eg2Tiny {
+        return openWith(allocator, io, false);
+    }
+
+    /// With the image tower's tensors, as a server that serves images loads them.
+    fn openWithVision(allocator: std.mem.Allocator, io: std.Io) !Eg2Tiny {
+        return openWith(allocator, io, true);
+    }
+
+    fn openWith(allocator: std.mem.Allocator, io: std.Io, vision: bool) !Eg2Tiny {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/embedding_gemma2_tiny_config.json") });
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = @embedFile("fixtures/embedding_gemma2_tiny.safetensors") });
+        var path_buf: [512]u8 = undefined;
+        const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+        var config = try model_mod.parseConfig(io, allocator, path);
+        var weights = if (vision) try model_mod.loadWeightsWithVision(io, allocator, path) else try model_mod.loadWeights(io, allocator, path);
+        errdefer weights.deinit();
+        model_mod.resolveWeightPrefix(&config, &weights);
+        return .{ .tmp = tmp, .config = config, .weights = weights };
+    }
+
+    fn deinit(self: *Eg2Tiny) void {
+        self.weights.deinit();
+        self.tmp.cleanup();
+    }
+};
+
+test "EmbeddingGemma 2: forward and pooled embeddings match the transformers reference on a tiny checkpoint" {
+    // Random weights in the release's layout (full-attention layers wider, inclusive band radius 2,
+    // projection-only per-layer inputs, layer scalars) and HF's float32 outputs. The 12-token rows cross the
+    // band, so an exclusive radius moves their embedding to cosine 0.84.
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+
+    var fx = try Eg2Tiny.open(allocator, io);
+    defer fx.deinit();
+    var xfm = try Transformer.init(io, allocator, fx.config, &fx.weights);
+    defer xfm.deinit();
+
+    const Expected = struct {
+        sequences: []const []const u32,
+        norm: []const []const []const f32,
+        embedding: []const []const f32,
+    };
+    const parsed = try std.json.parseFromSlice(Expected, allocator, @embedFile("fixtures/embedding_gemma2_tiny_expected.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const want = parsed.value;
+
+    // The production path: one padded, key-masked batch, pooled, projected, normalized.
+    const batch = try computeEmbeddingsBatch(allocator, &xfm, want.sequences);
+    defer {
+        for (batch) |r| allocator.free(r);
+        allocator.free(batch);
+    }
+    for (batch, want.embedding, 0..) |got, ref, i| {
+        try testing.expectEqual(ref.len, got.len);
+        const cos = rowCosine(got, ref);
+        testing.expect(cos > 0.998) catch |e| {
+            std.debug.print("row {d}: embedding cosine {d:.6}\n", .{ i, cos });
+            return e;
+        };
+    }
+
+    // A shipped pack's head is bf16, and normalizing its bf16 output leaves the norm off 1: the projection
+    // hands the normalization f32.
+    const head_f32 = xfm.dense0_w;
+    var head_bf16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(head_bf16);
+    try mlx.check(mlx.mlx_astype(&head_bf16, head_f32, .bfloat16, xfm.s));
+    xfm.dense0_w = head_bf16;
+    defer xfm.dense0_w = head_f32;
+    const bf16_head = try computeEmbeddingsBatch(allocator, &xfm, want.sequences);
+    defer {
+        for (bf16_head) |r| allocator.free(r);
+        allocator.free(bf16_head);
+    }
+    for (bf16_head, 0..) |row, i| {
+        var sumsq: f64 = 0;
+        for (row) |x| sumsq += @as(f64, x) * x;
+        testing.expect(@abs(@sqrt(sumsq) - 1.0) < 1e-5) catch |e| {
+            std.debug.print("row {d}: norm {d:.6} with a bf16 head\n", .{ i, @sqrt(sumsq) });
+            return e;
+        };
+    }
+
+    // Each row alone has no padding to hide behind; its final-normed token states are the pre-projection
+    // hidden the pooling reads, so the layers are checked row by row rather than only through the mean.
+    for (want.sequences, want.norm, 0..) |seq, ref_rows, i| {
+        var ids: [32]i32 = undefined;
+        for (seq, 0..) |t, k| ids[k] = @intCast(t);
+        const shape = [_]c_int{ 1, @intCast(seq.len) };
+        const input = mlx.mlx_array_new_data(&ids, &shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(input);
+        const hidden = try xfm.forwardEmbeddingMasked(input, null, null);
+        defer _ = mlx.mlx_array_free(hidden);
+        var f32_hidden = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f32_hidden);
+        try mlx.check(mlx.mlx_astype(&f32_hidden, hidden, .float32, xfm.s));
+        try mlx.check(mlx.mlx_array_eval(f32_hidden));
+        const data = mlx.mlx_array_data_float32(f32_hidden).?;
+        for (ref_rows, 0..) |ref, t| {
+            const cos = rowCosine(data[t * ref.len ..][0..ref.len], ref);
+            testing.expect(cos > 0.995) catch |e| {
+                std.debug.print("row {d} token {d}: state cosine {d:.6}\n", .{ i, t, cos });
+                return e;
+            };
+        }
+    }
+}
+
+const vision_mod = @import("vision.zig");
+
+/// The soft-token budget the tiny fixture's image and clip were processed at (70 is the smallest a processor accepts).
+const eg2_fixture_budget: u32 = 70;
+
+/// The media half of the tiny fixture's reference outputs (`tests/dump_embeddinggemma2_fixtures.py`).
+const Eg2Media = struct {
+    media: struct {
+        image: struct { h: u32, w: u32, rgb: []const u8, target: [2]u32, tokens: u32, soft: []const []const f32 },
+        image_big: struct { budget: u32, target: [2]u32, tokens: u32, soft: []const []const f32 },
+        frames: struct { h: u32, w: u32, rgb: []const []const u8, target: [2]u32, tokens: u32, soft: []const []const f32 },
+        image_ids: []const u32,
+        image_embedding: []const f32,
+        text_image_ids: []const u32,
+        text_image_embedding: []const f32,
+        video_ids: []const u32,
+        video_embedding: []const f32,
+        mixed_ids: []const u32,
+        mixed_embedding: []const f32,
+    },
+};
+
+/// The fixture's image through the production preprocessing at `budget` soft tokens.
+fn eg2FixtureImage(allocator: std.mem.Allocator, b64: []const u8, h: u32, w: u32, budget: u32) !vision_mod.UnitImage {
+    const rgb = try allocator.alloc(u8, @as(usize, h) * w * 3);
+    defer allocator.free(rgb);
+    try std.base64.standard.Decoder.decode(rgb, b64);
+    return vision_mod.budgetPixels(allocator, rgb, h, w, 16, 3, budget);
+}
+
+fn eg2ImageRows(allocator: std.mem.Allocator, enc: *vision_mod.VisionEncoder, m: anytype, budget: u32, target: [2]u32) !mlx.mlx_array {
+    const img = try eg2FixtureImage(allocator, m.rgb, m.h, m.w, budget);
+    defer allocator.free(img.pixels);
+    try testing.expectEqual(target[0], img.h);
+    try testing.expectEqual(target[1], img.w);
+    const shape = [_]c_int{ 1, 3, @intCast(img.h), @intCast(img.w) };
+    const pixels = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(pixels);
+    return enc.forward(pixels);
+}
+
+/// A video as the scheduler hands it to the tower: every frame's CHW pixels back to back, viewed as patch rows.
+fn eg2VideoRows(allocator: std.mem.Allocator, enc: *vision_mod.VisionEncoder, m: anytype) !mlx.mlx_array {
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(allocator);
+    var grid_h: u32 = 0;
+    var grid_w: u32 = 0;
+    for (m.rgb) |frame_b64| {
+        const img = try eg2FixtureImage(allocator, frame_b64, m.h, m.w, eg2_fixture_budget);
+        defer allocator.free(img.pixels);
+        try bytes.appendSlice(allocator, img.pixels);
+        grid_h = img.h / 16;
+        grid_w = img.w / 16;
+    }
+    const frames: u32 = @intCast(m.rgb.len);
+    const rows: c_int = @intCast(frames * grid_h * grid_w);
+    const shape = [_]c_int{ rows, 768 };
+    const patches = mlx.mlx_array_new_data(bytes.items.ptr, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(patches);
+    return enc.forwardVideoPatches(patches, frames, grid_h, grid_w);
+}
+
+/// The reference's soft-token rows, one list after another, as the [1, n, hidden] array the splice reads.
+fn eg2ReferenceRows(allocator: std.mem.Allocator, lists: []const []const []const f32) !mlx.mlx_array {
+    var flat = std.ArrayList(f32).empty;
+    defer flat.deinit(allocator);
+    var n: usize = 0;
+    for (lists) |rows| for (rows) |row| {
+        try flat.appendSlice(allocator, row);
+        n += 1;
+    };
+    const shape = [_]c_int{ 1, @intCast(n), @intCast(flat.items.len / n) };
+    return mlx.mlx_array_new_data(flat.items.ptr, &shape, 3, .float32);
+}
+
+fn eg2Concat(parts: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+    return out;
+}
+
+test "EmbeddingGemma 2: the image tower yields the reference's soft tokens" {
+    // At the checkpoint's own budget and at twice it: a grid larger than `default_output_length` has no padded
+    // shape to fit and must simply run.
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+
+    var fx = try Eg2Tiny.openWithVision(allocator, io);
+    defer fx.deinit();
+    var enc = try vision_mod.VisionEncoder.init(allocator, fx.config, &fx.weights);
+    defer enc.deinit();
+    const parsed = try std.json.parseFromSlice(Eg2Media, allocator, @embedFile("fixtures/embedding_gemma2_tiny_expected.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const media = parsed.value.media;
+
+    const Case = struct { budget: u32, target: [2]u32, tokens: u32, soft: []const []const f32 };
+    const cases = [_]Case{
+        .{ .budget = eg2_fixture_budget, .target = media.image.target, .tokens = media.image.tokens, .soft = media.image.soft },
+        .{ .budget = media.image_big.budget, .target = media.image_big.target, .tokens = media.image_big.tokens, .soft = media.image_big.soft },
+    };
+    for (cases) |want| {
+        const rows = try eg2ImageRows(allocator, &enc, media.image, want.budget, want.target);
+        defer _ = mlx.mlx_array_free(rows);
+        var f32_rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f32_rows);
+        try mlx.check(mlx.mlx_astype(&f32_rows, rows, .float32, enc.s));
+        try mlx.check(mlx.mlx_array_eval(f32_rows));
+        const shape = mlx.getShape(f32_rows);
+        try testing.expectEqual(@as(c_int, 1), shape[0]);
+        try testing.expectEqual(@as(c_int, @intCast(want.tokens)), shape[1]);
+        try testing.expectEqual(@as(c_int, @intCast(fx.config.hidden_size)), shape[2]);
+        const data = mlx.mlx_array_data_float32(f32_rows).?;
+        for (want.soft, 0..) |ref, t| {
+            const cos = rowCosine(data[t * ref.len ..][0..ref.len], ref);
+            testing.expect(cos > 0.999) catch |e| {
+                std.debug.print("budget {d}, soft token {d}: cosine {d:.6}\n", .{ want.budget, t, cos });
+                return e;
+            };
+        }
+    }
+}
+
+test "EmbeddingGemma 2: the tower's soft tokens are the same padded and masked (Gemma 4) as unpadded and fused" {
+    // Gemma 4 pads every image to its one budget and masks the padding out of eager attention; EmbeddingGemma 2
+    // runs the bare grid through the fused kernel. Masked padding is a no-op, so the two arms of the one tower
+    // must agree, and a break in either shows here without a Gemma 4 checkpoint.
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+
+    var fx = try Eg2Tiny.openWithVision(allocator, io);
+    defer fx.deinit();
+    var as_gemma4 = fx.config;
+    as_gemma4.model_type = "gemma4";
+    var padded = try vision_mod.VisionEncoder.init(allocator, as_gemma4, &fx.weights);
+    defer padded.deinit();
+    var bare = try vision_mod.VisionEncoder.init(allocator, fx.config, &fx.weights);
+    defer bare.deinit();
+    const parsed = try std.json.parseFromSlice(Eg2Media, allocator, @embedFile("fixtures/embedding_gemma2_tiny_expected.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const m = parsed.value.media;
+
+    const a = try eg2ImageRows(allocator, &padded, m.image, eg2_fixture_budget, m.image.target);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try eg2ImageRows(allocator, &bare, m.image, eg2_fixture_budget, m.image.target);
+    defer _ = mlx.mlx_array_free(b);
+    var a32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a32);
+    var b32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b32);
+    try mlx.check(mlx.mlx_astype(&a32, a, .float32, padded.s));
+    try mlx.check(mlx.mlx_astype(&b32, b, .float32, bare.s));
+    try mlx.check(mlx.mlx_array_eval(a32));
+    try mlx.check(mlx.mlx_array_eval(b32));
+    try testing.expectEqual(mlx.getShape(a32)[1], mlx.getShape(b32)[1]);
+    const hidden: usize = @intCast(mlx.getShape(a32)[2]);
+    const rows: usize = @intCast(mlx.getShape(a32)[1]);
+    const da = mlx.mlx_array_data_float32(a32).?;
+    const db = mlx.mlx_array_data_float32(b32).?;
+    for (0..rows) |t| {
+        const cos = rowCosine(da[t * hidden ..][0..hidden], db[t * hidden ..][0..hidden]);
+        testing.expect(cos > 0.99999) catch |e| {
+            std.debug.print("soft token {d}: padded vs bare cosine {d:.6}\n", .{ t, cos });
+            return e;
+        };
+    }
+}
+
+test "EmbeddingGemma 2: image, video and mixed prompts embed like the reference" {
+    // The reference splices each modality's rows at its placeholder ids; here one scatter takes every item's
+    // rows in PROMPT order, and the mixed prompt puts the video before the image on purpose.
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+
+    var fx = try Eg2Tiny.openWithVision(allocator, io);
+    defer fx.deinit();
+    var xfm = try Transformer.init(io, allocator, fx.config, &fx.weights);
+    defer xfm.deinit();
+    var enc = try vision_mod.VisionEncoder.init(allocator, fx.config, &fx.weights);
+    defer enc.deinit();
+    const parsed = try std.json.parseFromSlice(Eg2Media, allocator, @embedFile("fixtures/embedding_gemma2_tiny_expected.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const m = parsed.value.media;
+
+    const image = try eg2ImageRows(allocator, &enc, m.image, eg2_fixture_budget, m.image.target);
+    defer _ = mlx.mlx_array_free(image);
+    const video = try eg2VideoRows(allocator, &enc, m.frames);
+    defer _ = mlx.mlx_array_free(video);
+    try testing.expectEqual(@as(c_int, @intCast(m.frames.rgb.len * m.frames.tokens)), mlx.getShape(video)[1]);
+    const video_then_image = try eg2Concat(&.{ video, image }, xfm.s);
+    defer _ = mlx.mlx_array_free(video_then_image);
+
+    const cases = [_]struct { name: []const u8, ids: []const u32, rows: mlx.mlx_array, want: []const f32 }{
+        .{ .name = "image", .ids = m.image_ids, .rows = image, .want = m.image_embedding },
+        .{ .name = "text+image", .ids = m.text_image_ids, .rows = image, .want = m.text_image_embedding },
+        .{ .name = "video", .ids = m.video_ids, .rows = video, .want = m.video_embedding },
+        .{ .name = "video then image", .ids = m.mixed_ids, .rows = video_then_image, .want = m.mixed_embedding },
+    };
+    for (cases) |c| {
+        const seqs = [_][]const u32{c.ids};
+        const got = try computeEmbeddingsBatchWith(allocator, &xfm, &seqs, c.rows);
+        defer {
+            for (got) |r| allocator.free(r);
+            allocator.free(got);
+        }
+        const cos = rowCosine(got[0], c.want);
+        testing.expect(cos > 0.99) catch |e| {
+            std.debug.print("{s}: embedding cosine {d:.6}\n", .{ c.name, cos });
+            return e;
+        };
+    }
+
+    // The reference's own soft tokens through the same splice and trunk: this leg has no tower in it, so it holds
+    // the float32 bar the text rows do (the tower casts its inputs to bf16, which a random toy amplifies), and it
+    // can tell the prompt's row order from the kinds' (mean pooling alone hardly can).
+    const image_seq = [_][]const u32{m.image_ids};
+    const mixed_seq = [_][]const u32{m.mixed_ids};
+    const ref_image = try eg2ReferenceRows(allocator, &.{m.image.soft});
+    defer _ = mlx.mlx_array_free(ref_image);
+    const ref_ordered = try eg2ReferenceRows(allocator, &.{ m.frames.soft, m.image.soft });
+    defer _ = mlx.mlx_array_free(ref_ordered);
+    const ref_swapped = try eg2ReferenceRows(allocator, &.{ m.image.soft, m.frames.soft });
+    defer _ = mlx.mlx_array_free(ref_swapped);
+    var exact_cos: [3]f64 = undefined;
+    for ([_]struct { seq: []const []const u32, rows: mlx.mlx_array, want: []const f32 }{
+        .{ .seq = &image_seq, .rows = ref_image, .want = m.image_embedding },
+        .{ .seq = &mixed_seq, .rows = ref_ordered, .want = m.mixed_embedding },
+        .{ .seq = &mixed_seq, .rows = ref_swapped, .want = m.mixed_embedding },
+    }, 0..) |c, k| {
+        const got = try computeEmbeddingsBatchWith(allocator, &xfm, c.seq, c.rows);
+        defer {
+            for (got) |r| allocator.free(r);
+            allocator.free(got);
+        }
+        exact_cos[k] = rowCosine(got[0], c.want);
+    }
+    try testing.expect(exact_cos[0] > 0.9995);
+    try testing.expect(exact_cos[1] > 0.9995);
+    try testing.expect(exact_cos[2] < exact_cos[1] - 0.0005);
+
+    // A prompt whose placeholders outnumber the rows would wrap the scatter silently; two sequences cannot share rows.
+    const two = [_][]const u32{ m.image_ids, m.image_ids };
+    try testing.expectError(error.MultimodalNeedsOneSequence, computeEmbeddingsBatchWith(allocator, &xfm, &two, image));
+}
+
+test "EmbeddingGemma 2: a tower missing a tensor is a load error, a missing tower is not" {
+    // A pack with its tower cut to pieces would otherwise crash the server at load; a text-only pack (no tower at
+    // all) is the benign opt-out the loader already handles.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+    {
+        var fx = try Eg2Tiny.openWithVision(testing.allocator, io);
+        defer fx.deinit();
+        fx.weights.remove("vision_tower.encoder.layers.1.self_attn.k_proj.linear.weight");
+        try testing.expectError(error.MissingWeight, vision_mod.VisionEncoder.init(testing.allocator, fx.config, &fx.weights));
+    }
+    {
+        var fx = try Eg2Tiny.open(testing.allocator, io);
+        defer fx.deinit();
+        try testing.expectError(error.MissingVisionWeights, vision_mod.VisionEncoder.init(testing.allocator, fx.config, &fx.weights));
+    }
+}
+
+test "EmbeddingGemma 2: a checkpoint missing its head or per-layer-input weights is a load error" {
+    // Without the head the server would hand out 512-wide un-projected vectors under an arch that promises 768,
+    // and a layer without its input block or scalar would crash the first forward.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+    // init leaks its partial layer slice on an error return; an arena takes it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{
+        "language_model.embedding_projection.weight",
+        "language_model.ple.per_layer_model_projection.weight",
+        "language_model.ple.per_layer_projection_norm.weight",
+        "language_model.layers.3.ple_block.per_layer_projection.weight",
+        "language_model.layers.2.layer_scalar",
+    }) |name| {
+        var fx = try Eg2Tiny.open(testing.allocator, io);
+        defer fx.deinit();
+        fx.weights.remove(name);
+        try testing.expectError(error.MissingWeight, Transformer.init(io, arena.allocator(), fx.config, &fx.weights));
+    }
+}
+
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "native speculation: shared DSpark environment policy" {
+    const name = "MLX_SERVE_DSV4_DSPARK";
+    const saved = if (std.c.getenv(name)) |value|
+        try testing.allocator.dupeSentinel(u8, std.mem.span(value), 0)
+    else
+        null;
+    defer {
+        if (saved) |value| {
+            _ = setenv(name, value, 1);
+            testing.allocator.free(value);
+        } else {
+            _ = unsetenv(name);
+        }
+    }
+    try testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    try testing.expect(Generator.dsparkEnabled());
+    for ([_][:0]const u8{ "", "1", "0", "0disabled" }) |value| {
+        try testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
+        try testing.expectEqual(value.len == 0 or value[0] != '0', Generator.dsparkEnabled());
+    }
+}
 
 // ── Allocator-cache clear cadence (issue #110) ───────────────────────────────
 
@@ -19031,6 +20283,17 @@ test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)"
         }
         std.debug.print("dsv4 nextDspark (generator): first_div={d}/{d}, rounds={d}, accepts={d}\n", .{ first_div, want, gen.dspark_attempted, gen.dspark_accepted_tokens });
     }
+}
+
+test "nextDraw: each stochastic DSpark round takes a fresh draw of the request's seed" {
+    var gen: Generator = undefined;
+    gen.sampling = .{ .temperature = 0.6, .seed = 7, .draw = 5 };
+    const a = gen.nextDraw();
+    const b = gen.nextDraw();
+    try testing.expectEqual(@as(u64, 5), a.draw);
+    try testing.expectEqual(@as(u64, 6), b.draw);
+    try testing.expectEqual(@as(?u64, 7), b.seed);
+    try testing.expectEqual(@as(u64, 7), gen.sampling.draw);
 }
 
 test "dsparkArmFor: greedy and stochastic arms gate on clean sampling, kill switch restores greedy-only" {
@@ -19337,6 +20600,105 @@ test "computeLogprobs: f16 logits keep finite, exact log-probabilities" {
     for (r.top_logprobs) |t| try testing.expect(std.math.isFinite(t.logprob));
 }
 
+test "computeLogprobs: an id past the vocab reports -100, top_n 0 lists none, [1,1,V] reads as [1,V]" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const allocator = testing.allocator;
+    const raw = [_]f32{ 0, 1, 2, 3 };
+    const flat = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(flat);
+    const deep = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(deep);
+    const lse: f32 = 3.0 + @log(1.0 + @exp(@as(f32, -1)) + @exp(@as(f32, -2)) + @exp(@as(f32, -3)));
+
+    const past = try computeLogprobs(allocator, flat, 9, 2, s);
+    defer allocator.free(past.top_logprobs);
+    try testing.expectEqual(@as(f32, -100.0), past.token_logprob);
+    try testing.expectEqual(@as(usize, 2), past.top_logprobs.len);
+    try testing.expectEqual(@as(u32, 3), past.top_logprobs[0].token_id);
+
+    const none = try computeLogprobs(allocator, flat, 1, 0, s);
+    defer allocator.free(none.top_logprobs);
+    try testing.expectEqual(@as(usize, 0), none.top_logprobs.len);
+    try testing.expectApproxEqAbs(1.0 - lse, none.token_logprob, 1e-5);
+
+    const d = try computeLogprobs(allocator, deep, 2, 3, s);
+    defer allocator.free(d.top_logprobs);
+    try testing.expectApproxEqAbs(2.0 - lse, d.token_logprob, 1e-5);
+    try testing.expectEqual(@as(usize, 3), d.top_logprobs.len);
+    try testing.expectEqual(@as(u32, 1), d.top_logprobs[2].token_id);
+}
+
+test "promptLogprobs: no vocab-wide array outlives its use, so the top-k sort is the peak" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    const rows = 64;
+    const vocab = 65536;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 7));
+    var logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_random_normal(&logits, &[_]c_int{ 1, rows, vocab }, 3, .bfloat16, 0, 1, key, s));
+    try mlx.check(mlx.mlx_array_eval(logits));
+    var ids: [rows]u32 = undefined;
+    for (&ids, 0..) |*v, i| v.* = @intCast(i * 997 % vocab);
+    var out: std.ArrayList(LogprobResult) = .empty;
+    defer {
+        for (out.items) |r| allocator.free(r.top_logprobs);
+        out.deinit(allocator);
+    }
+
+    var base: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&base));
+    _ = mlx.mlx_reset_peak_memory();
+    try promptLogprobs(allocator, logits, &ids, 5, s, &out);
+    var peak: usize = 0;
+    try mlx.check(mlx.mlx_get_peak_memory(&peak));
+    // Bar: under six [rows, vocab] 4-byte arrays above what was live before (the sort alone holds five).
+    try testing.expect(peak - base < 6 * rows * vocab * 4);
+    try testing.expectEqual(@as(usize, rows), out.items.len);
+}
+
+test "promptLogprobs: every row scores its NEXT token, ranks tie on the lower id" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const allocator = testing.allocator;
+    const rows = [3][8]f32{
+        .{ 1, 1, 1, 1, 1, 1, 2, 3 },
+        .{ 0, 0, 0, 0, 0, 3, 0, 3 },
+        .{ -1.5, 0.25, 4, -3, 2, 0, 1, 0.5 },
+    };
+    const logits = mlx.mlx_array_new_data(&rows, &[_]c_int{ 1, 3, 8 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const next = [_]u32{ 7, 5, 3 };
+
+    var out: std.ArrayList(LogprobResult) = .empty;
+    defer {
+        for (out.items) |r| allocator.free(r.top_logprobs);
+        out.deinit(allocator);
+    }
+    try promptLogprobs(allocator, logits, &next, 2, s, &out);
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+    for (rows, next, out.items) |row, id, r| {
+        var lse: f64 = 0;
+        for (row) |v| lse += @exp(@as(f64, v));
+        lse = @log(lse);
+        try testing.expectApproxEqAbs(@as(f64, row[id]) - lse, r.token_logprob, 1e-5);
+        try testing.expectEqual(@as(usize, 2), r.top_logprobs.len);
+        try testing.expectApproxEqAbs(@as(f64, row[r.top_logprobs[0].token_id]) - lse, r.top_logprobs[0].logprob, 1e-5);
+    }
+    try testing.expectEqual(@as(u32, 7), out.items[0].top_logprobs[0].token_id);
+    try testing.expectEqual(@as(u32, 6), out.items[0].top_logprobs[1].token_id);
+    try testing.expectEqual(@as(u32, 5), out.items[1].top_logprobs[0].token_id);
+    try testing.expectEqual(@as(u32, 7), out.items[1].top_logprobs[1].token_id);
+    try testing.expectEqual(@as(u32, 2), out.items[2].top_logprobs[0].token_id);
+
+    const too_many = [_]u32{ 1, 2, 3, 4 };
+    try testing.expectError(error.PromptLogprobsUnavailable, promptLogprobs(allocator, logits, &too_many, 2, s, &out));
+}
+
 test "sampleToken: reported logprobs are the model's, not the client's temperature" {
     // Same prompt, same chosen token, three temperatures used to report three
     // different logprobs (-0.2129 / -0.0607 / -2.1566 at 0 / 0.6 / 2.0). The
@@ -19398,6 +20760,60 @@ test "logprobs publish through the one-token delay, never straight from sampleTo
         }
     }
     try testing.expect(seen >= 1);
+}
+
+test "lilicorr missing restored anchor takes a plain round and recovers it" {
+    if (mlx.noGpuBackend()) return;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var trunk_tmp = testing.tmpDir(.{});
+    defer trunk_tmp.cleanup();
+    var asst_tmp = testing.tmpDir(.{});
+    defer asst_tmp.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_len = try trunk_tmp.dir.realPath(io, &trunk_buf);
+    const trunk_path = trunk_buf[0..trunk_len];
+    var asst_buf: [512]u8 = undefined;
+    const asst_len = try asst_tmp.dir.realPath(io, &asst_buf);
+    const asst_path = asst_buf[0..asst_len];
+    try dflash_mod.TinyFix.writeTrunk(io, trunk_tmp.dir, trunk_path, s);
+    try dflash_mod.TinyFix.writeAssistant(io, asst_tmp.dir, asst_path, s);
+    var cfg = try model_mod.parseConfig(io, a, trunk_path);
+    var weights = try model_mod.loadWeights(io, a, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&cfg, &weights);
+    var xfm = try Transformer.init(io, a, cfg, &weights);
+    defer xfm.deinit();
+    var dm = try dflash_mod.loadDflash(io, a, s, asst_path);
+    defer dm.deinit();
+    try dm.bind(&xfm);
+    var tok: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5 };
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, 8, .{ .temperature = 0 }, &.{}, .{
+        .dflash_enabled = true,
+        .dflash = &dm,
+        .dflash_min_accepted_per_round = 0,
+    });
+    defer gen.deinit(a);
+    // A restored context has its K/V but no LiLiCorr anchor row.
+    try asst_tmp.dir.writeFile(io, .{ .sub_path = "fixture.safetensors", .data = @embedFile("fixtures/lilicorr_fp32.safetensors") });
+    const path = try std.fmt.allocPrint(a, "{s}/fixture.safetensors", .{asst_path});
+    defer a.free(path);
+    var fx = try model_mod.loadWeightsSingleFile(a, path);
+    defer fx.deinit();
+    dm.lilicorr = try lilicorr_mod.load(a, &fx, s, .{ .top_k = 3, .hidden = 8, .trunk = 12, .heads = 2, .slots = 3, .layers = 2, .factor = 6, .vector_eps = 0.0001, .logit_scale = 8, .rms_eps = 1e-6 });
+    try testing.expect(gen.dflash_ctx.?.anchor.ctx == null);
+    const pending = gen.next_token_id;
+    const step = (try gen.nextDflash(a)).?;
+    defer a.free(step.tokens);
+    try testing.expectEqualSlices(u32, &[_]u32{pending}, step.tokens);
+    try testing.expectEqual(@as(u32, 0), step.accepted_tokens);
+    try testing.expectEqual(@as(u32, 1), gen.dflash_plain);
+    try testing.expect(!gen.spec_disabled_runtime);
+    try gen.dflashFlushPending(a);
+    try testing.expect(gen.dflash_ctx.?.anchor.ctx != null);
+    try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
 }
 
 test "dflash: nextDflash greedy equals serial decode, invariants exact each round" {
@@ -19544,6 +20960,161 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         try testing.expectEqual(want, got.items.len);
         for (serial, got.items) |a, b| try testing.expectEqual(a, b);
     }
+}
+
+const PolicyArm = struct {
+    /// A DFlash2 assistant (selector confidence) instead of the v1 block drafter.
+    v2: bool,
+    /// Verify exactly this many rows whenever the draft has them (0 = the policy chooses).
+    pin_rows: u32 = 0,
+    /// Pre-train the calibration to trust every draft, so the policy verifies the whole block.
+    trust: bool = false,
+    sampled: bool = false,
+    /// A prompt that ends mid-repeat, so the first round copies the context's continuation.
+    copy: bool = false,
+};
+
+/// Ten distinct ids repeated, then the first nine again: `COPY_PATTERN[9]` as t1 continues the repeat.
+const COPY_PATTERN = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17 };
+
+/// One request through `nextDflash` under the round policy on the tiny fixture pair, three plain
+/// rounds first: the trunk and assistant cursors agree after EVERY round whatever mix of plain and
+/// drafted rounds ran, and a greedy stream is the serial stream. Returns the generator's stats.
+fn policyArm(arm: PolicyArm, serial: []const u32) !dflash_policy.PositionStats {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_trunk = std.testing.tmpDir(.{});
+    defer tmp_trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try tmp_trunk.dir.realPath(io, &trunk_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+
+    var tmp_asst = std.testing.tmpDir(.{});
+    defer tmp_asst.cleanup();
+    var asst_buf: [512]u8 = undefined;
+    const asst_path = asst_buf[0..try tmp_asst.dir.realPath(io, &asst_buf)];
+    if (arm.v2) try dflash_mod.TinyFix.writeAssistant2(io, tmp_asst.dir, asst_path, s, false) else try dflash_mod.TinyFix.writeAssistant(io, tmp_asst.dir, asst_path, s);
+
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    var dm = try dflash_mod.loadDflash(io, allocator, s, asst_path);
+    defer dm.deinit();
+    try dm.bind(&xfm);
+
+    var tok_dummy: Tokenizer = undefined; // never read by the Generator
+    const copy_prompt = COPY_PATTERN ++ COPY_PATTERN ++ COPY_PATTERN[0..9].*;
+    const plain_prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    const prompt: []const u32 = if (arm.copy) &copy_prompt else &plain_prompt;
+    var copy_serial: [16]u32 = undefined;
+    if (arm.copy) {
+        var sx = try Transformer.init(io, allocator, config, &weights);
+        defer sx.deinit();
+        var sg = try Generator.initWithOptions(io, allocator, &sx, &tok_dummy, prompt, 16, SamplingParams{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
+        defer sg.deinit(allocator);
+        sg.next_token_id = COPY_PATTERN[9];
+        for (&copy_serial) |*t| t.* = (try sg.next(allocator)).?;
+    }
+    const reference: []const u32 = if (arm.copy) &copy_serial else serial;
+    const sampling = if (arm.sampled) SamplingParams{ .temperature = 1.0, .seed = 7 } else SamplingParams{ .temperature = 0.0 };
+    const want: u32 = 16;
+    var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, prompt, want, sampling, &.{}, .{
+        .dflash_enabled = true,
+        .dflash = &dm,
+        .dflash_policy = true,
+    });
+    defer gen.deinit(allocator);
+    const pol = &gen.dflash_pol.?;
+    pol.pin_rows = arm.pin_rows;
+    pol.drafting.owed = if (arm.copy) 0 else 3;
+    if (arm.copy) gen.next_token_id = COPY_PATTERN[9];
+    const plain_rounds: usize = if (arm.copy) 0 else 3;
+    if (arm.trust) for (0..10) |b| for (0..40) |_| pol.calib.observe((@as(f32, @floatFromInt(b)) + 0.5) / 10.0, true);
+
+    var got = std.ArrayList(u32).empty;
+    defer got.deinit(allocator);
+    var round: usize = 0;
+    while (true) : (round += 1) {
+        const plain_before = gen.dflash_plain;
+        const attempts_before = gen.dflash_attempted;
+        const last = gen.max_tokens -| gen.completion_tokens == 1;
+        const res = (try gen.nextDflash(allocator)) orelse break;
+        defer allocator.free(res.tokens);
+        try got.appendSlice(allocator, res.tokens);
+        if (round < plain_rounds) {
+            try testing.expectEqual(@as(usize, 1), res.tokens.len);
+            try testing.expectEqual(plain_before + 1, gen.dflash_plain);
+            try testing.expectEqual(attempts_before, gen.dflash_attempted);
+        }
+        // A plain stretch rides the serial pipeline: one lookahead token is in the trunk's cache, unemitted.
+        const lookahead: usize = if (gen.has_pending_logits or gen.has_pending_token) 1 else 0;
+        try testing.expectEqual(prompt.len + gen.generated_ids.items.len - gen.unforwarded_tail + lookahead, gen.ctx.cache.step);
+        // The assistant context reaches the trunk's cursor, appended or still parked.
+        try testing.expectEqual(gen.ctx.cache.step, gen.dflashContextLen());
+        // A drafted round appends whatever the plain ones left parked.
+        if (gen.dflash_attempted != attempts_before) try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
+        _ = last;
+    }
+    try testing.expect(gen.dflash_plain >= plain_rounds);
+    if (arm.copy) try testing.expect(gen.dflash_copies > 0);
+    try testing.expect(!gen.spec_disabled_runtime);
+    try testing.expectEqual(@as(usize, want), got.items.len);
+    if (!arm.sampled) for (reference, got.items) |a, b| try testing.expectEqual(a, b);
+    // The scheduler settles the context to the committed prefix, whatever lookahead the run ended on.
+    const committed = prompt.len + gen.generated_ids.items.len - gen.unforwarded_tail;
+    try gen.dflashSettle(allocator, committed);
+    try testing.expectEqual(committed, gen.dflash_ctx.?.absLen());
+    return gen.dflash_stats;
+}
+
+test "dflash: the round policy runs plain rounds between drafted ones, the stream stays serial's" {
+    // A plain round is the verify forward at one row (no assistant forward): it must advance the trunk
+    // and the assistant context exactly like a drafted round, so DFlash can resume after any stretch of
+    // them; a draft the policy verifies only in part must not shift the accept, rollback or q indexing.
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_trunk = std.testing.tmpDir(.{});
+    defer tmp_trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try tmp_trunk.dir.realPath(io, &trunk_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var tok_dummy: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    var serial: [16]u32 = undefined;
+    {
+        var xfm = try Transformer.init(io, allocator, config, &weights);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, SamplingParams{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
+        defer gen.deinit(allocator);
+        for (&serial) |*t| t.* = (try gen.next(allocator)).?;
+    }
+
+    // The v1 block drafter verifies its whole block.
+    const v1 = try policyArm(.{ .v2 = false }, &serial);
+    try testing.expect(v1.rows[4] > 0);
+    // The DFlash2 selector: two rows of a three-draft block, then the whole block once it is trusted.
+    const two = try policyArm(.{ .v2 = true, .pin_rows = 2 }, &serial);
+    try testing.expect(two.rows[2] > 0 and two.rows[3] == 0 and two.rows[4] == 0);
+    const trusted = try policyArm(.{ .v2 = true, .trust = true }, &serial);
+    try testing.expect(trusted.rows[4] > 0);
+    // A copied continuation (no assistant forward) is verified like any draft.
+    _ = try policyArm(.{ .v2 = false, .copy = true }, &serial);
+    _ = try policyArm(.{ .v2 = false, .copy = true, .sampled = true }, &serial);
+    // Sampled requests: the Leviathan accept reads q at the draft's own stride, whatever was kept.
+    _ = try policyArm(.{ .v2 = true, .pin_rows = 2, .sampled = true }, &serial);
+    _ = try policyArm(.{ .v2 = true, .trust = true, .sampled = true }, &serial);
 }
 
 // Hermetic Nemotron-H MTP round loop: a tiny hybrid trunk (Mamba2 +
@@ -19866,6 +21437,8 @@ test "countSpliceRows counts image, audio and video placeholders, extras only wh
     try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 88, 0));
     try testing.expectEqual(@as(usize, 4), countSpliceRows(&ids, 99, 88, 77));
     try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 88, 77));
+    // An audio-only model declares no image token: token 0 is text.
+    try testing.expectEqual(@as(usize, 1), countSpliceRows(&[_]i32{ 0, 88, 0 }, 0, 88, 0));
 }
 
 test "vision prefill chunks by default and the splice offset feeds every prefill forward" {
@@ -22430,4 +24003,19 @@ test "MTP depth bounds: warmup, group fill and native head caps constrain the fi
     gen.mtp_depth = 3; // Native multi-head cap resolved at initialization.
     depth_bounds.active = .{ .min = 5, .max = 5 };
     try testing.expectEqual(@as(u32, 3), gen.mtpRoundPlan().m_hi);
+}
+
+test "explicitPrefillChunkU32: unset is 0, a flag past u32 clamps instead of overflowing" {
+    const saved = .{ prefill_chunk_explicit, prefill_chunk_override };
+    defer {
+        prefill_chunk_explicit = saved[0];
+        prefill_chunk_override = saved[1];
+    }
+    prefill_chunk_explicit = false;
+    try std.testing.expectEqual(@as(u32, 0), explicitPrefillChunkU32());
+    prefill_chunk_explicit = true;
+    prefill_chunk_override = 256;
+    try std.testing.expectEqual(@as(u32, 256), explicitPrefillChunkU32());
+    prefill_chunk_override = 5_000_000_000;
+    try std.testing.expectEqual(std.math.maxInt(u32), explicitPrefillChunkU32());
 }

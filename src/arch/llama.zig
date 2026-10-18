@@ -12,6 +12,12 @@ const std = @import("std");
 const ffi = @import("../llama_ffi.zig");
 const log = @import("../log.zig");
 
+/// The llama shim's log sink: llama.cpp's warnings and errors stay visible, the rest
+/// (the loader's metadata dump, backend probing) is debug.
+export fn mlx_llama_log(warn: bool, text: [*:0]const u8) void {
+    if (warn) log.warn("{s}", .{std.mem.span(text)}) else log.debug("{s}", .{std.mem.span(text)});
+}
+
 pub const Error = error{
     EngineOpenFailed,
     SessionCreateFailed,
@@ -373,7 +379,10 @@ pub const LlamaSeq = struct {
         if (common < self.resident.items.len) {
             // 1 = the tail could not be rolled back (recurrent state) and the
             // whole sequence was cleared: nothing is resident any more.
-            if (ffi.mlx_llama_seq_trim(self.ctx.handle, self.id, @intCast(common)) == 1) common = 0;
+            if (ffi.mlx_llama_seq_trim(self.ctx.handle, self.id, @intCast(common)) == 1) {
+                log.info("[llama] recurrent state cannot roll back to {d}; cold prefill\n", .{common});
+                common = 0;
+            }
             self.resident.shrinkRetainingCapacity(common);
         }
 

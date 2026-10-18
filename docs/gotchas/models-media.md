@@ -2,6 +2,22 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### ModelOpt's NVFP4 global scale is not MLX's (NVIDIA Flash Next FP4)
+
+NVIDIA's pack loaded and chatted, but every image read as "a blank white canvas". The vision tower's NVFP4 linears were dequantized with `weight_scale_2` passed as MLX's `global_scale`. ModelOpt stores `weight_scale_2 = amax / (448 x 6)`; MLX's kernels divide its `global_scale` by 448 x 6 themselves, so every weight came out 2688x too small. Fix: `modelopt_pack.dequantDense` multiplies by 448 x 6 first. Guard: `ModelOpt NVFP4 dense dequant` checks code x e4m3 x `weight_scale_2` exactly. The routed experts never meet MLX's convention: their per-expert scales ride the gate and the routing weight.
+
+### RADIO configuration and numerics must follow the checkpoint
+
+Defect: native omni packs loaded text-only. Cause: vision keyed on a private `radio_vision` flag instead of `vision_config.model_type: "radio"`. Fix: loader and discovery share `model_discovery.hasRadioVision`; preprocessing follows the official float32 antialiased bicubic and float32 CPE (PIL's uint8 step moved pixels). Guards: native RADIO config tests, format corpus, the executed fp32 fixtures (cosine plus RMS ratio).
+
+### Native Nemotron wrappers retain more than an architecture tag
+
+Defect: Super's `nemotron_h_omni` pack was hidden in the app and failed to load. Cause: exact type lists and flat `backbone`/`mlp1` names. Fix: the language wrapper and `mlp1.layers` projector resolve from the checkpoint's names, quantization per linear; the native config's final vision LayerNorm before pixel shuffle is required. Guards: picker/type parity tests, nested/flat forwards, Super RADIO fixtures.
+
+### A LiLiCorr drafter can own its output head
+
+Defect: Super's drafter proposed through the target's head. Cause: DFlash ignored `has_own_lm_head`. Fix: a declared head is loaded and validated (geometry, token space) and used only for proposals; verify keeps the target head. Separately, `/v1/messages` dropped DFlash because it checked only the Gemma slot: all four surfaces now share `requestEnableDrafter`. Guards: native config corpus, head forwards, malformed-head tests, HTTP defaults on all four APIs.
+
 ### Metaspace `prepend_scheme: "first"` read as "always" (Mistral v0.3)
 The laya port added HF `Metaspace` support and treated every scheme except `never` as `always`, so Mistral's SentencePiece tokenizer got a ▁ after every special token (`[INST]Use` -> `▁Use`; HF gives `Use`). HF's `first` only prepends to text at original offset 0, and `always` does it per segment after added-token extraction.
 - Found by the smoke matrix: every Mistral cell's prompt grew 11 tokens. Part of that was CORRECT: 26.9.5 dropped every `\n` on byte-fallback tokenizers (no `<0x0A>`), which the same port fixed.
@@ -1915,6 +1931,26 @@ Two more came out of the first llmprobe run (all cells failing were ours):
 - Guard: `tests/test_hadamard_fidelity.sh` (server greedy logprobs vs a
   self-contained f32 reference, KL < 1e-5); red on the old engine.
 
+## Qwen3.8 Flash Next's GatedDeltaNet decayed in bf16 (2026-10-10)
+
+- Defect: qwen4_exp kept its GatedDeltaNet state in bf16 and rounded the
+  per-token decay g = exp(-exp(A_log)·softplus(a + dt_bias)) to bf16 in all
+  five gate producers. bf16's spacing below 1 is 2^-8, so a head meant to
+  forget slower than ~2e-3 per token got g = 1.0 exactly: at a = 0, 206 of
+  the shipped packs' 1728 heads never forgot and 469 forgot more than 10% off
+  rate, and the state re-rounded to bf16 every decoded token. The packs declare
+  `mamba_ssm_dtype: float32`; the HF reference and mlx-lm keep both in f32.
+- Fix: `ssmStateDtype` is f32 on qwen4_exp (set at parse, keyed on the arch:
+  HF ignores the key), and under bf16 activations every producer computes the
+  gate at the state's dtype (`gdn_decode.gateDtype`: K1/K1S/K1P and the packed
+  prework's `GT`; the compiled chain); f16 Hadamard packs keep their gate. At
+  f32, serial decode, verify, tree, batched rows and a stock prefill dispatch
+  agree bit for bit. Checkpoints bill twice the state, f32 roots get their own
+  SSD namespace, and `MLX_SERVE_GDN_STATE_F32=0` restores bf16.
+- Guard: `qwen4_exp GDN: a slow-decay head forgets at its own rate on every
+  arm` (g^n of the bf16 A_log) and `... equal serial decode bit for bit`; red
+  on the old engine.
+
 ## Qwen-Image-2.1: an 18 GB VAE decode on a 5 GB engine
 
 Defect: the first 1024² generation on the 4-bit pack reported an 18 GB peak process footprint; the staged engine holds 5.5 GB and the 40-step denoise is flat at that. `mlx_get_peak_memory` read 4.9 GB throughout, so nothing MLX-side pointed at it.
@@ -2026,6 +2062,13 @@ Cause: `lora.delta` multiplied the bf16 low-rank product by an f32 scalar ARRAY,
 Fix: `lora.addTo` = one skinny GEMM per adapter and `mlx_addmm`, whose epilogue adds onto the base output in its own dtype. H3 now steps at ~10 s with Turbo. flux/krea/LTX still call `deltaSum` and pay the same tax at their own row counts.
 Guard: `addTo equals y + deltaSum in y's dtype` (lora.zig; the dtype assert is the promotion guard).
 
+## A LoRA at scale 0 still changed the image (2026-10-14)
+
+Defect: a Qwen-Image LoRA attached at `lora_scales: [0]` rendered a different picture from no adapter, so a user could not switch an adapter off by scale.
+Cause: `lora.addTo` called `mlx_addmm(y, xa, bt, alpha=scale, beta=1)`; at `alpha == 0` MLX's addmm does not return `beta*c` at DiT-sized shapes in bf16.
+Fix: `addTo` skips an adapter whose scale is 0 and hands back a copy of `y` when nothing remains. This also repairs H3, which shares `addTo`.
+Guard: `addTo with a zero or tiny scale returns y, at DiT-sized shapes` (lora.zig); live `tests/test_qwen_image_lora.sh` check 2 (scale 0 byte-identical to no adapter).
+
 ## Stable Audio 3: a fractional length came out as clipped noise (2026-10-05)
 
 Defect: a sound effect at any non-whole length (0.5, 0.9, 1.5 s) came out as near-constant full-scale noise; whole seconds sounded right.
@@ -2039,3 +2082,78 @@ Defect: Llama-3.2-3B answered a 1k-token prompt and returned whitespace at 1.8k 
 Cause: two. `ModelConfig.has_sliding_window` defaults to Gemma's layout (5 sliding layers to 1 global, window 1024), and the llama-family branch never cleared it; Llama 3.x configs have no `sliding_window` key, so 5 of every 6 layers saw only the last 1024 tokens. And `rope_scaling` `rope_type: "llama3"` was read as nothing (the branch resets the factor to 1), so the low frequencies ran 32x fast.
 Fix: the llama family (llama, mistral, qwen2, qwen3, k2_horizon) is full attention in every layer, as in mlx-lm; `Llama3Rope` feeds HF's frequencies to `mlx_fast_rope`. The keys change, so llama3 packs get their own SSD cache root. Next-token logprobs now match mlx-lm within 0.1 nats at 3.8k tokens.
 Guard: `parseConfigFromJson: Llama 3.x llama3 rope_scaling …` (model.zig), `computeLlama3Freqs` golden values (transformer.zig), and the smoke matrix's ~3k-token `long prompt` check, which every short check had missed.
+
+## A Sushi MiMo pack loaded a stale bf16 copy of o_proj and the head (2026-10-07)
+
+Defect: `MiMo-V2.6-Flash-Sushi-2.3bpw` died in warmup (`quantized_matmul` "weight should be uint32 but received bfloat16"), then, once the biases bound, on a 1024-wide embedding.
+Cause: the pack's source shard still carries bf16 `o_proj`, `embed_tokens` and `lm_head` beside the affine triples in their own shards, and the loader kept whichever file the directory listed last; separately, a config with no `quantization` block (`quant_bits == 0`) made embed/head/o_proj biases read as dense.
+Fix: an EXL3 pack loads each duplicated tensor from the shard its index names (`indexOwners`); embed and head are dense by dtype, not by `quant_bits`; `getLayerBias` probes when there is no block.
+Guard: `indexOwners: the index names the shard…` (model.zig) and `sushi pack: a tensor another shard owns is not billed` (sushi_pack.zig).
+
+## EmbeddingGemma 2: a padded row can NaN a whole batch (2026-10-08)
+
+Defect: the first `embedding_gemma2` forward returned NaN for every row of a mixed-length batch (a 3-token row beside a 12-token one, band radius 2).
+Cause: a sliding layer's mask is band + key padding, both `-inf`. A PADDED query whose whole band is padding softmaxes over `-inf`, and its NaN row reaches the real rows through V in every later layer (0 x NaN). Only the NAX kernels (M5) happen to stay finite; the plain kernels do not. `forwardGemma3EncoderWith` builds the same mask unfloored.
+Fix: `forwardEmbeddingGemma2With` floors the summed mask at -1e9. The projection head returns f32 too: normalizing a bf16 head output left EmbeddingGemma 1 norms up to 0.17% off 1.
+Ported from the reference, none visible in the config: the band radius is INCLUSIVE (`abs(q-kv) <= sliding_window`; the card's 1024 is the width), per-layer inputs are projection-only (`ple.*`, `layers.N.ple_block.*`, no `embed_tokens_per_layer`), the bias-free `embedding_projection` commutes with the mean so it runs after pooling in the dense0 slot, and the trained window is the card's 8192 (the config's 262144 is the rope table). The sentence-transformers 6 pooling sidecar spells `pooling_mode` as a string (the release ships it), which `parsePoolingSidecar` now reads: it used to fall through to the mean default, which would have served a CLS or last-token checkpoint mean-pooled.
+Guard: `EmbeddingGemma 2: forward and pooled embeddings match the transformers reference on a tiny checkpoint` (generate.zig; the band edge, the rope base and the floor each verified red) and `tests/test_embeddings.sh` [4d].
+Not wired: the audio tower (there is no conformer in the tree).
+
+## EmbeddingGemma 2 video frames embedded at 70 tokens, not 140 (2026-10-08)
+
+Defect: the first live video request embedded every frame at 70 soft tokens instead of the 140 the release's `processor_config.json` asks for (332 prompt tokens against the reference's 617).
+Cause: the budgets were parsed with a 16 KB `FixedBufferAllocator`; Google's file (an audio feature extractor and three processors) does not fit, the `OutOfMemory` was swallowed, and the defaults held. A toy-sized JSON in the unit test fit.
+Fix: `parseSoftTokenBudgetsFromJson` takes the allocator and the real file is its test input. `parseVisionProcessorDefaultsFromJson` still has the fixed buffer (Qwen/Muse files are small).
+Also easy to get wrong, none of it in the config: EmbeddingGemma 2 uses Gemma 4's own image processor, not the chat path's 768 square (`vision.budgetSize`: aspect-preserving, sides in multiples of 48, 70..1120 soft tokens); the resize is bicubic antialiased on the uint8 pixels (torchvision's kernel is Pillow's to within one level) and PIL's `convert("RGB")` DROPS alpha; a clip keeps `max_frames` client frames as `np.linspace(0, n-1, kept, dtype=int)` and wraps EVERY frame in its own `<boi>`…`<eoi>`; its grid is never padded to `default_output_length` (a bigger budget indexed past it) and runs fused attention (the eager score matrix alone is 2.4 GB per layer at the top budget).
+Guard: the processor's own tables for `budgetSize`/`sampledFrame`/`resizeToUnitChw` (vision.zig); `the image tower yields the reference's soft tokens` at two budgets and `image, video and mixed prompts embed like the reference` (generate.zig); `embeddingPrompt`/`mediaRunTokens` (server.zig); `tests/test_embeddings.sh` [4d]; real checkpoints via `tests/dump_embeddinggemma2_media.py`.
+
+## YuE2: a Scope held 25 GB of decoder temporaries, and three oracle bars were wrong (2026-10-08)
+
+Defect: the first YuE2 song peaked at 29 GB for 40 seconds of audio (weights 4.5 GB), growing with duration up to one decode tile; the first oracle run also showed a 0.4% VAE gain and a 0.6% logit RMS shortfall, and the sampler's nucleus kept the wrong tokens.
+Cause: `Scope` keeps every handle until it is deinitialized, and a stage-wide scope kept ~70 half-gigabyte Snake/conv temporaries of a 1056-frame tile alive through its eval. The gain is TF32: this NAX-enabled MLX rounds f32 convs, and `MLX_ENABLE_TF32=0` matches the reference to cos 1.000000. The logit shortfall is bf16 rounding moving the whole background one ulp (0.03125), which a softmax does not see. The nucleus bug was overwriting `c[0].v` in the softmax loop and then subtracting it for the other survivors.
+Fix: `snake` and `resUnit` own short-lived scopes and return one kept result (peak now weights + 5.4 GB); the oracles bound what matters: logits by argmax and KL, the decoder by cosine and a 1% scale band, the NAR by cosine and `rms_ratio`.
+Guard: `yue2 sampler: top-k and the nucleus bound the draw, a seed repeats it` (red before the fix), the five `YUE2_*` oracles (`tests/dump_yue2_fixtures.py`), and `tests/test_yue2_gen.sh`. The app side: `tiktoken` was missing from the download allowlist, so an app-downloaded pack had no tokenizer; `Yue2MusicTests.testBundleMarkersAreTheFilesTheServerNeeds` selects a simulated tree against the bundle's own ready markers.
+
+## Whitespace runs split where HF's regex keeps them whole: blank lines holding spaces, U+3000/NBSP, DeepSeek's isolated runs (2026-10-10)
+
+Defect: on the Qwen, Llama-3, GLM, LFM2, Muse and DeepSeek-V4 regexes a blank line holding spaces cost a token (`"\n    \n"` -> `"\n"` + `"    \n"`; HF: one); U+3000, NBSP and the other Unicode spaces were read as punctuation (`你好\u3000世界\u3000\u3000！` glued `\u3000\u3000！`; HF: three); and on DeepSeek-V4, Hunyuan (hy_v3) and Spark-X2.5 a whitespace run before a number or a CJK run was split (`"x  1"` -> `"x"`, `" "`, `" "`, `"1"`; HF keeps `"  "`), so every indented number in code was off. Indented code, Markdown, Chinese prose and Gutenberg headers reached the model off-distribution.
+Cause: pattern 5 `\s*[\r\n]+` stopped at the run's FIRST newline, where Oniguruma's greedy `\s*` gives back characters only down to the LAST one; `\s` was ASCII-only, where Oniguruma's is Unicode White_Space; and those three families put `\p{N}{1,3}` and a CJK class in Split entries of their own AHEAD of the main regex, which then runs on each piece alone, while `.gpt2` ran over the whole text. U+3000 read as punctuation hid that last gap on Chinese prose: fixing `\s` alone split every U+3000 paragraph indent there.
+Fix: patterns 5-7 walk codepoints (`whitespaceLen`); pattern 5 ends after the run's last `\r`/`\n`; `isWhitespaceCp` is the White_Space set; `isolatedRunsPreTokenize` cuts the text at digit and CJK run edges (`Tokenizer.isolated_runs`, exact match on those Split entries) before the gpt2 grammar.
+Guard: the `pre-tokenize:` tests (tokenizer.zig); `tokenizer parity` over `tests/fixtures/tokenizer_parity/{qwen3_8,deepseek_v4}.json` (`tests/dump_tokenizer_parity_fixtures.py`); the qwen3_8 texts per family in `tests/test_tokenizer_hf_parity.sh`.
+Not fixed: the NFC normalizer (U+2000 -> U+2002); DeepSeek's main regex reads zero-width characters as neither punctuation nor space; Spark-X2.5's has `[\r\n]` where the gpt2 regex has `\s*[\r\n]+`, and its vocab merges `\n` with 3, 7, 11 or 15 spaces, so a blank line holding exactly that many (LF or CRLF), at the start of the text or after a line ending in a letter, digit or CJK, and before an unindented line or the end of the text, matched Spark by accident and now differs (124 of 4992 blank-line shapes, none of 900 real-text chunks).
+
+## A placeholder id of 0 is UNSET, not token 0: an audio-only model heard silence (Qwen3-ASR, 2026-10-13)
+
+**Defect.** Qwen3-ASR's first live transcription answered `language None<asr_text>` (no speech) with the tower matching mlx-audio at cos 1.000000. **Cause.** Three splice sites treated `image_token_id` as always set: `applyVisionEmbeddingsWith` returned early when it was 0 (an audio-only model has none, so its rows were never spliced), `spliceVisionRows` matched `token_ids == 0`, and `countSpliceRows` counted it, so a text `!` (Qwen id 0) would have taken an audio row and shifted every later one. **Fix.** All three skip a 0 id, like the audio and video ids already did. **Guards.** `spliceVisionRows: an unset placeholder id (0) never claims token 0`, the `countSpliceRows` case, and `tests/test_transcriptions.sh` (word recall 0.0 on revert).
+
+## A companion pack under its base's `model_type`: Qwen3-ForcedAligner read as an ASR (2026-10-13)
+
+**Defect.** `mlx-community/Qwen3-ForcedAligner-0.6B-*` was listed as a `transcription` model, loaded with no audio tower and a 4096 context (its thinker's type fell to `unknown`), and became the headless default chat model, as the Qwen3-ASR itself did. **Cause.** The aligner's root says `qwen3_asr` like the ASR's; only `thinker_config.model_type` (`qwen3_forced_aligner`) tells them apart, which nothing read, and `chatCapable` let any qwen3 trunk behind an audio tower be the default. **Fix.** Discovery reports the arch hint `qwen3_forced_aligner` (capability `alignment`, a named 400 on every text route), the parser takes the thinker type as the ASR shape plus the timestamp fields, the app lists it under the same type (`DownloadManager.markerModelType`), and an audio-tower trunk is never chat-capable. Japanese and Korean go one character per unit: the reference's nagisa and dictionary splitters are Python, and measured against them word times agree within one 80 ms step (Japanese, 27/27 words) and exactly (Korean, units joined back into its spaced words, 13/13). **Guards.** `a Qwen3-ForcedAligner pack is discovered as the aligner`, `ModelConfig parses Qwen3-ForcedAligner`, the registry promotion test, `AsrAlignerDownloadTests`, `tests/test_transcriptions.sh` section 6.
+
+## A Sushi MiMo pack drafted nothing: its MTP heads kept the source layout (2026-10-13)
+
+Every boot of `beamster/MiMo-V2.6-Flash-Sushi-*` logged `[mimo-mtp] missing model.mtp.layers.0.self_attn.q_proj.weight — MTP off`: the pack stores its three heads like its trunk (fused e4m3 QKV with 128-tile scales, e4m3 MLP), and `sushi_pack` only converted the trunk while billing the heads as unserved. `dequantFp8Trunk` now runs the same QKV split and MLP decode over `model.mtp.layers.N`, in a sliding layer's geometry (`ModelConfig.firstSlidingLayer`, which `mimo_mtp` reads too). Guard: `sushi pack: the MiMo MTP heads get the trunk's split QKV and decoded MLP` + the smoke `mimo_v2_sushi.mtp` cell.
+
+
+## MiMo's own DFlash drafter loaded, drafted garbage and outranked MTP (2026-10-13)
+
+`--drafter <MiMo Sushi pack>/dflash` (Xiaomi's drafter) loaded clean and accepted 2-4% of its drafts, so the gate turned it off and the request ran serial: 32 tok/s against 67 with the pack's MTP heads, because DFlash outranks MTP. Its config declares `partial_rotary_factor` 0.5, `attention_value_scale` and attention-sink biases, and the block forward has no arm for any of them. `parseConfigFromJson` now refuses such a drafter by name (`UnsupportedDflashAttention`), like the unported Markov heads. Guard: `dflash: a drafter whose attention needs unported arms is refused by name`.
+
+## A speaker cache keeps one of many equal frames: past the first chunk, parity is the selection, not the output (Nemotron 3 Diarization, 2026-10-13)
+
+**Defect.** The diarizer agreed with mlx-audio to 0.04 inside its first 27.2 s chunk and drifted to 0.43 after it on the 8-bit pack. **Cause.** Every confidently spoken frame scores about the same in the Arrival-Order Speaker Cache's ranking, so a compression keeps one of many near-equal frames: a 0.036 difference in probabilities swapped 18 of 300 kept frames, and the chunks that attend to the cache moved with them (mlx-audio and the official model disagree the same way). Under it sat a real one: `Scope.geluErf` added an f32 scalar, so a bf16 caller's residual stream ran in f32 from the first feed-forward on. **Fix.** `geluErf` keeps its input's dtype (the ASR tower, f32, is unchanged); the compression runs on the host (`aoscKeep`) so it can be checked on its own. **Guard.** `nemotron diarization: features, speaker activity and the cache match the references` checks every compression against the official one on the same inputs and the activity against both references; on the test conversation the port puts 99.43% of speech frames on the right speaker, mlx-audio 99.48%, the official model 99.49%. A cached-selection model is judged by agreement and accuracy, never by frame-exact output past the first chunk.
+
+## The int8 copy sat BESIDE the packed weights, and the route ran where it could not (`w8a8`, 2026-10-16)
+
+**Defect.** `--w8a8` built an int8 copy of every DiT linear but left the packed weights resident (H3 held 77 GB, a 4-bit pack grew), and once it was the default its int8 ATTENTION ran on every machine: only the linears checked for NAX, so an M1-M4 would have launched a kernel written for the M5 matrix unit. **Cause.** Four paths still read the originals (row floor, LoRA on fused q/k/v and gate/up, the ANE seam, `outFeatures`); the loaders also held their weight maps, whose refs kept every packed buffer alive until the loader returned; the activation memo outlived its job. **Fix.** No row floor; fused q/k/v are row VIEWS (an interleaved gate/up runs the plain GEMM under a LoRA, `forwardPair`); `--ane-*` skip the conversion and the bill follows; a loader drops each converted block from its map (`Weights.dropBlock`); the memo drops at the end of every media job; `w8a8.nax()` gates the kernels (int8 attention included); the route is default-on only with NAX and 64 GiB RAM, since nothing falls back to packed once the copy exists. **Guard.** `int8 attention declines where the matrix unit is absent`, `w8a8 is on by default only with NAX and 64 GiB`, `w8a8 overlay converts the pack's own (bits, group)`, `w8a8 takeLinear`, `Weights.dropPrefix`, `residency bill:` tests, the Hunyuan3D arm's load-peak bound (red without `dropBlock`), and every engine arm (cosine AND rms vs the packed forward, resident bytes vs the bill).
+## A ModelOpt GLM answered with its own prompt: the `up` scale landed after the clamp (2026-10-17)
+
+**Defect.** `GLM-5.3-Flash-FP4-Local` loaded and served, then echoed the question back (12 of 39 `test_glm5_next.sh` checks failed). **Cause.** The loader folded each expert's `up` global scale into the routing weight, which is exact for Flash Next. GLM clamps `up` at +-10 BEFORE that point, and the scales are ~4.5e-5, so the unscaled `up` (~20,000x too large) saturated the clamp in every MoE layer. **Fix.** With a `swiglu_limit` the loader keeps `up_proj.expert_scale` apart (`MoeMlpWeights.up_expert_scale`, applied to `up` before the activation on the sorted path) and `expert_scale` is the down scale alone. **Rule.** A scale folds past an activation only if the activation is linear in that operand. **Guard.** `ModelOpt banks: a clamped SwiGLU keeps the up scale apart`; live `tests/test_glm5_next.sh` (39/39).
+
+## `F_NOCACHE` is ignored for an unaligned read: a 165 GB load filled 120 GB of page cache (2026-10-17)
+
+**Defect.** Loading GLM FP4-Local froze a 256 GB Mac for ~30 s at a time (kernel pressure warning, swap growing) and ended in SIGKILL or a watchdog kill. **Cause.** `F_NOCACHE` bypasses the cache only when file offset, length AND buffer are page-aligned. Expert tensors sit at arbitrary offsets, so every `pread` went through the cache (APFS, 4 GiB read: aligned +0.00 GiB cache, offset +512 +3.0 GiB, plain +4.0 GiB) beside 163 GiB of wired banks. **Fix.** `modelopt_pack.Reader` reads the covering aligned span (`alignedSpan`) through a page-aligned stage; banks are read 6 at a time and copied into MLX's own memory; `status.memoryPressureLevel` is read before each round and stops the load with `InsufficientMemory`; the resident bill adds the decoded scales (`bankExpansionBytes`). The pressure stop is the one place a load reads OS pressure: the next loader should join it, or the preflight absorb it. **Tell.** `File-backed pages` in `vm_stat` climbing as fast as the load. **Guard.** `ModelOpt reads`, `ModelOpt banks`, `residentModelDiskBytes: a ModelOpt pack is billed its decoded expert banks`.
+
+## An f32 norm weight widened a bf16 model's MoE input: GLM FP4 ran the slow chain everywhere (2026-10-17)
+
+**Defect.** `GLM-5.3-Flash-FP4-Local` decoded far slower than the 5.1bpw pack (6400 ops per forward). **Cause.** NVIDIA keeps `post_attention_layernorm` (and the final norm) in f32, and `rms_norm` promotes to the weight's dtype, so the MoE read f32: the fused hyper-connection read (`hcRowsServes` wants the norm dtype to equal the stream's) and the fp4 MoE kernels (16-bit only) both declined, and the clamped SwiGLU plus per-expert up scale had no fused path anyway. **Fix.** `narrowsLoadedF32Norm` casts the language trunk's f32 layer norms to bf16 at load, for ModelOpt packs only (the one reference measured; `MLX_SERVE_F16_NARROW_1D=0` restores them); `moe_fp4` takes the up scale and GLM's whole-number clamp (`Scales`); `moeFp4DecodeEligible` declines a non-16-bit stream instead of throwing. **Guard.** The predicate test (a vision tower's f32 norms stay: the RADIO f32-parity tests went red when it matched `vision_projector.*layernorm`), `loadWeightsOpt: an f32 trunk norm narrows ... for a ModelOpt pack` (any other pack keeps its dtype), `moe fp4 decode: a clamped SwiGLU ...` against fp32 truth, `ops/forward` and the `[moe] fp4 decode kernels engaged` line in `MLX_SERVE_DECODE_FWD_UBENCH`.

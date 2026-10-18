@@ -11,10 +11,42 @@ struct LoraAdapter: Codable, Equatable, Identifiable {
     /// Absolute path to a `.safetensors` adapter. Empty rows (mid-edit, e.g.
     /// right after tapping "+") are dropped before the request is sent.
     var path: String = ""
-    /// Strength multiplier on top of the file's own alpha/rank scale.
+    /// Strength multiplier on top of the file's own alpha/rank scale. Negative
+    /// values reverse the effect and only slider-style LoRAs want them, so the
+    /// row keeps a 0 floor until `allowsNegative` is switched on.
     var scale: Double = 1.0
+    var allowsNegative: Bool = false
 
-    private enum CodingKeys: String, CodingKey { case path, scale }
+    private enum CodingKeys: String, CodingKey { case path, scale, allowsNegative }
+}
+
+extension LoraAdapter {
+    /// `allowsNegative` is absent from older blobs; a saved negative scale implies it.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        path = try c.decodeIfPresent(String.self, forKey: .path) ?? ""
+        scale = try c.decodeIfPresent(Double.self, forKey: .scale) ?? 1.0
+        allowsNegative = try c.decodeIfPresent(Bool.self, forKey: .allowsNegative) ?? (scale < 0)
+    }
+}
+
+/// What the LoRA picker offers for a strength. The server takes any finite
+/// number; the slider only has to be usable, so it widens to fit the value.
+enum LoraScale {
+    /// Far past any published slider adapter (±20); only keeps a typo from overflowing bf16.
+    static let limit = 100.0
+
+    static func clamped(_ value: Double, allowsNegative: Bool) -> Double {
+        value.isNaN ? 0 : min(limit, max(allowsNegative ? -limit : 0, value))
+    }
+
+    /// Slider half-range: ±2 until a value outside it is entered, then the next multiple of 10.
+    static func sliderBound(for value: Double) -> Double {
+        let m = abs(value)
+        return m <= 2 ? 2 : min(limit, (m / 10).rounded(.up) * 10)
+    }
+
+    static func sliderStep(bound: Double) -> Double { bound <= 2 ? 0.05 : 0.5 }
 }
 
 /// Keys for the pre-multi-LoRA single `loraPath`/`loraScale` fields, kept
@@ -246,6 +278,8 @@ extension AudioGenSettings {
 struct MusicGenSettings: Codable, Equatable {
     var modelId: String = MusicModelPreset.acestepXLTurbo8bit.id
     var durationSeconds: Int = 60
+    /// YuE2: let the model end the song (no cap). On by default: the cap cut songs mid-lyric.
+    var autoLength: Bool = true
     var vocalLanguage: String = "en"
     var keepResident: Bool = false
     // Everything below used to live in plain `@State`. The pane is UNMOUNTED
@@ -258,6 +292,9 @@ struct MusicGenSettings: Codable, Equatable {
     var seed: Int = -1
     var steps: Int? = nil
     var instrumental: Bool = false
+    /// YuE2's score plan and the hand-edited ABC (part of the draft).
+    var plan: MusicPlan = .full
+    var score: String = ""
     /// Advanced starts OPEN. Collapsed-by-default is why tempo, key, seed and
     /// steps read as missing features — they were one unlabeled chevron away.
     var showAdvanced: Bool = true
@@ -310,6 +347,7 @@ extension MusicGenSettings {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         if let v = try c.decodeIfPresent(String.self, forKey: .modelId) { modelId = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .durationSeconds) { durationSeconds = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .autoLength) { autoLength = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .vocalLanguage) { vocalLanguage = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         bpm = try c.decodeIfPresent(Int.self, forKey: .bpm)
@@ -318,6 +356,8 @@ extension MusicGenSettings {
         if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
         steps = try c.decodeIfPresent(Int.self, forKey: .steps)
         if let v = try c.decodeIfPresent(Bool.self, forKey: .instrumental) { instrumental = v }
+        if let v = try c.decodeIfPresent(MusicPlan.self, forKey: .plan) { plan = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .score) { score = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prompt) { prompt = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .lyrics) { lyrics = v }
@@ -434,6 +474,9 @@ struct VideoGenSettings: Codable, Equatable {
     var refImageSize: RefImageSizing = .match
     var showMediaInputs: Bool = true
     var showAdvanced: Bool = false
+    /// Storyboard mode: `prompt` is the story, the shots are what generates.
+    var storyboardMode: Bool = false
+    var storyboard: [StoryboardSegment] = []
 
     private static let storageKey = "videoGenSettings"
 
@@ -551,6 +594,8 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(RefImageSizing.self, forKey: .refImageSize) { refImageSize = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showMediaInputs) { showMediaInputs = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .storyboardMode) { storyboardMode = v }
+        if let v = try c.decodeIfPresent([StoryboardSegment].self, forKey: .storyboard) { storyboard = v }
     }
 }
 

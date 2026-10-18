@@ -41,8 +41,8 @@ struct SoundGenView: View {
 
             VStack(spacing: 12) {
                 previewArea
-                AudioHistoryShelf(title: "History", paths: service.recent,
-                                  playingPath: clipPlayer.playingPath,
+                AudioHistoryShelf(paths: service.recent,
+                                  playingPath: clipPlayer.playingPath, paused: clipPlayer.isPaused,
                                   onPlay: { clipPlayer.play($0) }, onStop: { clipPlayer.stop() })
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: MediaStorage.soundRoot)])
@@ -63,7 +63,6 @@ struct SoundGenView: View {
             }
             if server.status == .running { Task { await server.refreshModels() } }
         }
-        .onDisappear { clipPlayer.stop() }
         .onChange(of: snapshot) { _, s in if !hydrating { s.save() } }
         .onChange(of: service.phase) { _, phase in
             if case .running = phase { clipPlayer.stop() }
@@ -192,6 +191,7 @@ struct SoundGenView: View {
                                        description: Text("Describe a sound and press Generate.").font(.app(.body)))
             case .running(let step, let total, let message):
                 VStack(spacing: 12) {
+                    LoadingModelsRow()
                     if total == 0 {
                         ProgressView().frame(width: 240)
                     } else {

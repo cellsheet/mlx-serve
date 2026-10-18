@@ -1,9 +1,9 @@
 const std = @import("std");
 const jinja_c = @import("jinja_c");
 const tokenizer_mod = @import("tokenizer.zig");
-const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_ds4 = if (@import("build_options").ds4_engine) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const ds4_ffi = if (@import("build_options").ds4_engine) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
+const arch_llama = if (@import("build_options").llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const log = @import("log.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 
@@ -43,17 +43,21 @@ pub const VisionPreproc = struct {
     /// Clef's Pillow RGB conversion discards alpha instead of compositing it.
     composite_alpha: bool = true,
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
-    /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2 } = .gemma,
+    /// `gemma_budget` (Gemma 4's own processor, as EmbeddingGemma 2 uses it: a CHW image of any
+    /// aspect ratio sized to `max_tokens` soft tokens), or one of the patch-grid towers
+    /// (each with its own resize + patch order).
+    mode: enum { gemma, qwen, muse, lfm2, glm, minicpm, gemma_budget, radio } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
     min_pixels: u32 = 0,
     max_pixels: u32 = 0,
-    /// muse/lfm2: the resize cap is on MERGED tokens, not pixels.
+    /// muse/lfm2/glm: the resize cap is on MERGED tokens, not pixels.
     max_tokens: u32 = 0,
-    /// lfm2: the budget has a FLOOR too — a small image is upscaled to it.
+    /// lfm2/glm: the budget has a FLOOR too — a small image is upscaled to it.
     min_tokens: u32 = 0,
+    /// minicpm: most detail crops a source is sliced into.
+    max_slices: u32 = 0,
     /// lfm2 tiling. A source past `max_tokens * pixels_tolerance` is split into
     /// a grid of `tile_size` tiles (plus a thumbnail) and encoded piece by
     /// piece. `tile_size == 0` disables splitting, which is every other tower.
@@ -62,6 +66,8 @@ pub const VisionPreproc = struct {
     max_tiles: u32 = 0,
     use_thumbnail: bool = false,
     pixels_tolerance: f32 = 0,
+    /// gemma_budget video: the most frames kept from a client's list.
+    max_frames: u32 = 0,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.
@@ -71,14 +77,13 @@ pub const AudioData = struct {
     samples: []const u8, // Raw float32-LE bytes (n_samples * 4)
 };
 
-/// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
-/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo` /
-/// `QwenVision.forwardVideo`) — the video-equivalent of `ImageData.pixels`'s
-/// Qwen merge-order layout. `grid_t` is a TEMPORAL PATCH count (raw sampled
-/// frames grouped `tps`-at-a-time), not a raw frame count; `grid_h`/`grid_w`
-/// are the shared per-frame patch grid every frame in the video was resized to.
+/// Qwen3-VL stores pre-patchified pixel values for every temporal-patch group.
+/// `grid_t` is that group count and `grid_h` / `grid_w` are the shared patch grid.
+/// RADIO stores concatenated float32 CHW frames. `grid_t` is the raw frame count
+/// (the encoder repeats a short last tubelet) and `grid_h` / `grid_w` are the
+/// shared pixel size.
 pub const VideoData = struct {
-    pixels: []const u8, // merge-order patches [grid_t*(grid_h*grid_w)*feat*4]
+    pixels: []const u8,
     grid_t: u32,
     grid_h: u32,
     grid_w: u32,
@@ -154,18 +159,15 @@ pub const ChatConfig = struct {
     /// Template variables as a JSON object: the model's `chat_template_kwargs`
     /// (`model-settings.json`), with a request's own merged over them per request.
     chat_template_kwargs: ?[]const u8 = null,
-    /// The model's `enable_thinking` / `reasoning_effort` kwargs, typed: used
-    /// only when a request names neither (`server.resolveChatThinking`).
-    default_enable_thinking: ?bool = null,
-    default_reasoning_effort: ?[]const u8 = null,
     /// `templateRendersToolTurn` for this template, probed ONCE at load (a probe render
     /// per request is a second parse of a multi-KB template); null = unknown, probe.
     renders_tool_turn: ?bool = null,
+    /// A model-specific video atom emitted only for an attached media part.
+    video_placeholder: ?[]const u8 = null,
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);
         if (self.chat_template_kwargs) |k| self.allocator.free(k);
-        if (self.default_reasoning_effort) |e| self.allocator.free(e);
         if (self.bos_token) |t| self.allocator.free(t);
         if (self.eos_token) |t| self.allocator.free(t);
     }
@@ -331,7 +333,13 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
 
     const root = parsed.value.object;
 
-    const chat_template: []const u8 = if (chatTemplateFromValue(root.get("chat_template"))) |t|
+    // DeepSeek's V4.1 template merges dicts with `**` (jinja.cpp cannot parse it)
+    // and the repack's departs from encoding.py; ours is pinned to the encoder.
+    const dsv41 = dirModelTypeIs(io, allocator, model_dir, "deepseek_v41");
+    if (dsv41) log.info("chat: deepseek_v41 — using the embedded V4.1 transcription\n", .{});
+    const chat_template: []const u8 = if (dsv41)
+        try allocator.dupe(u8, @embedFile("fixtures/dsv41_chat_template.jinja"))
+    else if (chatTemplateFromValue(root.get("chat_template"))) |t|
         try allocator.dupe(u8, t)
     else blk: {
         // Fall back to chat_template.jinja file (e.g. Qwen3.5 models)
@@ -596,6 +604,65 @@ pub fn decodeViaLlama(
         try out.appendSlice(allocator, piece);
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn radioTestTokenizer(allocator: std.mem.Allocator) !Tokenizer {
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    errdefer tok.deinit();
+    for (tok.byte_to_unicode, 0..) |cp, byte| {
+        var buf: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(cp, &buf);
+        const text = try allocator.dupe(u8, buf[0..n]);
+        try tok.vocab.put(text, @intCast(byte));
+        try tok.id_to_token.put(@intCast(byte), text);
+        try tok.unicode_to_byte.put(cp, @intCast(byte));
+    }
+    for ([_][]const u8{ "<image>", "<img>", "</img>" }, 1000..) |name, id| {
+        const text = try allocator.dupe(u8, name);
+        try tok.special_tokens.put(text, @intCast(id));
+        try tok.id_to_token.put(@intCast(id), text);
+    }
+    return tok;
+}
+
+test "RADIO video placeholders: literal HTML stays text in every role" {
+    const a = std.testing.allocator;
+    var tok = try radioTestTokenizer(a);
+    defer tok.deinit();
+    const config = ChatConfig{
+        .chat_template = "{% for m in messages %}{{ m.role + ':' }}{% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{% if p.type == 'image' %}{{ '<image>' }}{% elif p.type == 'video' %}{{ '<video>' }}{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endif %}{% endfor %}",
+        .bos_token = null, .eos_token = null, .add_bos_token = false,
+        .allocator = a, .renders_tool_turn = true, .video_placeholder = "<img>",
+    };
+    for ([_][]const u8{ "system", "user", "assistant", "tool" }) |role| {
+        const messages = [_]Message{.{ .role = role, .content = "How do I autoplay a <video> element?" }};
+        const ids = try formatChat(a, &tok, &messages, &config, null, null, true, null, false);
+        defer a.free(ids);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u32, ids, &.{1001}));
+        const text = try tok.decode(a, ids, false);
+        defer a.free(text);
+        try std.testing.expect(std.mem.indexOf(u8, text, "<video>") != null);
+    }
+}
+
+test "RADIO video placeholders: only attached clips create video atoms" {
+    const a = std.testing.allocator;
+    var tok = try radioTestTokenizer(a);
+    defer tok.deinit();
+    const config = ChatConfig{
+        .chat_template = "{% for m in messages %}{% for p in m.content %}{% if p.type == 'image' %}{{ '<image>' }}{% elif p.type == 'video' %}{{ '<video>' }}{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endfor %}",
+        .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .video_placeholder = "<img>",
+    };
+    const clips = [_]VideoData{.{ .pixels = "", .grid_t = 128, .grid_h = 32, .grid_w = 32 }};
+    const images = [_]ImageData{.{ .pixels = "", .width = 32, .height = 32 }};
+    const messages = [_]Message{.{ .role = "user", .content = "Explain this <video> element and the clip.", .images = &images, .videos = &clips }};
+    const ids = try formatChat(a, &tok, &messages, &config, null, null, true, null, false);
+    defer a.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{1001}));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{1000}));
+    const text = try tok.decode(a, ids, false);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<video>") != null);
 }
 
 /// Render the Jinja chat template with the given messages.
@@ -1081,7 +1148,7 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
 }
 
 pub fn serializeMessagesJsonOpts(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, false);
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, false, null);
 }
 
 /// K2-Horizon's template raises on an assistant turn with NO thinking field,
@@ -1092,7 +1159,7 @@ fn templateRequiresReasoningField(tpl: []const u8) bool {
 }
 
 pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, chat_config: *const ChatConfig) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template));
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template), chat_config.video_placeholder);
 }
 
 pub fn messageHasMedia(msg: Message) bool {
@@ -1110,7 +1177,7 @@ pub fn isImageItemStart(img: ImageData) bool {
 /// Media as content parts, so the model's own template renders one
 /// placeholder per item where the message sits: images, videos, audio (the
 /// order the server encodes them), then the text.
-fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), msg: Message) !void {
+fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), msg: Message, video_placeholder: ?[]const u8) !void {
     try buf.append(allocator, '[');
     var first = true;
     for (msg.images orelse &[_]ImageData{}) |img| {
@@ -1122,7 +1189,11 @@ fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8)
     for (msg.videos orelse &[_]VideoData{}) |_| {
         if (!first) try buf.append(allocator, ',');
         first = false;
-        try buf.appendSlice(allocator, "{\"type\":\"video\"}");
+        if (video_placeholder) |atom| {
+            try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
+            try appendJsonString(allocator, buf, atom);
+            try buf.append(allocator, '}');
+        } else try buf.appendSlice(allocator, "{\"type\":\"video\"}");
     }
     for (msg.audio orelse &[_]AudioData{}) |_| {
         if (!first) try buf.append(allocator, ',');
@@ -1137,7 +1208,7 @@ fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8)
     try buf.append(allocator, ']');
 }
 
-fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool) ![]const u8 {
+fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool, video_placeholder: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -1149,7 +1220,7 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
 
         try buf.appendSlice(allocator, ",\"content\":");
         if (messageHasMedia(msg)) {
-            try appendMediaContentParts(allocator, &buf, msg);
+            try appendMediaContentParts(allocator, &buf, msg, video_placeholder);
         } else if (msg.content.len > 0) {
             try appendJsonString(allocator, &buf, msg.content);
         } else switch (empty_content) {
@@ -1308,6 +1379,15 @@ pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
     return "low";
 }
 
+/// OpenAI's effort vocabulary -> DeepSeek-V4.1's low|medium|high|max (encoder default high).
+fn dsv41EffortFor(effort: ?[]const u8) []const u8 {
+    const e = effort orelse return "high";
+    if (std.mem.eql(u8, e, "none") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "low")) return "low";
+    if (std.mem.eql(u8, e, "medium")) return "medium";
+    if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max") or std.mem.eql(u8, e, "ultra")) return "max";
+    return "high";
+}
+
 /// OpenAI's effort vocabulary -> GLM-5-Next's low|high|max (the template's default is max).
 fn glm5EffortFor(effort: ?[]const u8) []const u8 {
     const e = effort orelse return "max";
@@ -1459,8 +1539,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         try buf.appendSlice(allocator, k2EffortFor(effort));
         try buf.append(allocator, '"');
     } else if (dsv4_style) {
+        // V4.1 renders a numeric budget for every thinking turn (its own ladder).
+        const v41 = std.mem.indexOf(u8, chat_config.chat_template, "(range 1-100") != null;
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
-        try buf.appendSlice(allocator, dsv4EffortFor(effort));
+        try buf.appendSlice(allocator, if (v41) dsv41EffortFor(effort) else dsv4EffortFor(effort));
         try buf.append(allocator, '"');
     } else if (qwen38_style) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
@@ -5070,10 +5152,25 @@ fn inklingTrailingNameRun(text: []const u8, end: usize) []const u8 {
 /// argument values.
 // DeepSeek-V4 native DSML markers. `｜` is the FULLWIDTH vertical bar
 // (U+FF5C, 3 bytes) — the dsml_token "｜DSML｜" appears in no other family.
-const DSML_INVOKE_TAG = "<｜DSML｜invoke";
-const DSML_INVOKE_CLOSE = "</｜DSML｜invoke>";
-const DSML_PARAM_TAG = "<｜DSML｜parameter";
-const DSML_PARAM_CLOSE = "</｜DSML｜parameter>";
+// V4.1 puts a space before every tag name (`<｜DSML｜ invoke`).
+const DsmlTag = struct { open: []const u8, name: []const u8 };
+const DSML_INVOKE_TAG: DsmlTag = .{ .open = "<｜DSML｜", .name = "invoke" };
+const DSML_INVOKE_CLOSE: DsmlTag = .{ .open = "</｜DSML｜", .name = "invoke>" };
+const DSML_PARAM_TAG: DsmlTag = .{ .open = "<｜DSML｜", .name = "parameter" };
+const DSML_PARAM_CLOSE: DsmlTag = .{ .open = "</｜DSML｜", .name = "parameter>" };
+
+const DsmlHit = struct { at: usize, end: usize };
+
+fn dsmlFind(text: []const u8, from: usize, comptime tag: DsmlTag) ?DsmlHit {
+    var p = from;
+    while (std.mem.indexOfPos(u8, text, p, tag.open)) |at| {
+        var q = at + tag.open.len;
+        if (q < text.len and text[q] == ' ') q += 1;
+        if (std.mem.startsWith(u8, text[q..], tag.name)) return .{ .at = at, .end = q + tag.name.len };
+        p = at + 1;
+    }
+    return null;
+}
 
 /// Tolerant quoted-attribute extraction from a tag-attribute segment:
 /// `name="X"` / `name='X'` / mangled unquoted `name=X` (to whitespace/`>`).
@@ -5113,8 +5210,8 @@ fn dsmlAttr(seg: []const u8, comptime key: []const u8) ?[]const u8 {
 fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
     const Param = struct { key: []const u8, value: []const u8, is_string: bool };
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, text, pos, DSML_INVOKE_TAG)) |inv| {
-        var p = inv + DSML_INVOKE_TAG.len;
+    while (dsmlFind(text, pos, DSML_INVOKE_TAG)) |inv| {
+        var p = inv.end;
         const tag_end = std.mem.indexOfScalarPos(u8, text, p, '>') orelse break;
         const name = dsmlAttr(text[p..tag_end], "name") orelse {
             pos = tag_end + 1;
@@ -5125,19 +5222,19 @@ fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
         var params = std.ArrayList(Param).empty;
         defer params.deinit(allocator);
         while (true) {
-            const next_param = std.mem.indexOfPos(u8, text, p, DSML_PARAM_TAG);
-            const next_close = std.mem.indexOfPos(u8, text, p, DSML_INVOKE_CLOSE);
-            const next_invoke = std.mem.indexOfPos(u8, text, p, DSML_INVOKE_TAG);
-            const np = next_param orelse std.math.maxInt(usize);
-            const nc = next_close orelse std.math.maxInt(usize);
-            const ni = next_invoke orelse std.math.maxInt(usize);
+            const next_param = dsmlFind(text, p, DSML_PARAM_TAG);
+            const next_close = dsmlFind(text, p, DSML_INVOKE_CLOSE);
+            const next_invoke = dsmlFind(text, p, DSML_INVOKE_TAG);
+            const np = if (next_param) |h| h.at else std.math.maxInt(usize);
+            const nc = if (next_close) |h| h.at else std.math.maxInt(usize);
+            const ni = if (next_invoke) |h| h.at else std.math.maxInt(usize);
             if (np == std.math.maxInt(usize) and nc == std.math.maxInt(usize) and ni == std.math.maxInt(usize)) {
                 // truncated invoke: ship NAME + completed pairs
                 p = text.len;
                 break;
             }
             if (nc <= np and nc <= ni) {
-                p = nc + DSML_INVOKE_CLOSE.len;
+                p = next_close.?.end;
                 break;
             }
             if (ni < np) {
@@ -5147,7 +5244,7 @@ fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
                 break;
             }
             // parameter
-            var q = np + DSML_PARAM_TAG.len;
+            var q = next_param.?.end;
             const ptag_end = std.mem.indexOfScalarPos(u8, text, q, '>') orelse {
                 p = text.len;
                 break;
@@ -5156,14 +5253,14 @@ fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
             const pkey = dsmlAttr(attrs, "name");
             const pstring = dsmlAttr(attrs, "string");
             const vstart = ptag_end + 1;
-            const vclose = std.mem.indexOfPos(u8, text, vstart, DSML_PARAM_CLOSE) orelse {
+            const vclose = dsmlFind(text, vstart, DSML_PARAM_CLOSE) orelse {
                 // unterminated value = server-cut fragment; drop it, end scan
                 p = text.len;
                 break;
             };
-            q = vclose + DSML_PARAM_CLOSE.len;
+            q = vclose.end;
             if (pkey) |k| {
-                const value = text[vstart..vclose];
+                const value = text[vstart..vclose.at];
                 // string attr absent (mangled opener): treat JSON-parseable
                 // values as JSON, everything else as a string.
                 const is_string = if (pstring) |sf|
@@ -9998,6 +10095,27 @@ test "renderChatTemplate: |min picks the smaller element, |max the larger" {
     try testing.expect(std.mem.indexOf(u8, rendered, "1/3") != null);
 }
 
+test "renderChatTemplate: a namespace attribute named like a dict method is the attribute" {
+    // `ns.items` resolved to dict.items(), `+` raised, and the render fell back to the generic format.
+    const allocator = testing.allocator;
+    const tpl =
+        \\{%- set ns = namespace(items=[]) -%}
+        \\{%- for message in messages -%}{%- set ns.items = ns.items + [message.content] -%}{%- endfor -%}
+        \\ITEMS={{ ns.items | join(',') }}
+    ;
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{ .{ .role = "user", .content = "hi" }, .{ .role = "assistant", .content = "there" } };
+    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "ITEMS=hi,there") != null);
+}
+
 test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback (HY3_MODEL_DIR)" {
     // Env-gated: HY3_MODEL_DIR=<dir containing chat_template.jinja>. Renders
     // the actual shipped template with system + tools + a tool round and
@@ -10490,6 +10608,36 @@ test "dsv4EffortFor: OpenAI effort vocabulary maps onto DeepSeek's low|high|max"
     try testing.expectEqualStrings("max", dsv4EffortFor("max"));
     // `ultra` is an EXPLICIT ask for the top tier — the unknown-string fallback would invert it into low.
     try testing.expectEqualStrings("max", dsv4EffortFor("ultra"));
+}
+
+test "serializeExtraContext: V4.1 maps effort onto its encoder's levels, default high" {
+    const a = testing.allocator;
+    var cfg = ChatConfig{
+        .chat_template = @embedFile("fixtures/dsv41_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = a,
+    };
+    const cases = [_]struct { in: ?[]const u8, out: []const u8 }{
+        .{ .in = null, .out = "high" },
+        .{ .in = "banana", .out = "high" },
+        .{ .in = "none", .out = "low" },
+        .{ .in = "minimal", .out = "low" },
+        .{ .in = "low", .out = "low" },
+        .{ .in = "medium", .out = "medium" },
+        .{ .in = "high", .out = "high" },
+        .{ .in = "xhigh", .out = "max" },
+        .{ .in = "max", .out = "max" },
+    };
+    for (cases) |c| {
+        const r = try serializeExtraContext(a, &cfg, true, c.in);
+        defer a.free(r);
+        const want = try std.fmt.allocPrint(a, "\"reasoning_effort\":\"{s}\"", .{c.out});
+        defer a.free(want);
+        try testing.expect(std.mem.indexOf(u8, r, want) != null);
+        try testing.expect(std.mem.indexOf(u8, r, "\"thinking_mode\":\"thinking\"") != null);
+    }
 }
 
 test "serializeExtraContext: dsv4 gets the reference's default reasoning effort" {
@@ -13031,6 +13179,24 @@ test "parseToolCalls dsml: canonical two-call block, string and JSON params" {
     try testing.expect(!calls[0].inferred);
 }
 
+test "parseToolCalls dsml: V4.1's spaced tag names parse like V4's" {
+    const raw = "On it.\n\n<｜DSML｜ calls>\n" ++
+        "<｜DSML｜ invoke name=\"get_weather\">\n" ++
+        "<｜DSML｜ parameter name=\"city\" string=\"true\">San Francisco</｜DSML｜ parameter>\n" ++
+        "<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n" ++
+        "</｜DSML｜ invoke>\n" ++
+        "<｜DSML｜ invoke name=\"get_time\">\n" ++
+        "</｜DSML｜ invoke>\n" ++
+        "</｜DSML｜ calls>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    try testing.expectEqualStrings("{\"city\":\"San Francisco\",\"days\":3}", calls[0].arguments);
+    try testing.expectEqualStrings("get_time", calls[1].name);
+    try testing.expectEqualStrings("{}", calls[1].arguments);
+}
+
 test "parseToolCalls dsml: dropped invoke close before the next call still parses both" {
     // Delimiter-drop tolerance (hy3 class): the model omits </｜DSML｜invoke>
     // between back-to-back calls.
@@ -13139,6 +13305,29 @@ test "loadChatConfig: template-less deepseek_v4 checkpoint gets the embedded DSV
     var cc2 = try loadChatConfig(io, allocator, dir_path);
     defer cc2.deinit();
     try testing.expectEqual(@as(usize, 0), cc2.chat_template.len);
+}
+
+test "loadChatConfig: deepseek_v41 always gets the embedded V4.1 transcription" {
+    // DeepSeek's own template merges dicts with `**`, which jinja.cpp cannot
+    // parse, and the repack's differs from the encoder: ours is the pinned one.
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"eos_token\": \"e\", \"chat_template\": \"{{ shipped }}\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\": \"deepseek_v41\"}" });
+    var pbuf: [512]u8 = undefined;
+    const plen = try tmp.dir.realPath(io, &pbuf);
+    const embedded = @embedFile("fixtures/dsv41_chat_template.jinja");
+
+    var cc = try loadChatConfig(io, allocator, pbuf[0..plen]);
+    defer cc.deinit();
+    try testing.expectEqualStrings(embedded, cc.chat_template);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"eos_token\": \"e\"}" });
+    var cc2 = try loadChatConfig(io, allocator, pbuf[0..plen]);
+    defer cc2.deinit();
+    try testing.expectEqualStrings(embedded, cc2.chat_template);
 }
 
 test "renderChatTemplate: muse_glimmer shipped template renders byte-identical to python jinja2 (hermetic)" {
@@ -15487,4 +15676,74 @@ test "renderChatTemplate: GLM-5-Next tool history renders natively (jinja `obj.0
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "<|observation|><tool_response>{\"temp_c\": 21}</tool_response><|assistant|><think>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "<start_of_turn>") == null);
+}
+
+test "chat: the embedded V4.1 template renders through jinja.cpp byte-exact with DeepSeek's encoder" {
+    // Cases and reference bytes from tests/dsv41_template_ab.py (the release's
+    // encoding/encoding.py); a construct jinja.cpp renders differently than
+    // jinja2 shows up here, never as a silent fallback in production.
+    const a = testing.allocator;
+    const tpl = @embedFile("fixtures/dsv41_chat_template.jinja");
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, @embedFile("fixtures/dsv41_template_cases.json"), .{});
+    defer parsed.deinit();
+    for (parsed.value.array.items) |case| {
+        const o = case.object;
+        const msgs = try std.json.Stringify.valueAlloc(a, o.get("messages").?, .{});
+        defer a.free(msgs);
+        const tools: ?[]u8 = if (o.get("tools").? == .null) null else try std.json.Stringify.valueAlloc(a, o.get("tools").?, .{});
+        defer if (tools) |t| a.free(t);
+        const extra = try std.fmt.allocPrint(a, "{{\"thinking_mode\":\"{s}\",\"reasoning_effort\":\"{s}\"}}", .{ o.get("thinking_mode").?.string, o.get("reasoning_effort").?.string });
+        defer a.free(extra);
+        const tpl_z = try a.dupeSentinel(u8, tpl, 0);
+        defer a.free(tpl_z);
+        const msgs_z = try a.dupeSentinel(u8, msgs, 0);
+        defer a.free(msgs_z);
+        const extra_z = try a.dupeSentinel(u8, extra, 0);
+        defer a.free(extra_z);
+        const tools_z = if (tools) |t| try a.dupeSentinel(u8, t, 0) else null;
+        defer if (tools_z) |t| a.free(t);
+        var len: usize = 0;
+        const ptr = jinja_c.jinja_render_chat(tpl_z.ptr, msgs_z.ptr, if (tools_z) |t| t.ptr else null, extra_z.ptr, 1, &len) orelse {
+            std.debug.print("{s}: {s}\n", .{ o.get("label").?.string, if (jinja_c.jinja_last_error()) |e| std.mem.span(e) else "render failed" });
+            return error.RenderFailed;
+        };
+        defer jinja_c.jinja_str_free(ptr);
+        testing.expectEqualStrings(o.get("expected").?.string, ptr[0..len]) catch |e| {
+            std.debug.print("case: {s}\n", .{o.get("label").?.string});
+            return e;
+        };
+    }
+}
+
+test "renderChatTemplate: REAL MiniCPM-V 4.7 chat_template.jinja renders without fallback (hermetic)" {
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = @embedFile("fixtures/minicpmv4_7_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
+    };
+    const on = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
+    defer allocator.free(on);
+    try testing.expect(std.mem.indexOf(u8, on, "If you choose to call a function ONLY reply") != null);
+    try testing.expect(std.mem.indexOf(u8, on, "<function=get_time>\n<parameter=timezone>\nUTC\n</parameter>\n</function>") != null);
+    try testing.expect(std.mem.indexOf(u8, on, "<tool_response>\n12:34 UTC\n</tool_response>") != null);
+    try testing.expect(std.mem.endsWith(u8, on, "<|im_start|>assistant\n<think>\n"));
+    try testing.expect(promptTailOpensThink(on));
+
+    const off = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
+    defer allocator.free(off);
+    try testing.expect(std.mem.endsWith(u8, off, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    try testing.expect(!promptTailOpensThink(off));
 }

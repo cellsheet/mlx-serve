@@ -12,7 +12,7 @@ mlx-serve serve             # serve everything you've pulled — models load on 
 mlx-serve launch claude     # configure + launch a coding agent CLI against the local server
 ```
 
-`launch` supports claude, pi, omp, opencode, opencode2, codex, hermes, and aider. It reads the running server's model list and real context window, writes the agent's config into a dedicated `~/.mlx-serve/<agent>/` folder (never your real agent config), and starts the agent. If the server is down it starts the MLX Core app first. `--model <id>` picks a model, `--print` shows the launch script instead of running, and anything after `--` goes to the agent (`mlx-serve launch codex -- resume`). `launch opencode` detects the installed OpenCode's version (even `--print` runs `opencode --version` to route) and picks its v1 or v2 integration automatically; `launch opencode2` stays as a compatibility alias that forces the v2 integration, which also installs the mlx-serve monitor plugin and needs the server started with `--metrics`. Full per-agent detail in [integrations.md](integrations.md).
+`launch` supports claude, pi, omp, opencode, opencode2, codex, hermes, and aider. It reads the running server's model list and real context window, writes the agent's config into a dedicated `~/.mlx-serve/<agent>/` folder (never your real agent config), and starts the agent; codex writes nothing and passes its settings as `-c` overrides over your own Codex home. If the server is down it starts the MLX Core app first. `--model <id>` picks a model, `--print` shows the launch script instead of running, and anything after `--` goes to the agent (`mlx-serve launch codex -- resume`). `launch opencode` detects the installed OpenCode's version (even `--print` runs `opencode --version` to route) and picks its v1 or v2 integration automatically; `launch opencode2` stays as a compatibility alias that forces the v2 integration, which also installs the mlx-serve monitor plugin and needs the server started with `--metrics`. Full per-agent detail in [integrations.md](integrations.md).
 
 Short names, `org/repo` HuggingFace ids, and `name:tag` all work. Models land in a shared `~/.mlx-serve/models` store the MLX Core app uses too.
 
@@ -45,7 +45,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | Flag | Default | Description |
 |---|---|---|
 | `--model PATH` | required | Path to the model directory or a `.gguf` file |
-| `--serve` | off | Start the HTTP server |
+| `--serve` | on unless `--prompt` | Start the HTTP server (implied; kept for older scripts) |
 | `--host ADDR` | `0.0.0.0` | Bind address (all interfaces — set `127.0.0.1` for strictly local) |
 | `--port N` | `11234` | Port for the HTTP server |
 | `--prompt TEXT` | `"Hello"` | Prompt for interactive mode |
@@ -67,8 +67,11 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--mtp-max-depth N` | auto | Maximum MTP draft depth (1..8); every planner choice stays within the bounds. Equal min/max pins the depth, replacing `MLX_SERVE_MTP_FORCE_DEPTH`. `--mtp-depth` is the old spelling of this flag. Native head count and remaining tokens can shorten a round. |
 | `--mtp-greedy-tail` | off | Sampled requests draft only the first MTP token by sampling, later ones by argmax; pairs with `--mtp-typical`. A model's `mtp_greedy_tail` in `model-settings.json` outranks it |
 | `--mtp-history-window N` | `0` (full) | Prompts past 16K tokens only build MTP head history for the last N tokens (windowing costs acceptance on stock Qwen heads) |
-| `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model) |
+| `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model). DeepSeek-V4.1 runs the stages its pack ships unless `--no-mtp` |
 | `--ssd-streaming` | off | ds4 / DeepSeek-V4-Flash GGUF only: stream expert weights from SSD instead of holding the whole model in RAM |
+| `--ane` | off | Serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine instead of the GPU, contexts up to 64K (a model's `"ane"` in `model-settings.json` wins); the first load on a Mac compiles its programs (minutes, then cached) |
+| `--ane-slots N` | `1` | Requests each Neural Engine model runs at once (1..4); slots share the weights, each adds its own KV and state |
+| `--w8a8` / `--no-w8a8` | on with an M5-class GPU and 64 GiB RAM, else off | Image, video, music and 3D models (Krea, Qwen-Image, MageFlow, FLUX.2 klein, LTX, MiniMax-H3, ACE-Step, Music 3, Hunyuan3D) run their transformer linears and, at head_dim 128, attention as rotated int8 x int8 on the Neural Accelerators: faster, slightly lossy, and the int8 copy replaces the packed weights (a 4-bit pack holds more memory, a bf16 pack half). `--w8a8` opts in on a smaller Mac, `--no-w8a8` keeps the packed weights |
 | `--prefill-chunk N` | `8192` | Max tokens forwarded per prefill chunk (auto-capped further per model); lower it to cut prefill peak memory |
 | `--no-decode-attn-quant` | on | Disable the decode-only requant of dense bf16 attention weights (the "Fast decode for bf16-attention models" toggle) |
 | `--kv-quant {off,4,8}` | off | KV-cache quantization scheme (MLX path) |
@@ -81,19 +84,20 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--max-concurrent N` | `1` | Continuous-batch decode parallelism |
 | `--prefill-decode-share S` | `0` | Wall-time fraction (0..0.9) decoding streams keep during another request's prefill; the prefill runs 1024-token chunks meanwhile. Env `MLX_SERVE_PREFILL_DECODE_SHARE` |
 | `--prefix-cache-entries N` | auto | Shared-prefix KV cache entry cap |
-| `--prefix-cache-mem N{KB,MB,GB}` | `2 GB`, or one session at the working context on qwen4_exp when larger | Shared-prefix KV cache memory cap |
+| `--prefix-cache-mem N{KB,MB,GB}` | `2 GB`, or one session at the working context on hybrid (Qwen3.5+, GLM-5.3, Nemotron-H, LFM2, Ling), sliding-ring (MiMo) and qwen4_exp models when larger | Shared-prefix KV cache memory cap |
 | `--prefix-cache-disk N{MB,GB}` | off | SSD tier: prefixes survive restarts (11K-token restart TTFT 5.9 s → 0.7 s) |
+| `--shutdown-persist-secs N` | `45` | On SIGTERM, finish writing the SSD-tier slices not yet on disk for at most N seconds, then exit; 0 disables. Under launchd, set `ExitTimeOut` above it |
 | `--metrics` | off | Prometheus `/metrics` + live dashboard panel on `/` |
 | `--api-key KEY` | none | Require a key for non-localhost requests (localhost stays open) |
 | `--lan-share <all\|id,...>` | off | Share the listed models (or all) with your local network over Bonjour — only inference is exposed, model management stays host-local |
 | `--lan-discover` | off | Discover models other Macs share: they appear in `/v1/models` as `model@peer` and requests proxy to that Mac |
 | `--lan-name NAME` | hostname | The Bonjour name other Macs see |
 | `--model-dir PATH` | none | Discover and serve every model in a folder (LRU resident set). Repeatable — folders merge first-wins |
-| `--max-resident-mem N{MB,GB}` | auto | Summed memory cap across loaded models; decides whether a model may load at all (auto = 80% of the MLX wired limit, `0` disables) |
+| `--max-resident-mem N{MB,GB}` | auto | Summed memory cap across loaded models; decides whether a model may load at all (auto = the GPU working-set limit, `0` disables) |
 | `--max-resident-models N` | `3` | How many models stay loaded at once (LRU-evicted) |
 | `--idle-evict-secs N` | off | Unload models nobody is using after this many idle seconds |
 | `--no-warmup-eager` | off | Skip the eager warmup at boot (benchmarking / minimal-footprint deployments) |
-| `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies) |
+| `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies). Either way, a load that would not fit in free RAM first unloads idle models when that makes it fit |
 | `--no-tool-autocorrect` | off | Turn off schema-driven repair of model-emitted tool arguments |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
 | `--log-file PATH` | `~/.mlx-serve/logs/` | Where the server log goes |

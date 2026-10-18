@@ -60,8 +60,11 @@ enum MediaModelPicks {
 /// not the architecture. They're also the grouping key, so two models sharing a
 /// label are treated as a ranking and only the better one is featured.
 extension ImageModelPreset {
+    /// Qwen-Image edits too, but it stays a generator first: moving it into
+    /// the editor group would change which model each group features.
     var capabilityLabel: String {
-        supportsReferenceEdit ? "Best for editing photos" : "Best for creating images"
+        let editsFirst = supportsReferenceEdit && variant != .qwenImage21 && variant != .qwenImage21Turbo
+        return editsFirst ? "Best for editing photos" : "Best for creating images"
     }
 }
 
@@ -80,7 +83,11 @@ extension AudioModelPreset {
 
 extension MusicModelPreset {
     var capabilityLabel: String {
-        family == .acestep ? "Fastest music (8-step Turbo)" : "Best for full songs with vocals"
+        switch family {
+        case .acestep: return "Fastest music (8-step Turbo)"
+        case .minimaxMusic3: return "Best for full songs with vocals"
+        case .yue2: return "Best for editable songs (score + vocals)"
+        }
     }
 }
 

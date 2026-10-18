@@ -145,6 +145,7 @@ struct StatusMenuView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
+    @ObservedObject private var music = MusicTransport.shared
     @State private var showDownloads = false
     /// Slot ids with an unload in flight (the eject button becomes a spinner —
     /// an unload can take seconds while the server drains a running request).
@@ -182,6 +183,8 @@ struct StatusMenuView: View {
             // them, which flattened the hierarchy into a stack of equals.
             VStack(alignment: .leading, spacing: TrayMetrics.sectionSpacing) {
                 serverSection
+
+                musicSection
 
                 if case .running = server.status {
                     residencySection
@@ -244,7 +247,10 @@ struct StatusMenuView: View {
 
     private var serverSection: some View {
         VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
-            TraySectionHeader(title: "Server")
+            HStack(spacing: 8) {
+                TraySectionHeader(title: "Server").fixedSize()
+                Spacer(minLength: 0)
+            }
             TrayCard {
                 if hasNoUsableModels {
                     VStack(alignment: .leading, spacing: 3) {
@@ -267,7 +273,6 @@ struct StatusMenuView: View {
                         .help("Model Settings for the selected model (context, KV cache, MTP)")
                     }
                     serverControls
-                    serverFooterRow
 
                     // Show error details
                     if case .error = server.status, !server.lastError.isEmpty {
@@ -383,17 +388,20 @@ struct StatusMenuView: View {
                 loadModelAtStart: appState.loadModelAtStart,
                 selectedModelPath: appState.selectedModelPath),
             isLoadingModel: appState.loadingModelPath != nil)
-        return HStack(spacing: 6) {
-            serverPrimaryButton(control)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                serverPrimaryButton(control)
 
-            Button {
-                openServerLog()
-            } label: {
-                Image(systemName: "macwindow.on.rectangle")
+                Button {
+                    openServerLog()
+                } label: {
+                    Image(systemName: "macwindow.on.rectangle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .help("Open Server Log in a separate window (easier copy/paste)")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.regular)
-            .help("Open Server Log in a separate window (easier copy/paste)")
+            ModelLoadProgressRow()
         }
     }
 
@@ -428,28 +436,53 @@ struct StatusMenuView: View {
         }
     }
 
-    private var serverFooterRow: some View {
-        HStack {
-            Toggle("Start server with the app", isOn: $appState.autoStartServer)
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .help("Start the server when the app launches. Whether that start preloads a model is \"Preload the model when the server starts\" in Settings ▸ Server.")
-            Spacer()
-            // The engine the resident chat model runs on, as the SERVER
-            // reports it; before a load, the file-type guess for the
-            // selected model.
-            if let engine = server.residentChatModel?.engine {
-                EngineBadge(text: engine.label, tint: EngineBadge.tint(engine))
-                    .help("Engine the loaded model runs on")
-            } else if let engine = appState.localModels
-                .first(where: { $0.path == appState.selectedModelPath })?.engine
-            {
-                EngineBadge(text: engine.displayName, tint: .secondary)
-                    .help("Engine the selected model will run on")
+    /// The engine the resident chat model runs on, as the SERVER reports it;
+    /// before a load, the file-type guess for the selected model.
+    // MARK: - Music
+
+    /// The Music tab's track while it plays, pauses or a station is on air.
+    @ViewBuilder private var musicSection: some View {
+        if let track = music.track {
+            VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
+                TraySectionHeader(title: track.radioOn ? "AI Radio" : "Now Playing")
+                TrayCard {
+                    HStack(spacing: 8) {
+                        Button {
+                            UserDefaults.standard.set(AudioGenView.Tab.music.rawValue, forKey: "audioGenTab")
+                            openAudioGen()
+                        } label: {
+                            Text(verbatim: track.title)
+                                .font(.app(.body))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open the Music tab")
+                        transportButton("backward.fill", .previous, track,
+                                        help: track.radioOn ? "AI Radio picks the next track" : "Previous track")
+                        transportButton(track.playing ? "pause.fill" : "play.fill", .playPause, track,
+                                        help: track.playing ? "Pause" : "Play")
+                        transportButton("forward.fill", .next, track, help: "Next track")
+                    }
+                }
             }
         }
-        .font(.app(.caption))
-        .foregroundStyle(.secondary)
+    }
+
+    /// A locked key stays drawn, dimmed, so its tooltip can say why.
+    private func transportButton(_ icon: String, _ key: DeckKey, _ track: MusicTransport.Track, help: String) -> some View {
+        let locked = key.isLocked(radioOn: track.radioOn)
+        return Button { music.press(key) } label: {
+            Image(systemName: icon)
+                .font(.app(.body))
+                .foregroundStyle(locked ? HierarchicalShapeStyle.tertiary : .primary)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(L10n.text(help))
     }
 
     // MARK: - What's resident, and what it costs
@@ -545,14 +578,8 @@ struct StatusMenuView: View {
     private var utilitiesSection: some View {
         TrayCard {
             if case .running = server.status {
-                // The Metrics button rides the header row — shown only when the
-                // server was launched with --metrics (opt-in; see
-                // ServerOptions.enableMetrics). The panel is hosted on the index
-                // page, so it opens root `/`.
-                EndpointsSection(
-                    baseURL: server.baseURL,
-                    showsMetricsButton: appState.serverOptions.enableMetrics
-                )
+                // The Web UI button rides the header row; the console at `/` works with or without metrics.
+                EndpointsSection(baseURL: server.baseURL)
                 TrayRowSeparator()
             }
 
@@ -587,6 +614,10 @@ struct StatusMenuView: View {
             // Spotlight-style ⌃Space prompt panel, summonable from any app
             // while MLX Core runs in the tray.
             QuickLauncherTrayRow()
+
+            TrayRowSeparator()
+
+            TranscriptTrayRow()
         }
     }
 
@@ -686,90 +717,104 @@ struct StatusMenuView: View {
         return label
     }
 
-    /// One resident-model slot: modality icon, name, badges (chat quant /
-    /// spec-decode), resident size, and an eject button that unloads it.
+    /// One resident-model slot: modality icon, the whole name, copy and eject buttons; beneath it
+    /// the badges (quant, engine, KV, spec-decode) and the resident size.
     @ViewBuilder
     private func modelSlotRow(_ info: ModelInfo) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: info.slotKind.icon)
-                .font(.app(.caption))
-                .foregroundStyle(.secondary)
-                .frame(width: 16)
-                .help(info.slotKind.label)
-            Text(info.name)
-                .font(.app(.caption).monospaced())
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .help(info.slotKind == .chat
-                      ? "\(info.slotKind.label) — \(info.layers) layers, \(info.hiddenSize)-dim"
-                      : info.slotKind.label)
-            if info.quantBits > 0 {
-                Text("\(info.quantBits)-bit")
-                    .font(.app(.caption2).weight(.semibold))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(.quaternary)
-                    .clipShape(Capsule())
-            }
-            if let kv = info.kvBadge {
-                Text(kv)
-                    .font(.app(.caption2).weight(.semibold))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(.quaternary)
-                    .clipShape(Capsule())
-                    .help("KV cache stored at \(info.kvQuant)-bit")
-            }
-            // Speculative-decoding speedup badge (DFlash family / MTP / drafter).
-            if let badge = info.specDecodeBadge {
-                Text(L10n.text(badge))
-                    .font(.app(.caption2).weight(.semibold))
-                    .foregroundStyle(.green)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Color.green.opacity(0.15))
-                    .clipShape(Capsule())
-                    .help(badge == "+MTP"
-                          ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
-                          : "\(info.drafterStone?.label ?? "Assistant drafter") loaded — faster decode via speculative decoding")
-            }
-            Spacer()
-            if info.bytesResident > 0 {
-                Text(MemoryInfo.format(Int64(clamping: info.bytesResident)))
-                    .font(.app(.caption2).monospaced())
-                    .foregroundStyle(.tertiary)
-            }
-            // Copy the model's full name/id to the clipboard (paste into a curl,
-            // a config file, etc.) — the row truncates it, so copy is the only
-            // way to get the whole string.
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(info.name, forType: .string)
-                copiedModelName = info.name
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    if copiedModelName == info.name { copiedModelName = nil }
-                }
-            } label: {
-                Image(systemName: copiedModelName == info.name ? "checkmark" : "doc.on.doc")
-                    .font(.app(.caption2))
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(copiedModelName == info.name ? .green : .secondary)
-            .help("Copy model name")
-            if unloadingIds.contains(info.name) {
-                ProgressView()
-                    .controlSize(.mini)
-                    .help("Unloading — waits for any running request to finish")
-            } else {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: info.slotKind.icon)
+                    .font(.app(.caption))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16)
+                    .help(info.slotKind.label)
+                Text(info.name)
+                    .font(.app(.caption).monospaced())
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(info.slotKind == .chat
+                          ? "\(info.slotKind.label) — \(info.layers) layers, \(info.hiddenSize)-dim"
+                          : info.slotKind.label)
+                Spacer(minLength: 4)
+                // Copy the model's full name/id to the clipboard (paste into a curl,
+                // a config file, etc.).
                 Button {
-                    unloadSlot(info.name)
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(info.name, forType: .string)
+                    copiedModelName = info.name
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        if copiedModelName == info.name { copiedModelName = nil }
+                    }
                 } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.app(.caption))
+                    Image(systemName: copiedModelName == info.name ? "checkmark" : "doc.on.doc")
+                        .font(.app(.caption2))
                 }
                 .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
-                .help("Unload from memory (the model reloads on its next use)")
+                .foregroundStyle(copiedModelName == info.name ? .green : .secondary)
+                .help("Copy model name")
+                if unloadingIds.contains(info.name) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .help("Unloading — waits for any running request to finish")
+                } else {
+                    Button {
+                        unloadSlot(info.name)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.app(.caption))
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Unload from memory (the model reloads on its next use)")
+                }
+            }
+            HStack(spacing: 6) {
+                Spacer()
+                if info.quantBits > 0 {
+                    Text("\(info.quantBits)-bit")
+                        .font(.app(.caption2).weight(.semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(.quaternary)
+                        .clipShape(Capsule())
+                }
+                let ane = info.engineBadge == "ANE"
+                Text(verbatim: info.engineBadge)
+                    .font(.app(.caption2).weight(.semibold))
+                    .foregroundStyle(ane ? Color.purple : Color.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(ane ? Color.purple.opacity(0.15) : Color.secondary.opacity(0.15))
+                    .clipShape(Capsule())
+                    .help("Engine serving this model")
+                if let kv = info.kvBadge {
+                    Text(kv)
+                        .font(.app(.caption2).weight(.semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(.quaternary)
+                        .clipShape(Capsule())
+                        .help("KV cache stored at \(info.kvQuant)-bit")
+                }
+                // Speculative-decoding speedup badge (DFlash family / MTP / drafter).
+                if let badge = info.specDecodeBadge {
+                    Text(L10n.text(badge))
+                        .font(.app(.caption2).weight(.semibold))
+                        .foregroundStyle(.green)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.green.opacity(0.15))
+                        .clipShape(Capsule())
+                        .help(badge == "+MTP"
+                              ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
+                              : "\(info.drafterStone?.label ?? "Assistant drafter") loaded — faster decode via speculative decoding")
+                }
+                if info.bytesResident > 0 {
+                    Text(MemoryInfo.format(Int64(clamping: info.bytesResident)))
+                        .font(.app(.caption2).monospaced())
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
     }
@@ -954,10 +999,6 @@ struct StatusDot: View {
 
 struct EndpointsSection: View {
     let baseURL: String
-    /// Puts a "Metrics" button on the header row (the Browse-on-Download-
-    /// Models pattern). Callers gate it on `ServerOptions.enableMetrics` —
-    /// the panel only exists when the server got `--metrics`.
-    var showsMetricsButton: Bool = false
     @State private var copiedEndpoint: String?
     @State private var isExpanded = false
 
@@ -992,12 +1033,10 @@ struct EndpointsSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             TrayDisclosureHeader(title: "Endpoints", isExpanded: $isExpanded) {
-                if showsMetricsButton {
-                    TrayAccessoryButton(title: "Metrics", icon: "chart.bar.xaxis",
-                                        help: "Open the live metrics panel in your browser") {
-                        if let root = Self.rootURL(baseURL) {
-                            NSWorkspace.shared.open(root)
-                        }
+                TrayAccessoryButton(title: "Web UI", icon: "safari",
+                                    help: "Open the web UI in your browser") {
+                    if let root = Self.rootURL(baseURL) {
+                        NSWorkspace.shared.open(root)
                     }
                 }
             }
@@ -1356,26 +1395,3 @@ struct TerminalLogTextView: NSViewRepresentable {
     }
 }
 
-/// The engine name as a tinted capsule, so it reads at a glance.
-struct EngineBadge: View {
-    let text: String
-    let tint: Color
-
-    var body: some View {
-        Text(text)
-            .font(.app(.caption).weight(.semibold))
-            .foregroundStyle(tint)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(tint.opacity(0.15), in: Capsule())
-    }
-
-    static func tint(_ engine: ServerEngine) -> Color {
-        switch engine {
-        case .mlx:     return .accentColor
-        case .mlxGguf: return .teal
-        case .llama:   return .orange
-        case .dsv4:    return .purple
-        }
-    }
-}

@@ -8,7 +8,7 @@
 //! (`block_size` + `mask_token_id` + `target_layer_ids`), never on the
 //! `model_type` string.
 //!
-//! Protocol per round (assistant borrows the trunk's embed table + lm_head):
+//! Protocol per round (assistant borrows the trunk's embed table):
 //!   1. Context delta = trunk hiddens at the OUTPUT of layers
 //!      `target_layer_ids` for the tokens the trunk just accepted,
 //!      concatenated on features → `encoder.fc` → RMS norm → per-layer K/V
@@ -18,8 +18,8 @@
 //!   3. Assistant forward: Q from the block only; K/V = cached context +
 //!      fresh block K/V. Block attends bidirectionally among itself,
 //!      sliding-windowed/full to context.
-//!   4. Draft logits = trunk `lm_head(hidden)[:, 1:]` — the anchor position
-//!      is DROPPED → block_size-1 drafts.
+//!   4. Draft logits use the declared own head or the trunk
+//!      `lm_head(hidden)[:, 1:]` — drop the anchor → block_size-1 drafts.
 //!   5. Trunk verify over `[t1, drafts...]` (standard spec verify invariant);
 //!      the verify forward doubles as the next round's context producer.
 //!   6. Block K/V are NEVER cached (reference evicts them via
@@ -38,6 +38,7 @@ const mtp_mod = @import("mtp.zig");
 const simd_qmm = @import("simd_qmm.zig");
 const lane_qmm = @import("lane_qmm.zig");
 const ane_mod = @import("ane.zig");
+const lilicorr_mod = @import("lilicorr.zig");
 
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
@@ -76,7 +77,7 @@ pub const DflashConfig = struct {
     conv_kernel_size: u32 = 0,
     conv_group_size: u32 = 0,
     /// Reference `compute_logits`: `logits * output_multiplier`, then
-    /// `tanh(l/cap)*cap`. The trunk head we borrow is the BARE Linear — an
+    /// `tanh(l/cap)*cap`. The selected head is the BARE Linear — an
     /// argmax draft is invariant to these (monotone), but the selector SUMS
     /// unary logits with codebook edges, so the muse sidecar's declared
     /// scale is load-bearing there. 0 cap / 1.0 multiplier = no transform.
@@ -98,9 +99,30 @@ pub const DflashConfig = struct {
     /// v1/v2 sidecar so far is neox (half-split); DSpark's is not, and the
     /// wrong half rotates silently.
     rope_traditional: bool = false,
+    /// Bolt LiLiCorr head. Capture ids are the declared targets minus one:
+    /// this engine stores a layer's output, and the head was trained on its input.
+    lilicorr: bool = false,
+    candidate_topk: u32 = 0,
+    lilicorr_hidden: u32 = 0,
+    lilicorr_layers: u32 = 0,
+    lilicorr_heads: u32 = 0,
+    factor_dim: u32 = 0,
+    vector_eps: f32 = 0.0001,
+    logit_scale: f32 = 8,
+    has_attn_sinks: bool = false,
+    /// A trained sidecar head uses the target's token ids without remapping.
+    has_own_lm_head: bool = false,
+    draft_vocab_size: u32 = 0,
+    /// Owned when `lilicorr` (same length as `target_layer_ids`). Empty otherwise.
+    capture_ids: []u32 = &.{},
 
     pub fn isDflash2(self: *const DflashConfig) bool {
         return self.selector_rank > 0 or self.conv_kernel_size > 0;
+    }
+
+    pub fn captureIds(self: *const DflashConfig) []const u32 {
+        if (self.capture_ids.len != 0) return self.capture_ids;
+        return self.target_layer_ids;
     }
 
     pub fn isDspark(self: *const DflashConfig) bool {
@@ -110,6 +132,7 @@ pub const DflashConfig = struct {
     pub fn deinit(self: *DflashConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.layer_types);
         allocator.free(self.target_layer_ids);
+        if (self.capture_ids.len != 0) allocator.free(self.capture_ids);
     }
 };
 
@@ -194,18 +217,48 @@ fn readConfigFile(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// sidecar goes with which checkpoint, and a mismatched pair is unbuildable.
 pub const IN_DIR_SUBDIR = "drafter";
 
-/// `<model_dir>/drafter` when it declares the DFlash contract, else null.
-/// Caller owns the returned path. Only ever consulted when no explicit
-/// `--drafter` was given — an explicit flag always wins, so an external
-/// sidecar can still be pointed at a merged checkpoint.
+/// `<model_dir>/drafter` when it declares the DFlash contract, else the pack's one subfolder
+/// holding a drafter we can serve (Sushi's GLM ships `GLM-5.3-Flash-DFlash2/`; MiMo's `dflash/`
+/// is refused at parse and passed over); two candidates is a guess, so neither. Caller owns the
+/// returned path. Only ever consulted when no explicit `--drafter` was given — an explicit flag
+/// always wins, so an external sidecar can still be pointed at a merged checkpoint.
 pub fn resolveInDirDrafter(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
-    const path = std.fs.path.join(allocator, &.{ model_dir, IN_DIR_SUBDIR }) catch return null;
-    if (!probeIsDflash(io, allocator, path)) {
-        allocator.free(path);
-        return null;
+    const own = std.fs.path.join(allocator, &.{ model_dir, IN_DIR_SUBDIR }) catch return null;
+    if (probeIsDflash(io, allocator, own)) return own;
+    allocator.free(own);
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var pick: ?[]u8 = null;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const path = std.fs.path.join(allocator, &.{ model_dir, entry.name }) catch continue;
+        if (!servesAsDrafter(io, allocator, path)) {
+            allocator.free(path);
+            continue;
+        }
+        if (pick) |p| {
+            allocator.free(p);
+            allocator.free(path);
+            return null;
+        }
+        pick = path;
     }
-    return path;
+    return pick;
+}
+
+/// Standalone sushi writes a quantized copy of a pack's drafter beside it, marked by this manifest.
+const SUSHI_RUNTIME_CACHE = "sushi-runtime-cache.json";
+
+fn servesAsDrafter(io: std.Io, allocator: std.mem.Allocator, dir: []const u8) bool {
+    if (!probeIsDflash(io, allocator, dir)) return false;
+    var sub = std.Io.Dir.openDirAbsolute(io, dir, .{}) catch return false;
+    defer sub.close(io);
+    if (sub.access(io, SUSHI_RUNTIME_CACHE, .{})) |_| return false else |_| {}
+    var cfg = parseConfig(io, allocator, dir) catch return false;
+    cfg.deinit(allocator);
+    return true;
 }
 
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !DflashConfig {
@@ -221,6 +274,51 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
     const root = parsed.value.object;
 
     const contract = dflashContractObject(root) orelse return error.NotDflashConfig;
+    const has_own_lm_head = if (root.get("has_own_lm_head")) |v| switch (v) {
+        .bool => v.bool,
+        .null => false,
+        else => return error.InvalidDflashConfigValue,
+    } else false;
+    const draft_vocab_size: u32 = if (has_own_lm_head)
+        try jsonU32(root.get("draft_vocab_size") orelse return error.IncompleteDflashConfig)
+    else
+        0;
+    if (has_own_lm_head) {
+        if (draft_vocab_size == 0 or draft_vocab_size > std.math.maxInt(c_int)) return error.InvalidDflashConfigValue;
+        if (root.get("vocab_size")) |v| if (v != .null and try jsonU32(v) != draft_vocab_size) return error.InvalidDflashConfigValue;
+    }
+
+    // Bolt's LiLiCorr head reuses the DFlash trunk, then drafts with the
+    // correlation module loaded beside it. Argmax of the trunk logits is not
+    // that head.
+    var lilicorr = false;
+    if (contract.get("projector_type")) |pt| if (pt == .string and std.mem.eql(u8, pt.string, "lilicorr")) {
+        lilicorr = true;
+    };
+    if (root.get("architectures")) |archs| if (archs == .array) {
+        for (archs.array.items) |a| {
+            if (a == .string and std.mem.indexOf(u8, a.string, "LiLiCorr") != null) lilicorr = true;
+        }
+    };
+    var candidate_topk: u32 = 0;
+    var lilicorr_hidden: u32 = 0;
+    var lilicorr_layers: u32 = 0;
+    var lilicorr_heads: u32 = 0;
+    var factor_dim: u32 = 0;
+    var vector_eps: f32 = 0.0001;
+    var logit_scale: f32 = 8;
+    if (lilicorr) {
+        candidate_topk = try jsonU32(contract.get("lilicorr_candidate_topk") orelse return error.IncompleteDflashConfig);
+        lilicorr_hidden = try jsonU32(contract.get("lilicorr_hidden_size") orelse return error.IncompleteDflashConfig);
+        lilicorr_layers = try jsonU32(contract.get("lilicorr_num_layers") orelse return error.IncompleteDflashConfig);
+        lilicorr_heads = try jsonU32(contract.get("lilicorr_num_heads") orelse return error.IncompleteDflashConfig);
+        factor_dim = try jsonU32(contract.get("lilicorr_factor_dim") orelse return error.IncompleteDflashConfig);
+        vector_eps = try contractFloat(contract, "lilicorr_vector_eps");
+        logit_scale = try contractFloat(contract, "lilicorr_logit_scale");
+        if (candidate_topk == 0 or lilicorr_hidden == 0 or lilicorr_layers == 0 or lilicorr_heads == 0 or factor_dim == 0) return error.InvalidDflashConfigValue;
+        if (candidate_topk > 64 or lilicorr_hidden % lilicorr_heads != 0) return error.InvalidDflashConfigValue;
+        if (!std.math.isFinite(vector_eps) or vector_eps <= 0 or vector_eps >= 0.5 or !std.math.isFinite(logit_scale) or logit_scale <= 0) return error.InvalidDflashConfigValue;
+    }
 
     // DSpark export markers. `markov_rank` is the load-bearing one (the head
     // IS DSpark); the architecture string and `projector_type` cover exports
@@ -278,6 +376,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         // against it; a non-ascending list is a converter bug worth naming.
         if (i > 0 and target_layer_ids[i] <= target_layer_ids[i - 1]) return error.InvalidDflashTargetLayers;
     }
+    var capture_ids: []u32 = &.{};
+    errdefer if (capture_ids.len != 0) allocator.free(capture_ids);
+    if (lilicorr) {
+        capture_ids = try allocator.alloc(u32, target_layer_ids.len);
+        for (target_layer_ids, capture_ids) |id, *slot| {
+            if (id == 0) return error.InvalidDflashTargetLayers;
+            slot.* = id - 1;
+        }
+    }
 
     const hidden_size: u32 = try jsonU32(root.get("hidden_size") orelse return error.IncompleteDflashConfig);
     if (conv_group_size > 0 and hidden_size % conv_group_size != 0) return error.InvalidDflashConfigValue;
@@ -287,7 +394,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
     const head_dim: u32 = try jsonU32(root.get("head_dim") orelse return error.IncompleteDflashConfig);
     const intermediate: u32 = try jsonU32(root.get("intermediate_size") orelse return error.IncompleteDflashConfig);
     const eps: f32 = jsonFloat(root.get("rms_norm_eps") orelse return error.IncompleteDflashConfig);
-    const sliding: u32 = if (root.get("sliding_window")) |v| try jsonU32(v) else 0;
+    const sliding: u32 = if (root.get("sliding_window")) |v| (if (v == .null) 0 else try jsonU32(v)) else 0;
 
     // `rope_parameters.rope_theta` is the transformers-5 spelling (muse,
     // DFlash2); DSpark ships a flat root `rope_theta`. Reading only the
@@ -311,6 +418,20 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         const kind = if (root.get("markov_head_type")) |v| (if (v == .string) v.string else "vanilla") else "vanilla";
         if (!std.mem.eql(u8, kind, "vanilla")) return error.UnsupportedMarkovHeadType;
     }
+
+    // MiMo's drafter rotates part of each head and scales values. Learned per-head
+    // sinks (`attention_sink_bias`) are loaded into SDPA. The SWA-sink flag is a
+    // different module and stays refused.
+    const partial: f32 = if (contract.get("partial_rotary_factor")) |v| jsonFloat(v) else 1.0;
+    var has_attn_sinks = false;
+    if (contract.get("attention_sink_bias")) |v| {
+        if (v == .bool and v.bool) has_attn_sinks = true;
+    }
+    var swa_sinks = false;
+    if (contract.get("add_swa_attention_sink_bias")) |v| {
+        if (v == .bool and v.bool) swa_sinks = true;
+    }
+    if (partial != 1.0 or swa_sinks or contract.get("attention_value_scale") != null) return error.UnsupportedDflashAttention;
 
     const lt_val = root.get("layer_types") orelse return error.IncompleteDflashConfig;
     if (lt_val != .array or lt_val.array.items.len != num_layers) return error.LayerTypesLengthMismatch;
@@ -345,6 +466,18 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         .markov_rank = markov_rank,
         .rope_traditional = rope_traditional,
         .anchor_row_drafts = anchor_row_drafts,
+        .lilicorr = lilicorr,
+        .candidate_topk = candidate_topk,
+        .lilicorr_hidden = lilicorr_hidden,
+        .lilicorr_layers = lilicorr_layers,
+        .lilicorr_heads = lilicorr_heads,
+        .factor_dim = factor_dim,
+        .vector_eps = vector_eps,
+        .logit_scale = logit_scale,
+        .has_attn_sinks = has_attn_sinks,
+        .has_own_lm_head = has_own_lm_head,
+        .draft_vocab_size = draft_vocab_size,
+        .capture_ids = capture_ids,
     };
 }
 
@@ -361,6 +494,12 @@ fn jsonFloat(v: std.json.Value) f32 {
         .integer => |i| @floatFromInt(i),
         else => 0.0,
     };
+}
+
+fn contractFloat(contract: Contract, key: []const u8) !f32 {
+    const v = contract.get(key) orelse return error.IncompleteDflashConfig;
+    if (v != .float and v != .integer) return error.InvalidDflashConfigValue;
+    return jsonFloat(v);
 }
 
 /// Every `target_layer_ids` entry must name an existing trunk layer — the
@@ -681,10 +820,13 @@ pub const DflashLayer = struct {
     // DFlash2 only — null on a v1 assistant.
     attention_conv: ?DynConv = null,
     mlp_conv: ?DynConv = null,
+    /// Learned per-query-head softmax sink. Null when the config has no sinks.
+    attn_sink: mlx.mlx_array = .{ .ctx = null },
 
     fn deinit(self: *DflashLayer) void {
         if (self.attention_conv) |*c| c.deinit();
         if (self.mlp_conv) |*c| c.deinit();
+        if (self.attn_sink.ctx != null) _ = mlx.mlx_array_free(self.attn_sink);
         _ = mlx.mlx_array_free(self.input_norm);
         _ = mlx.mlx_array_free(self.post_attn_norm);
         _ = mlx.mlx_array_free(self.q_norm);
@@ -708,6 +850,7 @@ pub const DflashLayer = struct {
         }
         if (self.attention_conv) |*c| c.appendEval(vec);
         if (self.mlp_conv) |*c| c.appendEval(vec);
+        if (self.attn_sink.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, self.attn_sink);
     }
 };
 
@@ -719,10 +862,12 @@ pub const DflashModel = struct {
     fc: DflashLinear, // encoder.fc [n_targets*hidden → hidden]
     enc_norm: mlx.mlx_array, // encoder.output_norm_enc [hidden]
     final_norm: mlx.mlx_array, // norm [hidden]
+    /// Trained by the sidecar; only draft logits use this projection.
+    own_lm_head: ?DflashLinear = null,
     layers: []DflashLayer,
 
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
-    /// bind time (`MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`, default 3, 0 disables).
+    /// bind time (`MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`, default 0 disables).
     /// Only the block's draft argmax projects through it — VERIFICATION is a
     /// trunk forward and never touches it, so the emitted distribution is
     /// untouched; drafts just read ~⅓ of the bytes of a full-vocab head.
@@ -736,11 +881,16 @@ pub const DflashModel = struct {
     /// DSpark Markov head — null unless the config declares `markov_rank`.
     markov: ?MarkovHead = null,
 
+    /// Bolt correlation head. Null on a stock DFlash assistant.
+    lilicorr: ?lilicorr_mod.Head = null,
+
     pub fn deinit(self: *DflashModel) void {
         const allocator = self.allocator;
         lane_qmm.release(@intFromPtr(self));
         if (self.selector) |*sel| sel.deinit();
         if (self.markov) |*mh| mh.deinit();
+        if (self.lilicorr) |*hd| hd.deinit();
+        if (self.own_lm_head) |*head| head.deinit();
         if (self.draft_head) |*dh| dh.deinit();
         self.fc.deinit();
         _ = mlx.mlx_array_free(self.enc_norm);
@@ -774,14 +924,13 @@ pub const DflashModel = struct {
         }
         if (self.selector) |*sel| bytes += try Tile.one(owner, &sel.hidden_projection, s);
         if (self.markov) |*mh| bytes += try Tile.one(owner, &mh.w2, s);
+        if (self.own_lm_head) |*head| bytes += try Tile.one(owner, head, s);
         return bytes;
     }
 
     /// Validate compatibility with the target trunk. The assistant borrows
-    /// the trunk's embedding table and lm_head, so hidden size and token-id
-    /// space must line up; the capture seam lives in the STANDARD forward
-    /// path only (v1), so module-owned / MoE / hybrid trunks are refused by
-    /// name at load rather than silently drafting from empty captures.
+    /// the trunk's embedding table, so hidden size and token ids must agree.
+    /// An own head cannot remap a smaller draft vocabulary into the target's.
     pub fn bind(self: *DflashModel, target: *Transformer) !void {
         if (self.config.hidden_size != target.config.hidden_size) {
             log.err("[dflash] hidden_size mismatch: assistant={d}, target={d}\n", .{
@@ -795,12 +944,24 @@ pub const DflashModel = struct {
             });
             return error.DflashTargetMismatch;
         }
+        if (self.own_lm_head != null and self.config.draft_vocab_size != target.config.vocab_size) {
+            log.err("[dflash] own head vocab {d} differs from target vocab {d}\n", .{ self.config.draft_vocab_size, target.config.vocab_size });
+            return error.DflashTargetMismatch;
+        }
         validateTargetLayers(self.config.target_layer_ids, target.config.num_hidden_layers) catch |err| {
             log.err("[dflash] target_layer_ids {any} out of range for {d}-layer target\n", .{
                 self.config.target_layer_ids, target.config.num_hidden_layers,
             });
             return err;
         };
+        if (self.config.lilicorr) {
+            validateTargetLayers(self.config.captureIds(), target.config.num_hidden_layers) catch |err| {
+                log.err("[dflash] lilicorr capture ids {any} out of range for {d}-layer target\n", .{
+                    self.config.captureIds(), target.config.num_hidden_layers,
+                });
+                return err;
+            };
+        }
         if (self.selector) |*sel| {
             // Candidate ids come from the TRUNK head's logits and gather
             // codebook rows — a trunk vocab wider than the tables reads OOB.
@@ -853,6 +1014,7 @@ pub const DflashModel = struct {
     /// from the trunk global); a dense bf16 head is quantized outright. Never
     /// built when it would not shrink the read.
     fn buildDraftHead(self: *DflashModel, target: *Transformer, bits: u32) !void {
+        if (self.own_lm_head != null) return;
         if (bits == 0) {
             log.info("[dflash] draft lm_head: trunk head (no requantization)\n", .{});
             return;
@@ -901,15 +1063,17 @@ pub const DflashModel = struct {
         log.info("[dflash] draft-only lm_head requantized to {d}-bit/gs{d}\n", .{ bits, group });
     }
 
-    /// Draft logits for the block hidden: the low-bit draft head when one was
-    /// built, else the trunk's own head. Both are the bare Linear; when the
+    /// Draft logits use the trained own head, otherwise the optional low-bit
+    /// copy or trunk head. These are bare Linears; when the
     /// sidecar DECLARES a softcap / output_multiplier (muse DFlash2) they are
     /// applied here — argmax drafts are invariant (monotone), but the
     /// selector sums these logits with codebook edges and the sampled arm
     /// softmaxes them, neither of which survives a scale change.
     pub fn draftLogits(self: *const DflashModel, target: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
         var out: mlx.mlx_array = undefined;
-        if (self.draft_head) |*dh| {
+        if (self.own_lm_head) |*head| {
+            out = try head.apply(x, self.s);
+        } else if (self.draft_head) |*dh| {
             out = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_quantized_matmul(
@@ -926,6 +1090,9 @@ pub const DflashModel = struct {
             ));
         } else if (target.config.draftVocab() > 0) {
             out = try target.lmHeadRowsForDraft(x, target.config.draftVocab());
+        } else if (target.rht != null) {
+            // bf16 drafter over an f16 pack: uncast, the head product runs in f32.
+            out = try target.hadamardLmHead(x);
         } else {
             out = try target.lmHeadForDraft(x);
         }
@@ -1015,7 +1182,7 @@ fn checkCodebook(arr: mlx.mlx_array, which: []const u8, rank: u32) !void {
 /// weight is quantized to `bits` when the contraction dim allows it and
 /// pre-transposed for a plain matmul otherwise.
 fn loadLinear(
-    w: *const Weights,
+    w: *Weights,
     prefix: []const u8,
     in_features: u32,
     bits: u32,
@@ -1041,17 +1208,46 @@ fn loadLinear(
     }
 
     var kb: [256]u8 = undefined;
-    const raw = try ownWeight(w, try std.fmt.bufPrint(&kb, "{s}.weight", .{prefix}));
+    const wkey = try std.fmt.bufPrint(&kb, "{s}.weight", .{prefix});
+    const raw = try ownWeight(w, wkey);
     defer _ = mlx.mlx_array_free(raw);
 
     if (bits != 0) {
-        if (quantGroupFor(in_features)) |group| return quantizeDense(raw, bits, group, s);
+        if (quantGroupFor(in_features)) |group| {
+            var q = try quantizeDense(raw, bits, group, s);
+            errdefer q.deinit();
+            // Materialize now and drop the map's handle, so the load peaks at
+            // one bf16 tensor, not the whole checkpoint.
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            q.appendEval(vec);
+            try mlx.check(mlx.mlx_eval(vec));
+            w.replace(wkey, mlx.mlx_array_new());
+            return q;
+        }
     }
     var transposed = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(transposed);
     const perm = [_]c_int{ 1, 0 };
     try mlx.check(mlx.mlx_transpose_axes(&transposed, raw, &perm, 2, s));
     return .{ .w = transposed, .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() };
+}
+
+fn loadOwnHead(weights: *Weights, cfg: *const DflashConfig, bits: u32, s: mlx.mlx_stream) !DflashLinear {
+    const raw = weights.get("lm_head.weight") orelse return error.MissingWeight;
+    const shape = mlx.getShape(raw);
+    if (shape.len != 2 or shape[0] != cfg.draft_vocab_size or shape[1] <= 0) return error.InvalidDflashHeadWeights;
+    if (weights.get("lm_head.scales")) |scales| {
+        const bias = weights.get("lm_head.biases") orelse return error.InvalidDflashHeadWeights;
+        const scale_shape = mlx.getShape(scales);
+        if (mlx.mlx_array_dtype(raw) != .uint32 or !transformer_mod.floatDtypeTable(mlx.mlx_array_dtype(scales)) or
+            !transformer_mod.floatDtypeTable(mlx.mlx_array_dtype(bias))) return error.InvalidDflashHeadWeights;
+        if (scale_shape.len != 2 or scale_shape[0] != shape[0] or !std.mem.eql(c_int, scale_shape, mlx.getShape(bias))) return error.InvalidDflashHeadWeights;
+        if (transformer_mod.affineParamsFromGeometry(raw, scales, cfg.hidden_size) == null) return error.InvalidDflashHeadWeights;
+    } else if (shape[1] != cfg.hidden_size or !transformer_mod.floatDtypeTable(mlx.mlx_array_dtype(raw))) {
+        return error.InvalidDflashHeadWeights;
+    }
+    return loadLinear(weights, "lm_head", cfg.hidden_size, bits, s);
 }
 
 /// Affine-quantize a dense `[out, in]` weight in place of a transpose — the
@@ -1110,6 +1306,10 @@ pub fn loadDflashQuant(
     var weights = try model_mod.loadWeights(io, allocator, model_dir);
     defer weights.deinit();
 
+    var own_lm_head: ?DflashLinear = null;
+    errdefer if (own_lm_head) |*head| head.deinit();
+    if (cfg.has_own_lm_head) own_lm_head = try loadOwnHead(&weights, &cfg, bits, s);
+
     const hidden = cfg.hidden_size;
     const q_out = cfg.num_attention_heads * cfg.head_dim;
     const fc_in: u32 = @intCast(cfg.target_layer_ids.len * hidden);
@@ -1155,6 +1355,16 @@ pub fn loadDflashQuant(
             layers[li].attention_conv = try loadDynConv(&weights, li, "attention_conv", hidden, bits, s);
             layers[li].mlp_conv = try loadDynConv(&weights, li, "mlp_conv", hidden, bits, s);
         }
+        if (cfg.has_attn_sinks) {
+            const sink = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.attention_sink_bias", .{li}));
+            const sh = mlx.getShape(sink);
+            if (sh.len != 1 or sh[0] != @as(c_int, @intCast(cfg.num_attention_heads))) {
+                _ = mlx.mlx_array_free(sink);
+                log.err("[dflash] attention_sink_bias layer {d} is {any}, expected [{d}]\n", .{ li, sh, cfg.num_attention_heads });
+                return error.InvalidDflashConfigValue;
+            }
+            layers[li].attn_sink = sink;
+        }
     }
 
     var selector: ?Selector = null;
@@ -1186,6 +1396,23 @@ pub fn loadDflashQuant(
         }
     }
 
+    var head: ?lilicorr_mod.Head = null;
+    errdefer if (head) |*hd| hd.deinit();
+    if (cfg.lilicorr) {
+        head = try lilicorr_mod.load(allocator, &weights, s, .{
+            .top_k = cfg.candidate_topk,
+            .hidden = cfg.lilicorr_hidden,
+            .trunk = cfg.hidden_size,
+            .heads = cfg.lilicorr_heads,
+            .slots = cfg.block_size - 1,
+            .layers = cfg.lilicorr_layers,
+            .factor = cfg.factor_dim,
+            .vector_eps = cfg.vector_eps,
+            .logit_scale = cfg.logit_scale,
+            .rms_eps = cfg.rms_norm_eps,
+        });
+    }
+
     // Force-eval all weights so serve time never faults a lazy transpose or
     // an un-materialized load-time quantization.
     {
@@ -1197,8 +1424,13 @@ pub fn loadDflashQuant(
         for (layers) |*lw| lw.appendEval(eval_vec);
         if (selector) |*sel| sel.appendEval(eval_vec);
         if (markov) |*mh| mh.appendEval(eval_vec);
+        if (head) |*hd| hd.appendEval(eval_vec);
+        if (own_lm_head) |*lm_head| lm_head.appendEval(eval_vec);
         _ = mlx.mlx_eval(eval_vec);
     }
+    // Hand the bf16 sources the load-time quantization freed back to the OS
+    // instead of leaving them in MLX's buffer pool.
+    _ = mlx.mlx_clear_cache();
 
     if (fc.isQuantized()) {
         log.info("[dflash] loaded {d} layers, hidden={d}, block_size={d}, targets={any}, weights={d}-bit/gs{d}\n", .{
@@ -1209,6 +1441,8 @@ pub fn loadDflashQuant(
             cfg.num_hidden_layers, cfg.hidden_size, cfg.block_size, cfg.target_layer_ids,
         });
     }
+
+    if (own_lm_head != null) log.info("[dflash] trained own lm_head loaded: vocab={d}\n", .{cfg.draft_vocab_size});
 
     if (cfg.isDflash2()) {
         log.info("[dflash] dflash2: selector rank={d} top_k={d}, dyn-convs ksize={d} group={d}\n", .{
@@ -1228,9 +1462,11 @@ pub fn loadDflashQuant(
         .fc = fc,
         .enc_norm = enc_norm,
         .final_norm = final_norm,
+        .own_lm_head = own_lm_head,
         .layers = layers,
         .selector = selector,
         .markov = markov,
+        .lilicorr = head,
     };
 }
 
@@ -1238,7 +1474,7 @@ pub fn loadDflashQuant(
 /// for layer `li`. Both weights are REQUIRED once the config declares
 /// `conv_kernel_size` — a DFlash2 pack missing them is a broken download.
 fn loadDynConv(
-    w: *const Weights,
+    w: *Weights,
     li: u32,
     comptime which: []const u8,
     hidden: u32,
@@ -1270,6 +1506,9 @@ pub const DflashCtx = struct {
     /// late-starting context is self-consistent (sliding-window semantics,
     /// same rule as the MTP history).
     base_pos: usize,
+    /// Last encoded context row. LiLiCorr scores slot 0 against this feature,
+    /// which is the token before the next draft anchor.
+    anchor: mlx.mlx_array = .{ .ctx = null },
 
     pub fn init(allocator: std.mem.Allocator, model: *const DflashModel, base_pos: usize) !DflashCtx {
         return .{
@@ -1280,6 +1519,7 @@ pub const DflashCtx = struct {
 
     pub fn deinit(self: *DflashCtx) void {
         self.cache.deinit();
+        if (self.anchor.ctx != null) _ = mlx.mlx_array_free(self.anchor);
     }
 
     /// Absolute trunk position one past the last cached context token.
@@ -1295,6 +1535,7 @@ pub const DflashCtx = struct {
             _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
             _ = mlx.mlx_vector_array_append_value(vec, entry.values);
         }
+        if (self.anchor.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, self.anchor);
     }
 };
 
@@ -1705,7 +1946,6 @@ fn baseKernelHalf(base_kernel: mlx.mlx_array, half: c_int, s: mlx.mlx_stream) !m
 
 // ── DFlash2 path selector (forward + host trace) ──
 
-
 pub const SelectedPath = struct {
     ids: []u32, // [m] chosen draft token ids
     chosen_idx: []u32, // [m] index of the choice within its candidate row
@@ -1714,11 +1954,15 @@ pub const SelectedPath = struct {
     /// density q over the candidate set (zero everywhere else). Null on the
     /// greedy trace.
     q: ?[]f32,
+    /// [m] the chosen candidate's share of its step's softmax (temperature 1, or the
+    /// sampling temperature): how sure the selector is, which `dflash_policy` calibrates.
+    conf: []f32,
 
     pub fn deinit(self: *SelectedPath, allocator: std.mem.Allocator) void {
         allocator.free(self.ids);
         allocator.free(self.chosen_idx);
         allocator.free(self.cand_ids);
+        allocator.free(self.conf);
         if (self.q) |qv| allocator.free(qv);
     }
 };
@@ -2037,7 +2281,6 @@ pub fn lattice(
         lat.e = try allocator.dupe(f32, e_data[0 .. (m - 1) * k * k]);
     }
     return lat;
-
 }
 
 /// A best-first draft tree over the lattice: node values are path sums of
@@ -2175,6 +2418,15 @@ fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
     }
 }
 
+/// `scores[i]`'s share of the softmax over `scores`.
+fn softmaxShare(scores: []const f32, i: usize) f32 {
+    var mx: f32 = -std.math.inf(f32);
+    for (scores) |sc| mx = @max(mx, sc);
+    var total: f32 = 0;
+    for (scores) |sc| total += @exp(sc - mx);
+    return @exp(scores[i] - mx) / total;
+}
+
 /// Reference `CandidateSelector.select`: top-k candidates per position by
 /// draft logit; score adjacent pairs `S_t(a,b) = U_t(b) + <pred(a) ⊙ H(h_t),
 /// succ(b)>`; trace the best (or sampled) path from the anchor. All pairwise
@@ -2211,6 +2463,7 @@ pub fn selectPath(
         .chosen_idx = undefined,
         .cand_ids = undefined,
         .q = null,
+        .conf = undefined,
     };
     errdefer allocator.free(out.ids);
     out.chosen_idx = try allocator.alloc(u32, m);
@@ -2218,6 +2471,8 @@ pub fn selectPath(
     out.cand_ids = try allocator.alloc(i32, m * k);
     errdefer allocator.free(out.cand_ids);
     @memcpy(out.cand_ids, cand_data[0 .. m * k]);
+    out.conf = try allocator.alloc(f32, m);
+    errdefer allocator.free(out.conf);
     if (stochastic) out.q = try allocator.alloc(f32, m * k);
 
     var scores_buf: [64]f32 = undefined; // top_k is 16 on the real checkpoint
@@ -2260,6 +2515,7 @@ pub fn selectPath(
         }
         out.ids[t] = @intCast(cand_data[t * k + choice]);
         out.chosen_idx[t] = @intCast(choice);
+        out.conf[t] = if (stochastic) out.q.?[t * k + choice] else softmaxShare(scores, choice);
         prev_idx = choice;
     }
     return out;
@@ -2284,6 +2540,21 @@ pub fn appendContext(
 
     const enc = try encodeContext(model, captures);
     defer _ = mlx.mlx_array_free(enc);
+    if (model.lilicorr != null) {
+        const esh = mlx.getShape(enc);
+        if (esh.len != 3 or esh[1] < 1) return error.InvalidLilicorrDraft;
+        var last = mlx.mlx_array_new();
+        errdefer {
+            if (last.ctx != null) _ = mlx.mlx_array_free(last);
+        }
+        const start = [_]c_int{ 0, esh[1] - 1, 0 };
+        const stop = [_]c_int{ esh[0], esh[1], esh[2] };
+        const step = [_]c_int{ 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&last, enc, &start, 3, &stop, 3, &step, 3, s));
+        if (ctx.anchor.ctx != null) _ = mlx.mlx_array_free(ctx.anchor);
+        ctx.anchor = last;
+        last = .{ .ctx = null };
+    }
 
     for (model.layers, 0..) |*lw, li| {
         const k = try projectHeads(enc, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, first_pos, true, cfg.rope_traditional, s);
@@ -2294,11 +2565,27 @@ pub fn appendContext(
     }
 }
 
+/// A copy of `x` in `like`'s dtype. An f16 trunk (Hadamard packs) feeding a
+/// bf16 drafter otherwise promotes every drafter op to f32, off the row lanes.
+fn toDrafterDtype(x: mlx.mlx_array, like: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const dt = mlx.mlx_array_dtype(like);
+    if (mlx.mlx_array_dtype(x) == dt) {
+        try mlx.check(mlx.mlx_array_set(&out, x));
+    } else {
+        try mlx.check(mlx.mlx_astype(&out, x, dt, s));
+    }
+    return out;
+}
+
 /// Encoder projection: concatenate the trunk captures on features →
 /// `encoder.fc` → RMS norm. Returns `[1, n, hidden]`, caller frees.
 pub fn encodeContext(model: *const DflashModel, captures: []const mlx.mlx_array) !mlx.mlx_array {
     const s = model.s;
     std.debug.assert(captures.len == model.config.target_layer_ids.len);
+    // `supportsLayerCapture` is a promise the trunk's forward must keep: an unfilled slot is a forward that ignores it.
+    for (captures) |c| if (c.ctx == null) return error.DflashCaptureMissing;
     var cat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(cat);
     {
@@ -2307,7 +2594,9 @@ pub fn encodeContext(model: *const DflashModel, captures: []const mlx.mlx_array)
         for (captures) |c| _ = mlx.mlx_vector_array_append_value(vec, c);
         try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 2, s));
     }
-    const projected = try model.fc.apply(cat, s);
+    const cast = try toDrafterDtype(cat, model.enc_norm, s);
+    defer _ = mlx.mlx_array_free(cast);
+    const projected = try model.fc.apply(cast, s);
     defer _ = mlx.mlx_array_free(projected);
     return rmsNormFn(projected, model.enc_norm, model.config.rms_norm_eps, s);
 }
@@ -2357,8 +2646,7 @@ pub fn forwardBlock(
     const none_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(none_mask);
 
-    var x = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_array_set(&x, noise_embeds));
+    var x = try toDrafterDtype(noise_embeds, model.enc_norm, s);
     errdefer _ = mlx.mlx_array_free(x);
 
     for (model.layers, 0..) |*lw, li| {
@@ -2419,9 +2707,9 @@ pub fn forwardBlock(
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
         if (mask) |m| {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "array", m, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "array", m, lw.attn_sink, false, s));
         } else {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "", none_mask, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "", none_mask, lw.attn_sink, false, s));
         }
 
         var attn_t = mlx.mlx_array_new();
@@ -2540,6 +2828,42 @@ const GEMMA_ASSISTANT_CONFIG_JSON =
     \\}
 ;
 
+test "dflash: a LiLiCorr contract parses and shifts capture ids to layer outputs" {
+    const json = @embedFile("fixtures/lilicorr_config.json");
+    const allocator = testing.allocator;
+    var cfg = try parseConfigFromJson(allocator, json);
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.lilicorr);
+    try testing.expectEqualSlices(u32, &[_]u32{ 0, 17, 34, 50, 67, 84 }, cfg.captureIds());
+    try testing.expectEqual(@as(u32, 8), cfg.candidate_topk);
+    try testing.expectEqual(@as(u32, 1024), cfg.lilicorr_hidden);
+    try testing.expectEqual(@as(u32, 2), cfg.lilicorr_layers);
+    try testing.expectEqual(@as(u32, 8), cfg.lilicorr_heads);
+    try testing.expectEqual(@as(u32, 1024), cfg.factor_dim);
+    try testing.expectApproxEqAbs(@as(f32, 0.0001), cfg.vector_eps, 1e-9);
+    try testing.expectEqual(@as(f32, 8), cfg.logit_scale);
+    try testing.expect(cfg.has_attn_sinks);
+    try testing.expect(cfg.isDflash2());
+}
+
+test "dflash: LiLiCorr rejects undeclared head-key aliases" {
+    const json = @embedFile("fixtures/lilicorr_config.json");
+    const allocator = testing.allocator;
+    for ([_][2][]const u8{
+        .{ "lilicorr_candidate_topk", "candidate_topk" },
+        .{ "lilicorr_hidden_size", "hidden" },
+        .{ "lilicorr_num_layers", "layers" },
+        .{ "lilicorr_num_heads", "heads" },
+        .{ "lilicorr_factor_dim", "factor" },
+        .{ "lilicorr_vector_eps", "vector_eps" },
+        .{ "lilicorr_logit_scale", "logit_scale" },
+    }) |keys| {
+        const guessed = try std.mem.replaceOwned(u8, allocator, json, keys[0], keys[1]);
+        defer allocator.free(guessed);
+        try testing.expectError(error.IncompleteDflashConfig, parseConfigFromJson(allocator, guessed));
+    }
+}
+
 test "dflash: muse assistant config parses with the full DFlash contract" {
     const allocator = testing.allocator;
     var cfg = try parseConfigFromJson(allocator, MUSE_ASSISTANT_CONFIG_JSON);
@@ -2643,11 +2967,37 @@ test "dflash: DSpark contract splits across root and dflash_config, and both hal
     try testing.expect(!cfg.isDflash2());
 }
 
+test "dflash: an explicit null sliding_window keeps the no-window default (MiniCPM-V 4.7 DSpark)" {
+    const allocator = testing.allocator;
+    const nulled = try std.mem.replaceOwned(u8, allocator, DSPARK_LFM2_CONFIG_JSON, "\"markov_rank\": 256,", "\"markov_rank\": 256, \"sliding_window\": null,");
+    defer allocator.free(nulled);
+    var cfg = try parseConfigFromJson(allocator, nulled);
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u32, 0), cfg.sliding_window);
+}
+
 test "dflash: a DSpark config with an unported markov head type is refused by name" {
     const allocator = testing.allocator;
     const gated = try std.mem.replaceOwned(u8, allocator, DSPARK_LFM2_CONFIG_JSON, "\"vanilla\"", "\"gated\"");
     defer allocator.free(gated);
     try testing.expectError(error.UnsupportedMarkovHeadType, parseConfigFromJson(allocator, gated));
+}
+
+test "dflash: a drafter whose attention needs unported arms is refused by name" {
+    const allocator = testing.allocator;
+    for ([_][2][]const u8{
+        .{ "\"markov_rank\": 256,", "\"markov_rank\": 256, \"partial_rotary_factor\": 0.5," },
+        .{ "\"markov_rank\": 256,", "\"markov_rank\": 256, \"add_swa_attention_sink_bias\": true," },
+        .{ "\"markov_rank\": 256,", "\"markov_rank\": 256, \"attention_value_scale\": 0.612," },
+    }) |edit| {
+        const json = try std.mem.replaceOwned(u8, allocator, DSPARK_LFM2_CONFIG_JSON, edit[0], edit[1]);
+        defer allocator.free(json);
+        try testing.expectError(error.UnsupportedDflashAttention, parseConfigFromJson(allocator, json));
+    }
+    const full = try std.mem.replaceOwned(u8, allocator, DSPARK_LFM2_CONFIG_JSON, "\"markov_rank\": 256,", "\"markov_rank\": 256, \"partial_rotary_factor\": 1.0,");
+    defer allocator.free(full);
+    var cfg = try parseConfigFromJson(allocator, full);
+    cfg.deinit(allocator);
 }
 
 test "dflash: DFlash2 nested dflash_config contract parses with selector + conv fields" {
@@ -2811,6 +3161,54 @@ test "dflash: an assistant merged into the checkpoint is found without a flag" {
     // `openDirAbsolute` on a non-absolute path is ReleaseFast UB.
     try testing.expectEqual(@as(?[]u8, null), resolveInDirDrafter(io, allocator, ""));
     try testing.expectEqual(@as(?[]u8, null), resolveInDirDrafter(io, allocator, "relative/dir"));
+}
+
+test "dflash: a pack's one servable drafter subfolder stands in for drafter/" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const model_dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const writeConfig = struct {
+        fn call(dir: std.Io.Dir, sub_path: []const u8, json: []const u8) !void {
+            const io_ = std.Io.Threaded.global_single_threaded.io();
+            try dir.createDirPath(io_, sub_path);
+            var sub = try dir.openDir(io_, sub_path, .{});
+            defer sub.close(io_);
+            try sub.writeFile(io_, .{ .sub_path = "config.json", .data = json });
+        }
+    }.call;
+    const unservable = try std.mem.replaceOwned(u8, allocator, DFLASH2_CONFIG_JSON, "\"head_dim\": 128,", "\"head_dim\": 128, \"partial_rotary_factor\": 0.5,");
+    defer allocator.free(unservable);
+
+    // Folders that are not drafters, and a drafter whose attention we cannot serve, are passed over.
+    try writeConfig(tmp.dir, "assets", "{\"model_type\":\"siglip\"}");
+    try writeConfig(tmp.dir, "dflash", unservable);
+    try testing.expectEqual(@as(?[]u8, null), resolveInDirDrafter(io, allocator, model_dir));
+
+    // Sushi's GLM ships its DFlash2 as `GLM-5.3-Flash-DFlash2/`.
+    try writeConfig(tmp.dir, "GLM-5.3-Flash-DFlash2", DFLASH2_CONFIG_JSON);
+    const found = resolveInDirDrafter(io, allocator, model_dir) orelse return error.TestExpectedInDirDrafter;
+    defer allocator.free(found);
+    try testing.expect(std.mem.endsWith(u8, found, "/GLM-5.3-Flash-DFlash2"));
+
+    // Standalone sushi's derived 4-bit copy of that drafter is its own cache, not a second candidate.
+    try writeConfig(tmp.dir, "dflash2", DFLASH2_CONFIG_JSON);
+    try tmp.dir.writeFile(io, .{ .sub_path = "dflash2/" ++ SUSHI_RUNTIME_CACHE, .data = "{}" });
+    const beside_cache = resolveInDirDrafter(io, allocator, model_dir) orelse return error.TestExpectedInDirDrafter;
+    defer allocator.free(beside_cache);
+    try testing.expect(std.mem.endsWith(u8, beside_cache, "/GLM-5.3-Flash-DFlash2"));
+
+    // Two candidates is a guess: neither is taken.
+    try writeConfig(tmp.dir, "Other-DFlash2", DFLASH2_CONFIG_JSON);
+    try testing.expectEqual(@as(?[]u8, null), resolveInDirDrafter(io, allocator, model_dir));
+
+    // `drafter/` stays the pack's own name and wins.
+    try writeConfig(tmp.dir, IN_DIR_SUBDIR, DFLASH2_CONFIG_JSON);
+    const own = resolveInDirDrafter(io, allocator, model_dir) orelse return error.TestExpectedInDirDrafter;
+    defer allocator.free(own);
+    try testing.expect(std.mem.endsWith(u8, own, "/" ++ IN_DIR_SUBDIR));
 }
 
 test "dflash: no wide verify lane caps the block at the split-K width" {
@@ -3194,6 +3592,172 @@ pub const TinyFix = struct {
     }
 };
 
+const OwnHeadFix = struct {
+    const seed = 777;
+    fn write(io: std.Io, dir: std.Io.Dir, path: []const u8, s: mlx.mlx_stream, rows: usize, cols: usize, prepacked: bool) !void {
+        try TinyFix.writeAssistant(io, dir, path, s);
+        const cfg = try std.fmt.allocPrint(testing.allocator, "{s},\"has_own_lm_head\":true,\"draft_vocab_size\":128}}", .{TinyFix.ASSISTANT_CONFIG[0 .. TinyFix.ASSISTANT_CONFIG.len - 1]});
+        defer testing.allocator.free(cfg);
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = cfg });
+        if (rows == 0) return;
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        if (prepacked) {
+            const dense = try TinyFix.bf16Arr(rows, cols, seed, s);
+            defer _ = mlx.mlx_array_free(dense);
+            var lin = try quantizeDense(dense, 4, 64, s);
+            defer lin.deinit();
+            try TinyFix.put(map, "lm_head.weight", lin.w);
+            try TinyFix.put(map, "lm_head.scales", lin.scales);
+            try TinyFix.put(map, "lm_head.biases", lin.biases);
+        } else try TinyFix.putW(map, "lm_head.weight", rows, cols, seed, s);
+        const file = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/head.safetensors", .{path}, 0);
+        defer testing.allocator.free(file);
+        try mlx.check(mlx.mlx_save_safetensors(file.ptr, map, meta));
+    }
+};
+
+test "dflash own head: official Super config and malformed declarations" {
+    const alloc = testing.allocator;
+    var super = try parseConfigFromJson(alloc, @embedFile("fixtures/model-configs/nemotron_h_super_drafter.json"));
+    defer super.deinit(alloc);
+    try testing.expect(super.has_own_lm_head);
+    try testing.expectEqual(@as(u32, 131072), super.draft_vocab_size);
+    try testing.expectEqual(@as(u32, 8), super.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 8192), super.sliding_window);
+    try testing.expectEqual(@as(u32, 2), super.conv_kernel_size);
+    try testing.expectEqualSlices(u32, &.{ 0, 21, 42, 63, 84 }, super.captureIds());
+    var borrow = try parseConfigFromJson(alloc, TinyFix.ASSISTANT_CONFIG);
+    defer borrow.deinit(alloc);
+    try testing.expect(!borrow.has_own_lm_head);
+    const begin = TinyFix.ASSISTANT_CONFIG[0 .. TinyFix.ASSISTANT_CONFIG.len - 1];
+    inline for (.{ "\"true\"", "1", "{}" }) |flag| {
+        const raw = try std.fmt.allocPrint(alloc, "{s},\"has_own_lm_head\":{s}}}", .{ begin, flag });
+        defer alloc.free(raw);
+        try testing.expectError(error.InvalidDflashConfigValue, parseConfigFromJson(alloc, raw));
+    }
+    inline for (.{ "0", "-1", "1.5", "\"128\"" }) |width| {
+        const raw = try std.fmt.allocPrint(alloc, "{s},\"has_own_lm_head\":true,\"draft_vocab_size\":{s}}}", .{ begin, width });
+        defer alloc.free(raw);
+        try testing.expectError(error.InvalidDflashConfigValue, parseConfigFromJson(alloc, raw));
+    }
+    inline for (.{ "false", "null" }) |flag| {
+        const raw = try std.fmt.allocPrint(alloc, "{s},\"has_own_lm_head\":{s}}}", .{ begin, flag });
+        defer alloc.free(raw);
+        var optional = try parseConfigFromJson(alloc, raw);
+        defer optional.deinit(alloc);
+        try testing.expect(!optional.has_own_lm_head);
+    }
+    const remapped = try std.fmt.allocPrint(alloc, "{s},\"has_own_lm_head\":true,\"draft_vocab_size\":128,\"vocab_size\":256}}", .{begin});
+    defer alloc.free(remapped);
+    try testing.expectError(error.InvalidDflashConfigValue, parseConfigFromJson(alloc, remapped));
+    const missing = try std.fmt.allocPrint(alloc, "{s},\"has_own_lm_head\":true}}", .{begin});
+    defer alloc.free(missing);
+    try testing.expectError(error.IncompleteDflashConfig, parseConfigFromJson(alloc, missing));
+}
+
+test "dflash own head: declared weights and geometry are mandatory" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.gpuStream();
+    for ([_][2]usize{ .{ 0, 0 }, .{ 127, 64 }, .{ 128, 32 } }) |shape| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+        try OwnHeadFix.write(io, tmp.dir, dir, s, shape[0], shape[1], false);
+        if (loadDflashQuant(io, testing.allocator, s, dir, 0)) |unexpected| {
+            var model = unexpected;
+            model.deinit();
+            return error.ExpectedHeadWeightError;
+        } else |err| try testing.expectEqual(if (shape[0] == 0) error.MissingWeight else error.InvalidDflashHeadWeights, err);
+    }
+}
+
+test "dflash own head: dense and affine projections preserve trained logits and target verification" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.gpuStream();
+    var trunk = testing.tmpDir(.{});
+    defer trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try trunk.dir.realPath(io, &trunk_buf)];
+    try TinyFix.writeTrunk(io, trunk.dir, trunk_path, s);
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    const ids = mlx.mlx_array_new_data(&[_]i32{ 2, 3, 7 }, &[_]c_int{ 1, 3 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    const before = try xfm.forward(ids);
+    defer _ = mlx.mlx_array_free(before);
+    const before_values = try TinyFix.readF32(before, allocator, s);
+    defer allocator.free(before_values);
+    const x = try TinyFix.capArr(TinyFix.BLOCK, 800, s);
+    defer _ = mlx.mlx_array_free(x);
+    const trunk_logits = try xfm.lmHeadForDraft(x);
+    defer _ = mlx.mlx_array_free(trunk_logits);
+    const trunk_values = try TinyFix.readF32(trunk_logits, allocator, s);
+    defer allocator.free(trunk_values);
+    for ([_]u32{ 0, 8, 4 }) |bits| {
+        var asst = testing.tmpDir(.{});
+        defer asst.cleanup();
+        var asst_buf: [512]u8 = undefined;
+        const path = asst_buf[0..try asst.dir.realPath(io, &asst_buf)];
+        try OwnHeadFix.write(io, asst.dir, path, s, TinyFix.VOCAB, TinyFix.HIDDEN, bits == 4);
+        var model = try loadDflashQuant(io, allocator, s, path, if (bits == 8) 8 else 0);
+        defer model.deinit();
+        try testing.expect(model.own_lm_head != null);
+        try testing.expectEqual(bits, model.own_lm_head.?.bits);
+        try model.bindWithDraftBits(&xfm, 3);
+        try testing.expect(model.draft_head == null);
+        xfm.config.vocab_size += 1;
+        try testing.expectError(error.DflashTargetMismatch, model.bind(&xfm));
+        xfm.config.vocab_size -= 1;
+        const dense = try TinyFix.bf16Arr(TinyFix.VOCAB, TinyFix.HIDDEN, OwnHeadFix.seed, s);
+        defer _ = mlx.mlx_array_free(dense);
+        var ref_weights = if (bits > 0) try quantizeDense(dense, bits, 64, s) else DflashLinear{
+            .w = mlx.mlx_array_new(),
+            .scales = mlx.mlx_array_new(),
+            .biases = mlx.mlx_array_new(),
+        };
+        defer ref_weights.deinit();
+        var expected = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(expected);
+        if (bits > 0) {
+            try mlx.check(mlx.mlx_quantized_matmul(&expected, x, ref_weights.w, ref_weights.scales, ref_weights.biases, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", s));
+        } else {
+            try mlx.check(mlx.mlx_transpose_axes(&ref_weights.w, dense, &[_]c_int{ 1, 0 }, 2, s));
+            try mlx.check(mlx.mlx_matmul(&expected, x, ref_weights.w, s));
+        }
+        const expected_values = try TinyFix.readF32(expected, allocator, s);
+        defer allocator.free(expected_values);
+        for ([_]bool{ false, true }) |tile| {
+            if (tile) _ = try model.tileLaneWeights(.bfloat16, s);
+            const got = try model.draftLogits(&xfm, x);
+            defer _ = mlx.mlx_array_free(got);
+            const values = try TinyFix.readF32(got, allocator, s);
+            defer allocator.free(values);
+            const parity = try paritySlices(expected_values, values);
+            try testing.expect(parity.cos > 0.9999 and @abs(parity.rms_ratio - 1) < 0.01);
+            var difference: f32 = 0;
+            for (values, trunk_values) |a, b| difference = @max(difference, @abs(a - b));
+            try testing.expect(difference > 0.1);
+        }
+        try xfm.resetCache();
+        const after = try xfm.forward(ids);
+        defer _ = mlx.mlx_array_free(after);
+        const after_values = try TinyFix.readF32(after, allocator, s);
+        defer allocator.free(after_values);
+        try testing.expectEqualSlices(f32, before_values, after_values);
+    }
+}
+
 test "dflash: loadDflash keeps a dense bf16 assistant dense + pre-transposed when quantization is off" {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -3310,6 +3874,31 @@ test "dflash: appendContext grows the cache; forwardBlock evicts its block K/V" 
         try appendContext(&m, &ctx, &[_]mlx.mlx_array{ c0, c1 }, 6);
     }
     try testing.expectEqual(@as(usize, 9), ctx.cache.step);
+}
+
+test "dflash: a capture the trunk never filled is a named error, not an empty append" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+    try TinyFix.writeAssistant(io, tmp_dir.dir, dir_path, s);
+    var m = try loadDflash(io, allocator, s, dir_path);
+    defer m.deinit();
+    var ctx = try DflashCtx.init(allocator, &m, 0);
+    defer ctx.deinit();
+
+    const c0 = try TinyFix.capArr(6, 200, s);
+    defer _ = mlx.mlx_array_free(c0);
+    // What a forward that ignores `capture_layers` leaves in the slot.
+    const unfilled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(unfilled);
+    try testing.expectError(error.DflashCaptureMissing, appendContext(&m, &ctx, &[_]mlx.mlx_array{ c0, unfilled }, 0));
+    try testing.expectEqual(@as(usize, 0), ctx.cache.step);
 }
 
 /// Run the full context-append + block forward on `m` and return the block
@@ -3702,6 +4291,10 @@ test "dflash2: selectPath traces the pairwise-scored path, edges outvote unary l
     // token 1 → 5+1=6, token 6 → 4+6=10 — the EDGE flips the unary order.
     try testing.expectEqual(@as(u32, 6), path.ids[1]);
     try testing.expect(path.q == null);
+    // The selector's confidence in each step is the chosen candidate's softmax share:
+    // scores (12, 11) at position 0, (10, 6) at position 1.
+    try testing.expectApproxEqAbs(@as(f32, 0.7311), path.conf[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0.9820), path.conf[1], 1e-3);
 
     // Sampled arm: q is a proper distribution over each candidate row and
     // the drawn token's q is positive (the acceptance ratio's denominator).
@@ -3784,6 +4377,17 @@ test "dflash: the draft-only lm_head shrinks the draft read and leaves verify al
     try testing.expect(m.draft_head == null);
 }
 
+test "dflash: a load-time quantized linear no longer pins its bf16 source in the weights map" {
+    const s = mlx.gpuStream();
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    try weights.map.put(try testing.allocator.dupe(u8, "lin.weight"), try TinyFix.bf16Arr(128, 256, 1, s));
+    var lin = try loadLinear(&weights, "lin", 256, 4, s);
+    defer lin.deinit();
+    try testing.expect(lin.isQuantized());
+    try testing.expect(weights.get("lin.weight").?.ctx == null);
+}
+
 test "dflash: quantGroupFor picks the widest divisor, declines what affine cannot pack" {
     try testing.expectEqual(@as(?u32, 64), quantGroupFor(6656));
     try testing.expectEqual(@as(?u32, 64), quantGroupFor(19968));
@@ -3791,6 +4395,46 @@ test "dflash: quantGroupFor picks the widest divisor, declines what affine canno
     try testing.expectEqual(@as(?u32, 32), quantGroupFor(96));
     try testing.expectEqual(@as(?u32, null), quantGroupFor(48));
     try testing.expectEqual(@as(?u32, null), quantGroupFor(0));
+}
+
+test "standard forward: skip_lm_head hands back the hidden the head reads, never logits" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir_path = path_buf[0..try tmp_dir.dir.realPath(io, &path_buf)];
+    try TinyFix.writeTrunk(io, tmp_dir.dir, dir_path, s);
+    var config = try model_mod.parseConfig(io, allocator, dir_path);
+    var weights = try model_mod.loadWeights(io, allocator, dir_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.usesStandardForward());
+
+    const prompt = [_]i32{ 3, 7, 1, 12, 30, 5, 9, 22 };
+    const ids = mlx.mlx_array_new_data(&prompt, &[_]c_int{ 1, prompt.len }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    var ctx = xfm.defaultCtx();
+    ctx.skip_lm_head = true;
+    const hidden = try xfm.forwardWith(&ctx, ids);
+    defer _ = mlx.mlx_array_free(hidden);
+    try testing.expectEqualSlices(c_int, &.{ 1, prompt.len, TinyFix.HIDDEN }, mlx.getShape(hidden));
+
+    try xfm.resetCache();
+    var plain = xfm.defaultCtx();
+    const logits = try xfm.forwardWith(&plain, ids);
+    defer _ = mlx.mlx_array_free(logits);
+    const projected = try xfm.lmHeadForDraft(hidden);
+    defer _ = mlx.mlx_array_free(projected);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, projected, logits, false, s));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try testing.expect(same);
 }
 
 test "dflash: trunk capture_layers = hidden_states[i+1], consistent across chunked prefill" {

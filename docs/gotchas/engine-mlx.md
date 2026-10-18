@@ -2,6 +2,10 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### A restored LiLiCorr context had no correlation anchor
+
+Defect: a request restored from the prefix cache failed under LiLiCorr. Cause: snapshots keep the drafter K/V but not the latest target feature. Fix: take one plain round to capture it, then resume speculation; layout unchanged. Guard: `lilicorr missing restored anchor takes a plain round and recovers it`.
+
 ### `top_p: 0` masked every token and sampled uniform garbage (2026-09-16)
 The nucleus keeps a rank while the mass STRICTLY above it is `< top_p`. Rank 0 sees exactly 0, so a literal `top_p: 0` (what clients send for "greedy") kept nothing: the row went `-inf` everywhere and the categorical draw was uniform over 248k ids ("będziemyWATCH끈 გა stimulation"). 0.001 and up were fine, which is why no sweep ever saw it. Fix: the threshold floors at `floatMin(f32)`, so rank 0 is always inside and `top_p 0` is greedy like `top_k 1`. Guard: `applyTopP at top_p 0 keeps exactly the argmax` (generate.zig) + `tests/test_api_edges.sh` (top_p 0 == temperature 0 live).
 
@@ -92,7 +96,9 @@ That review also found two DFlash lifecycle assumptions that were only true on t
 
 **MTP (native multi-token prediction)** (`src/mtp.zig`, `Generator.nextMtp`): Qwen 3.5/3.6 checkpoints with a trained one-layer MTP sidecar (`mtp/weights.safetensors`, ~15 tensors, e.g. ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve — buildable from any Qwen 3.6 checkpoint via tests/build_mtp_sidecar.py) auto-load it and speculate with the model's own head. Forward: `fc(concat([rmsnorm(embed(tok)), rmsnorm(trunk_hidden_post_final_norm)]))` → one qwen3_5 gated full-attention layer with its OWN single-layer dense KV cache (partial RoPE at cache-relative offset) → `mtp.norm` → trunk lm_head. The head keeps a COMMITTED-HISTORY cache: entry j pairs (trunk hidden at position p, token at p+1), built chunk-wise during prefill (`ForwardCtx.capture_hidden_all`) and rebuilt each round — drafts append temporary entries from MTP-predicted hiddens; the commit STASHES the round's (tokens, TRUE verify hiddens) pair (`Generator.MtpHistStash`) and the NEXT round's first draft consumes it: one truncate to the stash origin + ONE merged multi-row head forward appends the committed history AND the first draft entry, byte-identical in RoPE offsets/append order to the old appendHistory-then-stepArr sequence (pinned by the merged-forward equivalence test in mtp.zig) but one head forward cheaper per round (~7 ms on the 27B: T(3) 76.3 → 69.5 same-protocol). Rounds with no successor (EOS/length/runtime disable) never pay for the append; a pending stash makes `mc.step` STALE, so the round origin is `mtpRoundOff0(stash, mc.step)`, never raw `mc.step`. `appendHistory` itself survives only for prefill history build. Verify invariant identical to PLD/drafter. Quant: MTP linears re-solve (bits, group_size) PER WEIGHT per call (`transformer.affineParamsFromGeometry` from packed-column geometry vs the activation inner dim — the 35B-A3B sidecar mixes 5/6-bit gs-128 q/k/v beside 4-bit gs-64 o and experts; load-time `inferBits` globals are only the degenerate-geometry fallback); fc + norms bf16. The MLP is a union: dense SwiGLU, or the 35B-A3B MoE layout (`language_model.mtp.` key prefix, mlx-lm `switch_mlp` split experts + shared expert + SEG) forwarded through the trunk's own `moeMLP` — live 73% per-draft on the 35B, temp-0 identical to AR. Sidecar discovery (`mtp.sidecar_rel_paths`) accepts `mtp/weights.safetensors` (native), root `mtp.safetensors`/`model-mtp.safetensors`, and `optiq/mtp.safetensors` (oMLX OptiQ). GOTCHA (delta-encoded norms — now auto-handled): the original Qwen repo (and OptiQ's export) store RMS-norm weights DELTA-encoded (the layer computes `1 + w`), while mlx-serve applies `rmsnorm(x) * w` with no +1 — so a head loaded without the fold is structurally broken (engages, ~0% acceptance, gate-falls-back to AR, passes equivalence+engagement). The server now AUTO-FOLDS at load: `mtpNormsAreDeltaEncoded` reads the negative fraction of the norm weights (delta ≈ 30-50% negative; folded RMSNorm scales are strictly positive), and `ownNorm` adds +1 when delta — a native (already-folded) sidecar has no negatives so it's left byte-identical (no double-fold). Worst case of a mis-detect is the runtime gate turning MTP off, never wrong output. SECOND OptiQ class (mixed-precision embed): `embedTargetTokens` must resolve the trunk embed table's quant params PER-WEIGHT via `transformer.computeQuantParams` (mirroring `Transformer.embedding`→`quantParamsHinted`), NOT the global `config.quant_bits` — OptiQ quantizes `embed_tokens` to 8-bit while the base is 4-bit, and dequantizing an 8-bit table as 4-bit crashes the whole server (`[dequantize] scales/biases shape mismatch`, a 36-row slice reads as `(36,1280)`); uniform-4-bit checkpoints (ddalcu, MTPLX) resolve to the same 4/gs64 so they're byte-unchanged. Both classes guarded by the delta-norm detect/fold + optiq-path tests in mtp.zig and `tests/test_mtp_equivalence.sh` (green on all three 27B variants: ddalcu/mtplx folded-untouched, optiq folded + 8-bit-embed, avg_per_round 1.0). Priority MTP > drafter > PLD; NOT subject to the prompt n-gram spec-gate (the trained head holds ~73% per-draft on fully novel content).
 
-**The per-request default is ONE chokepoint: `server.defaultEnableMtp(mtp_loaded, dsv4_stages)`**, called by all four surfaces (chat / completions / messages / responses). Never inline the policy at a new surface; an output-equality test cannot see a spec path that silently never engaged (the drafter-dispatch-hole lesson). MoE heads used to default OFF (the verify forward pays expert routing), which left them unreachable from every client that sends no `enable_mtp` (Claude Code, llmprobe, curl) unless the operator passed `--mtp`; the app always passed it, so headless and app disagreed. A loaded head now drafts by default everywhere (`--mtp` is a no-op); `--no-mtp`, a model's `"mtp": false` or a request's `enable_mtp:false` opt out. The trade-off that remains: on qwen4 the MTP slot decodes exclusively, so concurrent chats stop batching while it drafts.
+**The per-request default is ONE chokepoint: `server.defaultEnableMtp(mtp_loaded, dsv4_stages)`**, called by all four surfaces (chat / completions / messages / responses). A loaded head drafts by default, dense or MoE. The model's `mtp` setting outranks the launch default, including `"mtp": true` with `--no-mtp`; `enable_mtp:false` opts out per request. Native DSpark must honor the resolved model and request opt-outs even when another speculative mode is requested; dispatch and `/props` share `Generator.dsparkEnabled` for the environment kill switch. On qwen4 the MTP slot decodes exclusively, so concurrent chats stop batching while it drafts.
+
+**mlx-stream speculation metadata:** `/props.settings.mtp.native` reports the installed lane name, `block_size` (draft cap, excluding the leading token and lookup extensions) and sampled acceptance; host-only acceptance/depth/adaptive fields are null. `native.sampled_acceptance: "off"` means the sampled lever is disabled or there are no stages, not that global policy or the current request disabled drafting. `loaded` describes resident stages, `default_on` honors resolved settings/environment opt-outs, and neither promises per-request engagement: logprobs, grammar and penalties still select serial decode. The native greedy lane uses typical acceptance, not exact argmax equality; opting out does not unload its resident stages. Guards: native capability/settings unit tests and `tests/test_dsv41_speculation.py` (also called by `DSV41_TEST_DSPARK=1 tests/test_dsv41.sh`).
 
 **EV adaptive depth controller** (default ON; `MLX_SERVE_MTP_ADAPTIVE=0` reverts to the fixed windowed controller for same-boot A/Bs): each request tracks per-index CONDITIONAL acceptance EMAs `a[i] = P(draft i accepted | i−1 accepted)` (β 0.15, ~10-round legacy warmup) and plans every round via the pure `mtpEvPlanFor` — base `m_lo` = static EV argmax, extended to `m_hi` when the head's chain log-confidence on chunk A clears a cost-derived τ (ONE bounded sync at the chunk boundary). Invariants: (1) a single-chunk plan (`m_lo == m_hi`) is byte-identical in round shape to the fixed path — no confidence graph, no sync; (2) sticky-disable needs a FULL 16-round window of first-draft outcomes collected only while base depth is 1 (wider-base rounds reset it; demotion instant via EMA decay; `m_lo` climbs ≤ +1/round); (3) `MTP_EV_PRIOR` (0.85) sits ABOVE the ~77% average rate ON PURPOSE — deep indices are OBSERVED only when extension fires, so a realistic prior starves exploration forever (τ + the full-confidence horizon are the only gates, pinned by the exploration test). Omitting `--mtp-max-depth` selects the automatic cap: cap 6 ordinarily, cap 8 ONLY for the calibrated G17-NAX fingerprint (see verifyQmm gotcha); explicit bounds win (validated in 1..`MAX_DEPTH`); `--mtp-min-depth` lifts the automatic cap when needed, and equal min/max values pin one depth; the internal 0 sentinel is plumbed through LoadParams so `lm.mtp_depth` logs stay truthful. `[spec-stats]` reports `drafted=`/`ext_rounds=` (per_draft_pct divides by DRAFTED tokens — depth varies per round). Guard: `tests/test_mtp_equivalence.sh` asserts ext_rounds>0 on a max-confidence echo AND `MLX_SERVE_MTP_ADAPTIVE=0` reverts to depth 3, zero extensions.
 
@@ -269,7 +275,7 @@ MLX's M5 neural-accelerator (NAX) kernels are gated at CMake configure time: Met
 A single `msv_attn_p256` CAUSAL dispatch scanning the whole KV monopolizes the GPU long enough at high kv_len to trip **macOS IOGPU interactivity preemption**, the penalty scaling with dispatch wallclock — invisible to µbenches (isolated kernel) and short-kv ratio gates, which is why the arm won every µbench yet lost every live ratio-gated A/B monotonically. Fix (ported from oMLX `qwen35_fa256_attention.py`): cap per-dispatch work at `batch·Hq·qL·keys ≤ budget` (`MLX_SERVE_FUSED_256_BUDGET`), splitting the key axis into BK-aligned dispatches with the FA-2 online-softmax state (m/l/unnormalized O) carried through fp32 buffers — register-precision-exact, so BIT-IDENTICAL to single-dispatch (pinned by a test + a dispatch-count engagement seam). Implementation trap: MLX's `metal_kernel` codegen binds sub-4KB inputs in the `constant` address space and larger in `device`, so carry reads must use direct indexing (`o_in[base + i]`), never a typed `const device float*` — a compile error only on the arm you didn't test first.
 
 ### Stock qmm_t at prefill widths is a ~10% dead zone — dequant + steel GEMM route (2026-07-22)
-Stock MLX qmm_t picks a 32×32×32 tile that stalls at M≥2048 on qwen shapes. `prefillDqGemm` (M≥2048, affine 2/3/4/5/6/8, `MLX_SERVE_PREFILL_DQ_GEMM=0` kill) dequantizes weights to a bf16 [N,K] transient and runs the dense steel GEMM near-peak — the per-call dequant costs <1 ms and repeats sizes per layer (allocator-cache-friendly); decode/verify widths never route; numerics differ only by bf16 weight rounding (no-worse-than-stock pinned). Trap: `boundedPrefillChunk`'s score-budget formula once shrank the 64K chunk below the route's 2048 floor — it silently never engaged at 64K (the ladder's weakest rung) until the fused-causal chunk policy (`min(base, 4096)`, no formula shrink) replaced it.
+Stock MLX qmm_t picks a 32×32×32 tile that stalls at M≥2048 on qwen shapes. `prefillDqGemm` (M≥2048, affine 2/3/4/5/6/8, `MLX_SERVE_PREFILL_DQ_GEMM=0` kill) dequantizes weights to a bf16 [N,K] transient and runs the dense steel GEMM near-peak — the per-call dequant costs <1 ms and repeats sizes per layer (allocator-cache-friendly); decode/verify widths never route; numerics differ only by bf16 weight rounding (no-worse-than-stock pinned). Trap: `boundedPrefillChunk`'s score-budget formula once shrank the 64K chunk below the route's 2048 floor — it silently never engaged at 64K (the ladder's weakest rung) until the fused-causal chunk policy (`min(base, 4096)`, no formula shrink) replaced it. The 2048 floor was tuned against that steel tile; on the M5 Ultra stock qmm is the fused NAX kernel, which beats the route below about 0.9·min(N, K) rows, so there the floor is per call (`prefillDqGemmRowFloor`): `max(2048, 0.9·min(N, K))` once both N and K are 4096 or more. Below that (Flash-Next's K 2560 and 640 and N 2560, which the 2048-row company chunk hits) and at K ≥ 3N, where the dense GEMM runs MLX's split-K kernel, the route still wins from 2048. The crossover depends on the chip's GEMM tiles, which MLX picks per arch suffix: the M5 Max crosses the other way, so only a dual-die arch (`dualDieArch`, `…d`) gets the shape-aware floor and every other chip keeps 2048.
 
 ### Sharpened-stochastic MTP drafting (Lightning scheme) LOSES to greedy argmax on low-entropy content — negative result, machinery kept opt-in (2026-07-22)
 Ported oMLX Lightning's scheme faithfully (drafts from a fixed sharper dist temp 0.6/top-p 0.95/top-k 20, full Leviathan `min(1,p/q)` accept, `normalize(max(p−q,0))` rejection — distribution-exact for ANY q, toy-vocab test). On low-entropy code/agent content greedy WINS: sharp acceptance is `1 − TV(p,q)`, greedy is `p(argmax_q)`; when the target is near-deterministic (temp-0.6 code sharpens p toward one-hot) `p(argmax) ≈ 1` while TV is dominated by the head's spread mass. Their "collapses to 10–20%" claim is about HIGH-entropy prose (the opposite regime). Keep it wired (`MLX_SERVE_MTP_DRAFT_GREEDY=0`) — the exact-residual machinery is correct and may win on prose. **It does — see the next section; the proposal is now chosen per request.**
@@ -1213,48 +1219,16 @@ documented next step; gemma's head_dim 256 needs a different lane mapping.
 Fourth mining pass over the mlxfast-challenge tree, executing the "next round" list from
 `docs/perf-next-levers.md`. Outcomes, in the order attempted:
 
-### Certified lm_head prune: kernels sound, argmax provable, LIVE NULL — ships opt-in
+### Certified lm_head prune: a µbench win the live graph does not keep — deleted
 
-Port of `LagunaLmHeadPrune.swift` (notes/68): an init-time MXFP8-g32 copy of the dense
-bf16 lm_head (half the bytes), one coarse GEMV emitting per-row coarse logit + a
-CERTIFIED bound (half-ulp e4m3 cells + a 2^-15 rounding allowance, top cell 186) + a bf16
-pre-fill; a dense one-byte candidate mask (`coarse+delta >= max(coarse-delta) - |L|/64`);
-an exact pass whose per-row arithmetic textually replicates the stock
-`gemv_bfloat16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0` (verified to be what MLX dispatches
-for this matvec) so every candidate row is bit-identical to the stock GEMV. Every
-argmax-reachable row is provably a candidate; every non-candidate is provably below the
-winner; the emitted token is the stock token.
-
-Three lessons:
-
-1. **The gate is REQUEST-level and must be known at init.** The pruned row is exact
-   at candidates and coarse elsewhere — enough for an argmax, not for a tail
-   distribution. `ForwardCtx.argmax_only` is set by the Generator (greedy or top-1, no
-   penalties, no logprobs, no grammar), and logprobs had to move into `InitOptions`:
-   the split-prefill final-token forward is a single-row dispatch that runs BEFORE any
-   post-init `gen.logprobs_n = n` write, so a logprobs request would have had its first
-   token's logprobs computed from a pruned row.
-2. **A hermetic parity test cannot see reduction order at this scale.** A deliberate
-   perturbation of the exact kernel's accumulation order (grouped instead of sequential)
-   STILL passed the bit-equality test: an f32 last-ulp difference almost always vanishes
-   in the final bf16 cast, and catching one empirically needs ~hundreds of thousands of
-   casts. The live >=160-token greedy on/off run (16M casts) is the real bit-identity
-   bar — same lesson as round 3's fused-QKV divergence at byte 164.
-3. **The µbench-vs-live class, third instance, with the strongest live design yet.**
-   µbench at the real [100352, 2048] geometry, with a separated-winner weight matrix
-   reproducing the LIVE candidate regime (median ~19 of 100352 candidates, measured by
-   `MLX_SERVE_LMHEAD_PRUNE_TRACE=1`): dense 1.04 -> pruned 0.63 ms/iter, a ~0.4 ms/token
-   saving. Live: an INTERLEAVED same-boot A/B — the gate is per-request, and
-   `presence_penalty: 1e-9` clears `argmax_only` while the lazy greedy sampler never
-   applies penalties, so the dense arm is byte-identical work in the SAME boot,
-   alternating per generation, and thermal drift cancels per pair. 20 rounds: median
-   +0.84% per pair, 3/20 wins; the on-arm's early −1.8% advantage decays within a few
-   generations while the off arm stays flat. The µbench saving does not survive the
-   live graph, and the boot-level A/B that "showed" −1.3%/+1.6% was just drift. Where
-   the ~0.5 ms goes live remains unattributed (candidates stay tiny all boot — traced;
-   the threshold chain and select are flat in the stage bisection; the exact pass with
-   a zero mask costs ~0.02 ms net). Shipped `MLX_SERVE_LMHEAD_PRUNE=1` opt-in with the
-   trace + µbench left in place for whoever picks it up.
+Port of `LagunaLmHeadPrune.swift`: a coarse MXFP8 copy of the dense bf16 head bounds every
+row's logit, and only rows that can still win run an exact replica of the stock GEMV. The
+µbench at Laguna XS geometry went 1.04 -> 0.63 ms, but a same-boot interleaved live A/B won
+3 of 20 pairs, and a 5-bit certified readout of Flash Next's 8-bit head (2026-10) repeated
+it: +1.4-2% on greedy one-row decode only; a top-20 draw left ~11% of the vocabulary as
+candidates and multi-row verify ran slower than stock. Both also took their threshold over
+reserved rows, so a top-ranked suppressed token could hide the real winner. The opt-in prune
+was deleted; a head-readout lever is judged by the live A/B, never the µbench.
 
 ### MoE down-path tail fusion: −1.5%, bit-identical, default ON
 
@@ -5607,3 +5581,135 @@ Guard: `kda decode step over T rows equals T one-row steps` (kda_recurrence.zig)
 
 ### A grouped verify drifted from its solo verify after two perf PRs (#727)
 `row-axis verify: every row of a group verify is byte-identical to its solo verify` failed from row 1 on. Two causes, both later than the test. (1) The fused GDN verify arm (#517) required `projected == null`, so a grouped verify, which hands each slot slices of one joined projection, ran the composed chain while a solo verify ran the kernel: same projections bit for bit, different recurrence rounding. The guard is gone; the joined path is now exact and takes the faster kernel. (2) Solo verify widths 2..8 take the MoE rows arm, and a joined group past 8 rows cannot, so it runs the sorted verify kernels, which reduce differently. Restricting joins to 8 rows made every larger grouped verify slower, so the join stays and the test pins each arm on both sides (`moe_verify_rows_override`). Bisected with `MLX_SERVE_LAYER_CAP=1`: the first divergent layer named the stage.
+
+## DFlash2 over Bonsai ran slower than MTP: dtypes and a load peak (2026-10-06)
+
+Defect: z-lab's bf16 DFlash2 drafter over the f16 Ternary Bonsai 2 27B pack on an M4 16 GB ran 14.6 tok/s vs MTP's 20.5, and OOMed under the default 8-bit drafter.
+Cause: f16 trunk inputs (raw embedding rows, captured hiddens) met bf16 drafter weights, so every drafter op promoted to f32 and `simd_qmm` (bf16 only) declined: assist 40 ms/round. The bf16 draft hidden through the f16 head did the same: head 30 ms. The loader quantized every linear lazily and evaluated once at the end, so the whole bf16 checkpoint (3.85 GB) was resident at once: peak 12.5 GB.
+Fix: `toDrafterDtype` at the drafter's entries, `hadamardLmHead` for the draft logits, per-linear eval + `Weights.replace` in `loadLinear`. Assist 13.5 ms, head 7.4 ms, peak 9.4 GB; with the M4 MMA lane block 8 is the default: 22.5 tok/s mean (code 24.6, math 29.7, prose 13.3).
+Guard: `dflash: a load-time quantized linear no longer pins its bf16 source in the weights map`. Tell: `[dflash-trace]` assist far above the drafter's bytes / bandwidth.
+
+## Every tool round re-forwarded the previous turn's generated tail (2026-10-06)
+
+- Defect: on Qwen3.8 Flash Next behind a coding agent, 98% of tool rounds sent a prompt that
+  matched the previous turn's prompt plus its whole reply, yet each one logged
+  `[hot-cache] reused P-31/...` and re-prefilled the 31-token backoff plus the full reply.
+- Cause: a hybrid restore can only land on an SSM checkpoint, and every checkpoint was a
+  prefill one; the newest sits `SSM_SNAPSHOT_BACKOFF` before the prompt end, and nothing
+  snapshotted the state where decode stopped.
+- Fix: `commitSlotIfApplicable` appends a checkpoint of the live state at the committed
+  length when `decodeEndCheckpointWanted` holds (live position == commit key, no media). It
+  is the newest, so the QSA handoff gives it the history. The MTP head's history ends one row
+  short there (its last row pairs with a token only the next prompt has), so the commit keeps
+  that row's trunk hidden and the restore appends it (`specCarriesOneRow`); without it every
+  such turn drafted blind. The SSD tier does not carry the hidden: a disk restore still does.
+  Only a turn that ends in speculative decode qualifies: serial decode keeps a forwarded
+  lookahead past the key (`live position 98, committed 96`), so it falls back as before.
+- Guard: `scheduler.decode-end checkpoint: taken only where the live state is the committed
+  prefix`, `prefix_cache.spec adoption: a decode-end restore one row past the history carries
+  that row`; `tests/test_cache_reuses_generated_tokens.sh` with a hybrid `CACHE_GEN_TEST_MODEL`.
+## A compiled region re-read its captured weights from disk on every call (2026-10-07)
+
+Defect: DeepSeek-V4.1 on pipenetwork's REAP50 pack (152 GiB of weights) spent five minutes in its warm-up, then ran out of GPU memory at about 200 GiB active.
+Cause: the per-layer decode regions are `mlx_compile`d closures that read their layer's weights from the model instead of taking them as inputs. The weights were still lazy safetensors loads when the first call traced them, so the compiled tape held the `Load` nodes: every call read each weight from disk into a fresh buffer, and the model's own arrays never received data.
+Fix: `deepseek_v41.evalWeights` evaluates every array the model reads at the end of `init`, one layer per eval.
+Guard: `dsv41 init: every weight the model reads is evaluated before a region traces it` (DSV41_TINY). A closure that captures arrays needs them evaluated before its first call.
+
+## A pack near the RAM size was compressed while it loaded, then killed (2026-10-07)
+
+Defect: the full Jundot oQ3e pack (231 GiB resident on a 256 GB Mac, preflight passed) died with `Killed: 9` during its load, and macOS showed "out of application memory".
+Cause: V4.1 evaluates its weights at init, before any GPU work. MLX's own reader left every shard's pages in the file cache beside the buffers, and buffers enter the residency set only once a wired limit is set and become resident (wired) only when a command buffer runs: until then they are ordinary pages, and the kernel compressed them (148 GB) instead of dropping the cache.
+Fix: V4.1 packs load through `nocache_reader` (F_NOCACHE, page-aligned stages), and `deepseek_v41.wireLoaded` applies the residency policy and runs a one-op command buffer after each layer: wired memory climbs with the load (233 GB), nothing is compressed.
+Guard: `nocache reader: tensors load byte-identical to MLX's own reader`; live, `test_dsv41.sh` on the full pack with a compressor watchdog. Tell: `vm_stat` wired flat at a few GB while the footprint climbs.
+
+## A DFlash drafter was bound to a GLM forward that never filled its taps (2026-10-07)
+
+Defect: binding incoai's DFlash2 drafter to GLM-5.3-Flash passed `supportsLayerCapture` and crashed the first prefill.
+Cause: the gate answers for every non-bidirectional arch, but `forwardGlm5With` never read `ForwardCtx.capture_layers`; the empty slots reached `mlx_concatenate_axis` and aborted the process.
+Fix: the forward fills the slot with the mean of the four hyper-connection streams after each tapped layer (SGLang's `hc_contract`), and `dflash.encodeContext` returns `DflashCaptureMissing` for any unfilled slot.
+Guard: `glm5_next DFlash capture` (env-gated, one-shot, chunked and per decode step against the reference's layer means, cosine plus RMS ratio, red when the tap is removed) and `dflash: a capture the trunk never filled is a named error`.
+
+## The policy's plain cost came from a table that folds outliers (2026-10-07)
+
+Defect: with the round policy on, novel text decoded at 56 tok/s against 62 serial, and `[spec-stats]` showed `skipped=0`: the backoff never engaged although most drafts were wasted.
+Cause: the policy read a plain round's cost from `round_cost.Table` cell 0. That cell takes a stale cell's next sample at half weight, so one slow tick moved it from 16.4 to 27.1 ms; every drafted round then looked like a win against it.
+Fix: `dflash_policy.PlainCost`, learned from the request's own consecutive pipelined ticks, slowly and by at most a quarter per sample.
+Guard: `PlainCost: a stall moves it little, a steady new speed is reached`; live, the probe's novel cell against serial and `skipped=` non-zero on prose.
+
+## A bare `@min` against a constant is a tiny integer (2026-10-08)
+
+Defect: the first copy chain of 15 drafts killed the server with a SIGBUS in the stack guard, no log line.
+Cause: `@min(p.len, MAX_DRAFTS)` with a comptime 15 has type `u4`, so `n + 2` overflowed at 15; ReleaseFast has no overflow check and the fall-through `unreachable` ran off the function.
+Fix: the result is typed (`const n: usize = @min(...)`) in `chooseRows` and `PositionStats.record`, and `chooseRows` ends in a real fallback.
+Guard: `chooseRows: a fifteen-draft chain is priced through its last row` and `PositionStats: the widest copied chain records without overflow`. A silent exit of a ReleaseFast server: read `~/Library/Logs/DiagnosticReports/*.ips` first.
+
+## A Vulkan backend's MSL translator refused our kernels at eval (2026-10-10)
+
+Defect: Qwen3.5-0.8B on the mlx-omarchy Vulkan backend (RTX 5060 Ti) failed every request with a 500 (`MlxFailure` in prefill).
+Cause: `metalKernelsAvailable` was true on every non-CUDA backend, so our MSL kernels went to omarchy's MSL-subset translator, which refuses what it cannot translate only when the graph evaluates: no decline probe sees it, and the latched error fails the request.
+Fix: `metalKernelsAvailable` is true on Metal only; Vulkan runs MLX ops, like CUDA (Qwen3-1.7B decoded 3% faster without the translated kernels). MTP's off-by-default gate keys on the same predicate (`mtpAllowedByDefault`): it was CUDA-only, and a 9B Qwen3.5 decoded at a third of plain speed with MTP on Vulkan.
+Guard: `custom Metal kernels run on the Metal backend only` and `MTP is off by default where the Metal verify kernels cannot run` (both red on a non-CUDA Linux build).
+
+## One slow sample put a warm n-gram table on the slower pool (2026-10-11, #821)
+
+Defect: on some boots Flash Next prefilled ~20% slower (4.2k vs 5.2k tok/s on an M5 Ultra, 4.7bpw); 1 of 4 default boots picked the pooled PLE gather after the table warm.
+Cause: the warmed calibration timed ONE 128-row sample per arm, and the serial arm only touched pages while the pool did full preads; neither arm paid the dequant a prefill pays. A noisy sample or the lighter serial work left the pool a 20% "win" it loses at prefill width.
+Fix: both arms run the gather's own `gatherSerial` / `gatherPooled` (read + dequant), on fresh rows per trial, and the verdict is the median of `PLE_CALIBRATION_TRIALS` (5). A cold table still picks the pool (8-bit: 30 vs 2.5 ms).
+Guard: `ngram prefill calibration: one slow sample does not pick the arm`, the trial count in `ngram prefill gather: 4096 rows ...`; live, 6/6 boots SERIAL after vs 1/4 POOLED before.
+
+## The standard forward handed back logits under `skip_lm_head` (2026-10-13)
+
+Defect: the forced aligner's head ran on the trunk's logits (`[..., 5000]` into a `[5000, 1024]` matmul), an MLX shape error on the first aligned request.
+Cause: `ForwardCtx.skip_lm_head` promises the post-final-norm hidden, and the moe, hybrid and module paths honor it, but `forwardStandardWith` only checked `embedding_mode`; the LTX text encoder had been paying a full-vocab head it then discarded.
+Fix: the standard path returns `final_normed` under either flag.
+Guard: `standard forward: skip_lm_head hands back the hidden the head reads, never logits` (dflash.zig, the tiny llama trunk).
+
+## Weights on the CPU stream lived in host memory on Windows (2026-10-14)
+
+Defect: on Windows (and WSL) Qwen3-0.6B decoded at 28 tok/s against mlx-lm's 130 on the same GPU; FLUX and ACE-Step ran 3-5x slow. The same quantized matmul kernel took 270 us per call against mlx-lm's 10 (nsys).
+Cause: every loader read safetensors on MLX's CPU stream. A stream-less allocation is managed memory, which native Linux migrates to the GPU, but without concurrent managed access MLX backs it with `cudaMallocHost`, which never moves: each token re-read the weights over PCIe. mlx-lm loads on the GPU stream.
+Fix: `mlx.weightLoadStream()` is the GPU stream on CUDA where unified memory is limited (Windows at compile time, WSL by kernel release), else the CPU stream (Metal has no GPU `Load`); every weight loader and the SSD KV restore take it, and there `status.get{Available,Total}MemBytes` report VRAM, so every gate bills the pool the weights live in.
+Guard: `weight loads go to the GPU on CUDA only where host memory never migrates there`, `memoryPool: ...`; live, 145 tok/s.
+
+## Two cuBLAS copies left llama.cpp on the CPU (2026-10-14)
+
+Defect: in one Windows server, a GGUF decoded at 7.6 tok/s when an MLX model had loaded first, 80 when it loaded first itself; no error anywhere.
+Cause: MLX loaded `cublasLt64_13.dll` from its build toolkit; `ggml-cuda.dll`, built against a newer one, then failed to load beside it and llama.cpp quietly fell back to its CPU backend.
+Fix: no CUDA DLL ships: `patches/mlx-cuda-windows-toolkit-dirs.patch` resolves MLX's DLL folders from the installed toolkit (`CUDA_PATH`, `CUDNN_PATH`; cuDNN's folder also goes on PATH for its sub-libraries), and `mlx.exportCudaHome` puts the same folder first on PATH, so both engines bind one copy.
+Guard: `cudaDllSearchPath: ...`; live, both load orders on the GPU with one `cublas64_13.dll` loaded.
+
+## A rebuild recompiled every cached Neural Engine program (2026-10-15)
+
+Defect: after a new build, a cached Qwen3.8-27B recompiled for minutes on the Neural Engine instead of restoring in seconds.
+Cause: the LM engine's cache variant hashed `round_cost.engineBuildId()`, and a dev build hashes its executable (a release, its git sha). The bridge's cold-compile prune deletes the model's entries tagged with another variant, so the first miss after a rebuild deleted every entry not yet restored, and the rest recompiled.
+Fix: the variant names only the configuration (lanes, contexts, drafter taps). Entries are keyed by program, so a rebuild restores what it still emits, and `rt.cacheSweep` drops the model's entries a finished build did not touch (an older engine's). Builds take turns (`build_mu`): the lineage is process-wide.
+Guard: `cache sweep: after a build, its group's entries it did not touch go; other groups stay` (ane_rt.zig).
+
+## Every app update recompiled every Neural Engine model (2026-10-15)
+
+Defect: after each app rebuild a cached Neural Engine model recompiled for minutes, while restarts of the same build restored it in seconds.
+Cause: the ANE service keys a compiled program by the code-signing identifier of the process that compiled it, and `app/build.sh` and the release workflow sign `mlx-serve` without `--identifier`, so codesign named each build `mlx-serve-<hash of the binary>`. A plain `zig build` is linker-signed as `mlx-serve` and restored any entry, which hid it in development.
+Fix: `mlx-serve` embeds an Info.plist (`__TEXT,__info_plist`, `CFBundleIdentifier` `com.dalcu.mlx-core.mlx-serve`, kept referenced from `main` or the linker strips it), which codesign uses as the identifier.
+Guard: none automated. Check with `codesign -f -s - <copy>; codesign -dv <copy>`, which must print that identifier.
+
+## Bonsai 2 2B, 4B and 9B answered in gibberish: a decode kernel sized for one pack's block (2026-10-15)
+
+Defect: prism-ml's Ternary Bonsai 2 2B, 4B and 9B packs loaded and produced word salad from the first token, while the 27B was fine.
+Cause: each pack picks its own Hadamard block (512 for 2B/4B, 4096 for 9B, 1024 for 27B), and the fused one-token GDN kernel (`gdn_decode.step`, its second dispatch: gated norm, then the out_proj rotation) was written for 1024 only. Prefill was correct, but the last prompt token is forwarded alone, so even the first answer token came out of the wrong rotation. Found by matching prism's own loader (mlx-vlm qwen3_5 + their `Packed` module) layer by layer under `MLX_SERVE_LAYER_CAP`: layer 0's GDN output matched on the 4-token prefill and diverged on the 1-token forward.
+Fix: the kernel takes the pack's block as a template (`J` = block / 32, heads per simdgroup derived from it) and `step` takes the block; `rht.kernelBlock` names the four blocks both butterflies serve, 4096 included, so decode and prefill rotate with the same code.
+Guards: `gdn_decode.step and recur` runs every block bit for bit against prework -> recurrence -> norm-gate -> `rht.transform`; `rht: every shipped block's transform` checks both transform paths at all four.
+
+## GLM's KDA layers came out 1.8% short: an epsilon on the mean, where the reference has it on the sum (2026-10-17)
+
+Defect: on NVIDIA's GLM-5.3-Flash-FP4-Local, every KDA layer's output was ~1.8% smaller than transformers' (layer-0 tap min cos 0.9985, rms 1.012 vs an f32 reference), while the dense MLP matched to 1.000000.
+Cause: the q/k prework normalized with `rms_norm(x, 1e-6)`, epsilon on the MEAN of squares, which is mlx-lm's Qwen GDN form. GLM's reference (fla's `l2norm`, and mlx-vlm's `1e-6 / head_dim`) puts it on the SUM. GLM's post-conv keys have a mean square near 3e-5, so a 128x larger epsilon shrank them. The tiny random-weight fixture has large keys and never saw it. Found by feeding the engine's own layer inputs to transformers' modules one at a time.
+Fix: `ModelConfig.gdnQkNormEps` (GLM 1e-6/dk, else 1e-6), read by the op chain and passed to the packed prework kernel as `qk_eps`. The one-token KDA decode kernel already added it to the sum.
+Guards: `glm5_next KDA q/k norm equals fla's l2norm on keys as small as the checkpoint's`; `glm5_next DFlash capture` on a real pack.
+
+## NVIDIA's Flash Next FP4 pack prefilled 14% slower than ours: its experts and linears sat off the tuned kernels (2026-10-17)
+
+Defect: `Qwen3.8-Flash-Next-FP4-Local` prefilled 4600 tok/s against 5390 for iQ-MLX-4.7bpw on the same Mac, with decode equal.
+Cause: the tuned sorted expert kernel (`gather_qmm_nax`, the oMLX port) took affine and MXFP4 only, and the dequant+GEMM prefill route took affine only, so NVFP4 experts ran stock `gather_qmm` behind a per-expert copy of the activations and MXFP8 linears ran stock `quantized_matmul`. A `QWEN4_STANDIN` ablation of GDN and attention pointed at the dense layers instead: stubbing a block changes the router's input and with it the expert load, so those costs read twice their size.
+Fix: `Fp4Q` decodes e4m3 scales at group 16 (`QuantMode.isFp4` at the three call sites), the paired SwiGLU kernel declines when per-expert scales exist (it ignores them), and `prefillDqGemm` takes the mode and serves MXFP8. 4600 -> 5340 tok/s.
+Guards: `segmented NAX sorted gather matches stock bit for bit on FP4 banks` (Flash Next shapes), the paired row-map case at group 16, `qmatmulBits: prefill-width MXFP8 calls take the dequant+GEMM route`. The expert kernel is exact (323 of 323 scored rows bit-identical); the MXFP8 route reorders sums, so judge it by `MLX_SERVE_PREFILL_DQ_GEMM=0` A/Bs.
+

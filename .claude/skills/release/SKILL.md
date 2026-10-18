@@ -10,6 +10,7 @@ Timings measured 2026-07-16 on the M4 Max 128 GB, AFTER the `stop_all_engines` p
 | # | Step | Command | Time |
 |---|---|---|---|
 | 1 | Hermetic suite | `zig build test` (**must** be every step, 9/9 today, 0 fail) + `cd app && swift test` | ~1 min |
+| 1b | Console is fresh | `cd app-web && npm ci && npm test && npm run build`, then `git diff --exit-code src/html` (the committed page matches its source) | ~15 s |
 | 2 | ReleaseFast binary | `zig build -Doptimize=ReleaseFast` → `du -h zig-out/bin/mlx-serve` ≈ **16 MB** in 26.9.6 (Debug ≈ 2× = fake regression) | ~10 s |
 | 3 | **Perf gate** (did WE regress?) | `./tests/bench.sh` (mlx-serve only, llmprobe) → diff vs the previous column in `benchmarks.md` → append this release's column | ~15 min |
 | 4 | Tool-call correctness | `zig build test -Dtest-filter="format corpus"` + `-Dtest-filter="tool traffic"`; live: `./tests/test_tool_matrix_small.sh` | ~3 min |
@@ -26,7 +27,7 @@ Timings measured 2026-07-16 on the M4 Max 128 GB, AFTER the `stop_all_engines` p
 - **`--only <substr>`** runs a single model row for tight dev loops.
 - **Depth**: default `--bench-only` is one run per ladder rung to 16k. `--full` takes median-of-3 per rung and climbs to 32k/64k — that's the release artifact depth (step 8). For a regression CLAIM on a spec-decode cell, sample across runs and boot orders regardless of depth: "reproducible ≠ not variance".
 - **Never quote a win without naming the engine it is over** — vs LM-GGUF the 26B-A4B row reads +33%; vs oMLX it is +1.6%.
-- **`benchmarks.md` gets one new COLUMN per release, from the rows step 3 prints** (Laguna's number comes from its own A/B harness, not the bench matrix). Obey the file's own header rules: results into the tables only, no text; **Apple M4 Max 128 GB only** — skip the update entirely when releasing from any other machine (the M4 mini), a mixed column poisons the history.
+- **`benchmarks.md` gets one new COLUMN per release, from the rows step 3 prints** (Laguna's number comes from its own A/B harness, not the bench matrix). Obey the file's own header rules: results into the tables only, no text; **one table per machine** (M4 Max 128 GB, M5 Ultra 80c 256 GB) — the column goes into the table of the machine that ran it; skip the update on any other machine (the M4 mini), a mixed column poisons the history.
 
 ## Release benchmark artifacts
 
