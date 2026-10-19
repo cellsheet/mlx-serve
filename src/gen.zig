@@ -773,9 +773,14 @@ pub const ImageEngine = struct {
     }
 
     /// `guidance_scale` when the request omits it: MOSS-Image is undistilled and its
-    /// authors' default is CFG 3; everywhere else 1.0 (one forward per step).
+    /// authors' default is CFG 3; Anima ships its own recommended CFG; everywhere
+    /// else 1.0 (one forward per step).
     pub fn defaultGuidance(self: *const ImageEngine) f32 {
-        return if (self.backend == .moss_image) moss_image.DEFAULT_GUIDANCE else 1.0;
+        return switch (self.backend) {
+            .moss_image => moss_image.DEFAULT_GUIDANCE,
+            .anima => self.backend.anima.recommended.cfg,
+            else => 1.0,
+        };
     }
 
     /// Steps for a request: a checkpoint's own sampling grid, else the
@@ -789,17 +794,6 @@ pub const ImageEngine = struct {
             .anima => self.backend.anima.recommended.steps,
             else => if (steps == 0) 4 else steps,
         };
-    }
-
-    /// CFG scale for a request that names none: 1.0 — which skips the
-    /// unconditional forward — or an undistilled checkpoint's own
-    /// recommendation. Resolved at the request edge so `ImageGenOpts` carries
-    /// a real scale and no backend arm has to know what "absent" means.
-    pub fn defaultGuidance(self: *const ImageEngine) f32 {
-        return if (self.backend == .anima)
-            self.backend.anima.recommended.cfg
-        else
-            1.0;
     }
 
     /// Reconcile the engine's attached LoRA stack with the request: an empty
@@ -2647,8 +2641,8 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     if (extractJsonFloat(body, "guidance_scale")) |g| {
         if (!(g >= 0.0 and g <= 20.0)) return sendError(conn, 400, "'guidance_scale' must be in [0,20]");
         if (g != 1.0 and !engine.supportsGuidance())
-            return sendError(conn, 400, "'guidance_scale' requires a FLUX.2, Qwen-Image or Anima model");
-        guidance = @floatCast(g);
+            return sendError(conn, 400, "'guidance_scale' requires a FLUX.2, Qwen-Image, MOSS-Image or Anima model");
+        guidance_scale = @floatCast(g);
     }
     var negative_prompt: []const u8 = "";
     var negative_prompt_owned: ?[]u8 = null;
@@ -2657,8 +2651,6 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         negative_prompt_owned = try jsonUnescape(allocator, raw_neg);
         negative_prompt = negative_prompt_owned.?;
     }
-    if (guidance_scale != 1.0 and !engine.supportsGuidance())
-        return sendError(conn, 400, "'guidance_scale' requires a FLUX.2, Qwen-Image or MOSS-Image model");
 
     // Qwen-Image edit: reference conditioning resolution (diffusers'
     // per-call `output_resolution` knob). Lower = fewer joint tokens per
@@ -2714,7 +2706,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .edit_image_bytes = edit_byte_bufs[0..edit_byte_n],
         .cond_gain = cond_gain,
         .cond_weights = cond_weights,
-        .guidance_scale = guidance,
+        .guidance_scale = guidance_scale,
         .negative_prompt = negative_prompt,
         .ref_resolution = ref_resolution,
     };
@@ -2735,7 +2727,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             @intCast(gen_opts.edit_image_bytes.len),
             gen_opts.ref_resolution,
             engine.backend.qwen_image.dit_cfg,
-            if (guidance != 1) 2 else 1,
+            if (guidance_scale != 1) 2 else 1,
         );
         const headroom = gpuHeadroomBytes();
         const plan = planQwenImageEdit(steps, cache_enabled, base_bill, prefix_bill, headroom) catch {
@@ -2767,7 +2759,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             return sendError(conn, 400, msg);
         }
     }
-    log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance, want_stream, prompt.len });
+    log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
     if (want_stream) try conn.writeAll(sse.headers);
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
         // Client hung up mid-generation — there is nobody to answer, and
