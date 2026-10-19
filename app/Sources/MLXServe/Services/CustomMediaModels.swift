@@ -45,6 +45,7 @@ enum CustomMediaModels {
         }
         if arch.hasPrefix("qwen_image") { return .qwenImage21_8bit }
         if arch == "anima" { return .animaBase }
+        if arch == "moss_image" { return .mossImageSFT_8bit }
         return nil
     }
 
